@@ -15,7 +15,9 @@ mkdir -p "$PROJECT_ROOT/logs"
   echo
 } | tee "$LOG"
 
-adb -s "$DEVICE_SERIAL" shell "cd $DEVICE_FOLDER && ./litert_lm_main \
+adb -s "$DEVICE_SERIAL" shell "cd $DEVICE_FOLDER && \
+  LD_LIBRARY_PATH=$DEVICE_FOLDER \
+  ./litert_lm_main \
   --backend=cpu \
   --model_path=$DEVICE_FOLDER/model.litertlm \
   --input_prompt='Say hello in one short sentence.'" 2>&1 | tee -a "$LOG"

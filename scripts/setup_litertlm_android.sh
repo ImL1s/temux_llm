@@ -32,6 +32,7 @@ adb -s "$DEVICE_SERIAL" shell "df -h /data/local/tmp"
 echo
 echo "=== litert_lm_main --help (for flag fact-check; saved to logs/binary_help.log) ==="
 mkdir -p "$PROJECT_ROOT/logs"
-adb -s "$DEVICE_SERIAL" shell "cd $DEVICE_FOLDER && ./litert_lm_main --help 2>&1 || true" \
+# LD_LIBRARY_PATH required even for --help — libGemmaModelConstraintProvider.so is a hard dep.
+adb -s "$DEVICE_SERIAL" shell "cd $DEVICE_FOLDER && LD_LIBRARY_PATH=$DEVICE_FOLDER ./litert_lm_main --help 2>&1 || true" \
   | tee "$PROJECT_ROOT/logs/binary_help.log"
 echo "=== setup done ==="
