@@ -68,7 +68,12 @@ class LlmService : Service() {
 
     private fun startHttpServer() {
         try {
-            val s = HttpServer()
+            // jniLibs are extracted by Android at install time; just verify the
+            // binary is reachable and executable.
+            val ready = LiteRtLmRunner(applicationContext).checkReady()
+            Log.i(tag, "litert_lm_main ready = $ready")
+
+            val s = HttpServer(applicationContext)
             s.start(fi.iki.elonen.NanoHTTPD.SOCKET_READ_TIMEOUT, false)
             server = s
             Log.i(tag, "http server started on 127.0.0.1:${HttpServer.PORT}")

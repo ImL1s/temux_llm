@@ -34,8 +34,13 @@ android {
     }
 
     packaging {
-        // litert_lm_main is shipped as an asset, not as a JNI lib, so no
-        // jniLibs filter is needed yet. Phase 2b will revisit.
+        jniLibs {
+            // We ship the litert_lm_main CLI as liblitert_lm_main.so under
+            // src/main/jniLibs/arm64-v8a/ so Android extracts it to nativeLibraryDir
+            // (which permits execve from the app sandbox; filesDir does NOT under
+            // Android 10+ W^X). useLegacyPackaging extracts on install.
+            useLegacyPackaging = true
+        }
     }
 }
 
