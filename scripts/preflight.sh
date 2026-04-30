@@ -5,7 +5,7 @@ set -euo pipefail
 
 DEVICE_SERIAL="${DEVICE_SERIAL:-RFCNC0WNT9H}"   # default = S21+
 DEVICE_FOLDER="${DEVICE_FOLDER:-/data/local/tmp/litertlm}"
-MIN_TMP_FREE_MB="${MIN_TMP_FREE_MB:-3300}"      # 2,544 MiB artifact + ~755 MiB safety
+MIN_TMP_FREE_MB="${MIN_TMP_FREE_MB:-3000}"      # 2,544 MiB artifact + ~456 MiB safety (S21+ ceiling after preserving user files)
 
 die() { echo "FATAL: $*" >&2; exit 1; }
 ok()  { echo "[ok] $*"; }

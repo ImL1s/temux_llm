@@ -36,8 +36,8 @@
 - model 2,583,085,056 B = 2,463.4 MiB
 - **artifact total = 2,668,070,072 B ≈ 2,544 MiB**
 
-S21+ /data: 1,634 MiB free observed; reclaiming `/data/local/tmp` adds ~1,500 MiB → ~3,134 MiB usable.
-Free-space gate: `MIN_TMP_FREE_MB=3300` (≈+155 MiB safety vs the 2,544 MiB artifact floor for partial-push retries / fs metadata / OS reserve). **E4B is out of scope on this device.**
+S21+ /data: 1,556 MiB free observed; reclaiming `/data/local/tmp` (Flutter `.deb` installers ×2, wear-debug.apk, two app APKs, perfd/, dalvik-cache/) frees ~1,534 MiB → 3,090 MiB usable.
+Free-space gate: `MIN_TMP_FREE_MB=3000` (~456 MiB safety vs 2,544 MiB artifact floor for partial-push retries / fs metadata / OS reserve). The remaining ~50 MiB of /data/local/tmp content (`vysor.pwd` credentials, user dev scripts, `*.sha1` shader caches, UIAutomator dumps) is **preserved** — not safe to auto-delete. **E4B is out of scope on this device.**
 
 **Backup device available:** `RFCY71LAFYE` (SM-S931Q / SM8750 Snapdragon 8 Elite for Galaxy / Android 16 / 198 GB free). Matches the brief's original target spec exactly. Use only if S21+ GPU path fails for hardware/OS reasons (Adreno 660 OpenCL refused, vendor namespace blocked, etc.).
 
@@ -299,7 +299,7 @@ set -euo pipefail
 
 DEVICE_SERIAL="${DEVICE_SERIAL:-RFCNC0WNT9H}"   # default = S21+
 DEVICE_FOLDER="${DEVICE_FOLDER:-/data/local/tmp/litertlm}"
-MIN_TMP_FREE_MB="${MIN_TMP_FREE_MB:-3300}"      # 2,544 MiB artifact + ~755 MiB safety
+MIN_TMP_FREE_MB="${MIN_TMP_FREE_MB:-3000}"      # 2,544 MiB artifact + ~456 MiB safety (real-world S21+ ceiling)
 
 die() { echo "FATAL: $*" >&2; exit 1; }
 ok()  { echo "[ok] $*"; }
