@@ -7,3 +7,8 @@ logs/
 .DS_Store
 .venv/
 __pycache__/
+android/app/build/
+android/.gradle/
+android/local.properties
+android/app/src/main/assets/
+android/build/
