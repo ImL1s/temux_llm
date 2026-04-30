@@ -4,7 +4,7 @@
 
 **Goal:** Validate the official LiteRT-LM Android arm64 native CLI on a Samsung Galaxy S21+ (SM-G9960, Snapdragon 888, Adreno 660, Android 15), running `gemma-4-E2B-it.litertlm` with CPU and GPU backends, and apply the brief's "GPU is useful only if…" interpretation rule to decide whether to proceed to the Android foreground service + localhost API phase.
 
-**Architecture:** macOS arm64 host pulls v0.9.0 prebuilt artifacts (`litert_lm_main.android_arm64` from GitHub Release + matching `prebuilt/android_arm64/*.so` set from the repo via Git LFS at the same `v0.9.0` tag) plus the generic `gemma-4-E2B-it.litertlm` model from HuggingFace `litert-community/`. Bash orchestrators push everything to `/data/local/tmp/litertlm` on the S21+ via adb, run CPU smoke → CPU benchmark → GPU smoke → GPU benchmark, save raw logs on host, then parse for OpenCL/Adreno/silent-fallback signals.
+**Architecture:** macOS arm64 host pulls v0.9.0 prebuilt artifacts (`litert_lm_main.android_arm64` from GitHub Release + matching `prebuilt/android_arm64/*.so` set from the repo via Git LFS at the same `v0.9.0` tag) plus the `gemma-4-E2B-it.litertlm` model from HuggingFace `litert-community/` **pinned to a specific commit** (HF `main` is mutable). Every artifact is verified by sha256 against `scripts/sha256_manifest.txt` after download. Bash orchestrators push everything to `/data/local/tmp/litertlm` on the S21+ via adb, then run CPU smoke → GPU smoke → CPU benchmark → GPU benchmark in that order (smoke gates benchmark per the brief). Logs are kept on host and parsed for OpenCL/Adreno/silent-fallback signals.
 
 **Tech Stack:** macOS host (curl, adb, bash, python3); LiteRT-LM v0.9.0 prebuilt (Bazel-built C++); Android 15 / arm64-v8a; Adreno 660 OpenCL via `/vendor/lib64/libOpenCL.so`.
 
@@ -30,7 +30,14 @@
 | Model `gemma-4-E4B-it.litertlm` size | 3,654,467,584 B (~3.40 GB) — **WILL NOT FIT** on S21+ | HF HEAD `Content-Length` |
 | `.so` set total (v0.9.0) | ~41 MB (6 files) | `prebuilt/android_arm64?ref=v0.9.0` |
 
-**Storage math for S21+ E2B path:** binary 37 MB + `.so` ~41 MB + model 2,413 MB = **~2,491 MB**. After cleaning `/data/local/tmp` legacy artifacts (frees ~1,500 MB) we have ~3,100 MB available, leaving ~600 MB headroom. Tight but workable. **E4B is out of scope on this device.**
+**Storage math for S21+ E2B path** (bytes / MiB only — avoid GB/GiB ambiguity):
+- binary 37,280,824 B = 35.6 MiB
+- 6 `.so` total = 47,704,192 B = 45.5 MiB (v0.9.0 LFS oid sizes)
+- model 2,583,085,056 B = 2,463.4 MiB
+- **artifact total = 2,668,070,072 B ≈ 2,544 MiB**
+
+S21+ /data: 1,634 MiB free observed; reclaiming `/data/local/tmp` adds ~1,500 MiB → ~3,134 MiB usable.
+Free-space gate: `MIN_TMP_FREE_MB=3300` (≈+155 MiB safety vs the 2,544 MiB artifact floor for partial-push retries / fs metadata / OS reserve). **E4B is out of scope on this device.**
 
 **Backup device available:** `RFCY71LAFYE` (SM-S931Q / SM8750 Snapdragon 8 Elite for Galaxy / Android 16 / 198 GB free). Matches the brief's original target spec exactly. Use only if S21+ GPU path fails for hardware/OS reasons (Adreno 660 OpenCL refused, vendor namespace blocked, etc.).
 
@@ -40,8 +47,10 @@
 
 1. **CPU smoke fails** → fix binary/model/path first; do not advance.
 2. **GPU smoke fails because `.so` missing or `LD_LIBRARY_PATH` wrong** → fix push & env; retry.
-3. **GPU fails due to vendor/OpenCL namespace** → stop on this device; switch to S25 *or* skip to Android foreground-service route (out of this plan's scope).
-4. **GPU smoke succeeds AND benchmark shows meaningful TTFT/prefill improvement AND no silent fallback** → green-light Phase 2 (Android foreground service + localhost HTTP API). Phase 2 is **out of scope** for this plan.
+3. **GPU fails due to vendor/OpenCL namespace (adb-shell linker can't dlopen libOpenCL.so or .so set)** → STOP Phase 1 on this device; **do NOT build the Android HTTP server** (per brief line 112: "If adb shell GPU fails: do not spend time building Android HTTP server yet"). Optionally rerun Phase 1 unchanged on the S25 (`DEVICE_SERIAL=RFCY71LAFYE`), or sketch a separate minimal Android native-app GPU probe — neither is in this plan.
+4. **GPU smoke succeeds AND 1024/256 benchmark (async=false) shows meaningful TTFT/prefill improvement AND no silent fallback to CPU** → green-light Phase 2 (Android foreground service + localhost HTTP API). Phase 2 is **out of scope** for this plan.
+
+> **OOM rule:** if the 1024/256 benchmark OOMs the device, that counts as a **failed required benchmark** for stop condition #4. A smaller-prefill run (e.g. 512) is *diagnostic only* and never substitutes for the 1024/256 gate.
 
 ---
 
@@ -98,7 +107,7 @@ Expected: commit succeeds with 3+ files.
 ```bash
 #!/usr/bin/env bash
 # scripts/fetch_artifacts.sh — Phase 0: download host-side artifacts.
-# Idempotent: skips files that already exist with the expected size.
+# Idempotent: skips files that already exist with matching sha256 (per scripts/sha256_manifest.txt).
 set -euo pipefail
 
 PROJECT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -290,7 +299,7 @@ set -euo pipefail
 
 DEVICE_SERIAL="${DEVICE_SERIAL:-RFCNC0WNT9H}"   # default = S21+
 DEVICE_FOLDER="${DEVICE_FOLDER:-/data/local/tmp/litertlm}"
-MIN_TMP_FREE_MB="${MIN_TMP_FREE_MB:-2700}"      # need ~2.5 GB clear
+MIN_TMP_FREE_MB="${MIN_TMP_FREE_MB:-3300}"      # 2,544 MiB artifact + ~755 MiB safety
 
 die() { echo "FATAL: $*" >&2; exit 1; }
 ok()  { echo "[ok] $*"; }
@@ -446,7 +455,8 @@ git commit -m "feat(scripts): interactive /data/local/tmp cleanup helper"
 ```bash
 #!/usr/bin/env bash
 # scripts/setup_litertlm_android.sh — push binary + .so + model to device.
-# Idempotent: re-pushes only when host file mtime newer than device file.
+# Re-runnable; preflight gates the operation. NOTE: pushes overwrite each time
+# (no mtime/size diff) — model push is ~2 min over USB 2.0 due to its 2.4 GB size.
 set -euo pipefail
 
 DEVICE_SERIAL="${DEVICE_SERIAL:-RFCNC0WNT9H}"
@@ -829,7 +839,7 @@ git commit -m "docs: S21+ Phase-1 findings and Phase-2 GO/NO-GO decision"
 | v0.9.0 binary ABI vs `main` `.so` | Pin .so URL to `?ref=v0.9.0` (Task 2). |
 | Adreno 660 OpenCL refused on Android 15 | Captured in Task 8 logs; falls under stop condition #3. |
 | `/data/local/tmp` too full | Task 5 reclaims ~1.5 GB before push. |
-| 2.4 GB RAM available may be tight for prefill 1024 | E2B is ~2 GB on disk → typical ~1.5 GB working set; if OOM, drop prefill to 512 and re-run benchmark task. Document the deviation in `findings-…md`. |
+| 2.4 GB RAM available may be tight for prefill 1024 | E2B is ~2 GB on disk → typical ~1.5 GB working set; if 1024/256 OOMs, that counts as a failed required benchmark per stop condition #4. A 512-prefill run is *diagnostic only* and is never a decision substitute. |
 | HF download interrupted | `fetch_artifacts.sh` re-checks size and re-downloads on mismatch. |
 
 ---
