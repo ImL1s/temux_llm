@@ -1,0 +1,9 @@
+bin/
+models/
+logs/
+*.litertlm
+*.so
+*.android_arm64
+.DS_Store
+.venv/
+__pycache__/
