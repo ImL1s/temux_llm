@@ -19,6 +19,11 @@ PROJECT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 LOG="$PROJECT_ROOT/logs/${BACKEND}_benchmark.log"
 PROMPT_FILE="$PROJECT_ROOT/scripts/long_prompt.txt"
 
+# shellcheck source=scripts/_lib.sh
+source "$(cd "$(dirname "$0")" && pwd)/_lib.sh"
+omc_validate_device_folder "$DEVICE_FOLDER" || exit 1
+omc_validate_backend "$BACKEND" || exit 1
+
 mkdir -p "$PROJECT_ROOT/logs"
 [[ -f "$PROMPT_FILE" ]] || { echo "FATAL: missing $PROMPT_FILE (long benchmark prompt)" >&2; exit 1; }
 DEVICE_PROMPT_PATH="$DEVICE_FOLDER/long_prompt.txt"
@@ -26,7 +31,7 @@ adb -s "$DEVICE_SERIAL" push "$PROMPT_FILE" "$DEVICE_PROMPT_PATH" >/dev/null
 
 # Always clear any stale XNNPack cache before benchmark — caches from a different model or
 # different backend can break loading (observed empirically when switching gemma-4 -> Qwen3).
-adb -s "$DEVICE_SERIAL" shell "rm -f $DEVICE_FOLDER/model.litertlm.xnnpack_cache 2>/dev/null"
+adb -s "$DEVICE_SERIAL" shell "rm -f '$DEVICE_FOLDER/model.litertlm.xnnpack_cache' 2>/dev/null"
 
 BACKEND_UPPER=$(echo "$BACKEND" | tr '[:lower:]' '[:upper:]')
 {
@@ -38,7 +43,7 @@ BACKEND_UPPER=$(echo "$BACKEND" | tr '[:lower:]' '[:upper:]')
 
 # LD_LIBRARY_PATH is required for ANY backend on this binary — libGemmaModelConstraintProvider.so
 # is a hard dynamic dep regardless of --backend. Empirically confirmed via setup --help failure.
-LD_PREFIX="LD_LIBRARY_PATH=$DEVICE_FOLDER"
+LD_PREFIX="LD_LIBRARY_PATH='$DEVICE_FOLDER'"
 
 # Pin to performance cores when taskset is available (per build-and-run.md tip).
 # `f0` = mask 0xF0 = upper 4 cores on most flagship Snapdragons including SM8350.
@@ -50,10 +55,10 @@ else
   echo "[info] taskset NOT available on device — running without core affinity" | tee -a "$LOG"
 fi
 
-adb -s "$DEVICE_SERIAL" shell "cd $DEVICE_FOLDER && \
+adb -s "$DEVICE_SERIAL" shell "cd '$DEVICE_FOLDER' && \
   $LD_PREFIX $TASKSET ./litert_lm_main \
   --backend=$BACKEND \
-  --model_path=$DEVICE_FOLDER/model.litertlm \
-  --input_prompt_file=$DEVICE_PROMPT_PATH" 2>&1 | tee -a "$LOG"
+  --model_path='$DEVICE_FOLDER/model.litertlm' \
+  --input_prompt_file='$DEVICE_PROMPT_PATH'" 2>&1 | tee -a "$LOG"
 
 echo "log: $LOG"

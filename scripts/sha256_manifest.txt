@@ -1,17 +1,27 @@
-# sha256 manifest — pin every artifact for reproducibility (Codex review 2026-05-01).
-# Format: <sha256>  <relative path>  # <size in bytes>  <source>
+# sha256 manifest — pin every artifact for reproducibility.
+# Format: <sha256><2 spaces><relative path><2 spaces># size=<bytes> source=<source>
+# Two-space separator is mandatory; the awk parser in fetch_artifacts.sh splits on it.
+# Comments (# ...) are stripped by the parser; blank lines ignored.
 
 # v0.9.0 release binary (GitHub release asset)
-606a933f3971b7c3c23a00e016cbf020ccd6d35f04a1ee8d1072387f361bb629  bin/litert_lm_main  # 37280824  release v0.9.0
+606a933f3971b7c3c23a00e016cbf020ccd6d35f04a1ee8d1072387f361bb629  bin/litert_lm_main  # size=37280824 source=release-v0.9.0
 
 # v0.9.0 prebuilt/android_arm64 (Git LFS, pinned to tag)
-03c5be00b26db93f86ab36f42ad20f291670df15488ed5de2e4369b150a4656a  bin/android_arm64/libGemmaModelConstraintProvider.so  # 20186832
-83c19e84500ae1f2a653de9a67a18cb4321de64dcec7bec86093d9351c601cd8  bin/android_arm64/libLiteRtGpuAccelerator.so  # 12882984
-795391cf408fdd655fdc65c190cb92074c99035d31b4ee263cdfaaee471c46dc  bin/android_arm64/libLiteRtOpenClAccelerator.so  # 2974704
-c7901b30a41c11c67f81cfdc574947b7da310c237645ea8683756b758dfbd747  bin/android_arm64/libLiteRtTopKOpenClSampler.so  # 1430872
-6a070fad13583cb3175a9cf3905b39f315879b1352c9858e92ef8f00aa4fdebf  bin/android_arm64/libLiteRtTopKWebGpuSampler.so  # 1465840
-5a3d55323ff257f8390bf42998711c6e8d8d7862846b9d586126f091800c204e  bin/android_arm64/libLiteRtWebGpuAccelerator.so  # 8762960
+03c5be00b26db93f86ab36f42ad20f291670df15488ed5de2e4369b150a4656a  bin/android_arm64/libGemmaModelConstraintProvider.so  # size=20186832
+83c19e84500ae1f2a653de9a67a18cb4321de64dcec7bec86093d9351c601cd8  bin/android_arm64/libLiteRtGpuAccelerator.so  # size=12882984
+795391cf408fdd655fdc65c190cb92074c99035d31b4ee263cdfaaee471c46dc  bin/android_arm64/libLiteRtOpenClAccelerator.so  # size=2974704
+c7901b30a41c11c67f81cfdc574947b7da310c237645ea8683756b758dfbd747  bin/android_arm64/libLiteRtTopKOpenClSampler.so  # size=1430872
+6a070fad13583cb3175a9cf3905b39f315879b1352c9858e92ef8f00aa4fdebf  bin/android_arm64/libLiteRtTopKWebGpuSampler.so  # size=1465840
+5a3d55323ff257f8390bf42998711c6e8d8d7862846b9d586126f091800c204e  bin/android_arm64/libLiteRtWebGpuAccelerator.so  # size=8762960
 
-# HuggingFace model — pinned to original upload commit (HF tree is mutable on `main`)
+# HuggingFace gemma-4-E2B-it model — pinned to upload commit (HF main is mutable).
 # commit: 7fa1d78473894f7e736a21d920c3aa80f950c0db (litert-community/gemma-4-E2B-it-litert-lm)
-ab7838cdfc8f77e54d8ca45eadceb20452d9f01e4bfade03e5dce27911b27e42  models/gemma-4-E2B-it.litertlm  # 2583085056
+# NOTE: the v0.9.0 binary cannot load this model file (returns INVALID_ARGUMENT:
+# Unsupported model type — confirmed empirically). Listed for reproducibility only;
+# default toolkit run uses Qwen3-0.6B below.
+ab7838cdfc8f77e54d8ca45eadceb20452d9f01e4bfade03e5dce27911b27e42  models/gemma-4-E2B-it.litertlm  # size=2583085056
+
+# HuggingFace Qwen3-0.6B model — DEFAULT model for the v0.9.0 binary.
+# commit: 49837332af6863b008a73a5394ed60789504069d (initial Qwen3-0.6B.litertlm upload)
+# litert-community/Qwen3-0.6B
+555579ff2f4fd13379abe69c1c3ab5200f7338bc92471557f1d6614a6e5ab0b4  models/Qwen3-0.6B.litertlm  # size=614236160

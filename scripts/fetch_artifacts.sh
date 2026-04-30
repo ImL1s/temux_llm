@@ -1,7 +1,11 @@
 #!/usr/bin/env bash
 # scripts/fetch_artifacts.sh — Phase 0: download host-side artifacts.
-# Idempotent: skips files that already exist with matching sha256 (per scripts/sha256_manifest.txt).
-# Re-fetches on size or sha256 mismatch. Bails with FATAL on any final mismatch.
+# Idempotent: skips files whose sha256 already matches the manifest.
+# Verifies every download against scripts/sha256_manifest.txt; bails on mismatch.
+#
+# Default model is Qwen3-0.6B (works with v0.9.0 binary). Set MODEL=gemma to also
+# fetch gemma-4-E2B-it.litertlm (larger; not loadable by v0.9.0 — kept only for
+# reproducibility / future when a newer Android binary is built from source).
 set -euo pipefail
 
 PROJECT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -14,21 +18,22 @@ mkdir -p "$BIN_DIR" "$SO_DIR" "$MODEL_DIR"
 # --- Pin every artifact for ABI / content stability ---
 LITERTLM_TAG="v0.9.0"
 
-# HF .litertlm pinned to the commit when this exact file was first uploaded.
-# `main` is mutable: we observed sm8750 .litertlm replaced within hours of release.
-# Pinned commit verified via: shasum -a 256 model == ab7838cdfc... (manifest).
-MODEL_COMMIT="7fa1d78473894f7e736a21d920c3aa80f950c0db"
+QWEN3_COMMIT="49837332af6863b008a73a5394ed60789504069d"
+GEMMA4_COMMIT="7fa1d78473894f7e736a21d920c3aa80f950c0db"
 
 BINARY_URL="https://github.com/google-ai-edge/LiteRT-LM/releases/download/${LITERTLM_TAG}/litert_lm_main.android_arm64"
 LFS_BASE="https://media.githubusercontent.com/media/google-ai-edge/LiteRT-LM/${LITERTLM_TAG}/prebuilt/android_arm64"
-MODEL_URL="https://huggingface.co/litert-community/gemma-4-E2B-it-litert-lm/resolve/${MODEL_COMMIT}/gemma-4-E2B-it.litertlm"
+QWEN3_URL="https://huggingface.co/litert-community/Qwen3-0.6B/resolve/${QWEN3_COMMIT}/Qwen3-0.6B.litertlm"
+GEMMA4_URL="https://huggingface.co/litert-community/gemma-4-E2B-it-litert-lm/resolve/${GEMMA4_COMMIT}/gemma-4-E2B-it.litertlm"
 
 # --- helpers ---
 sha_of() { shasum -a 256 "$1" | awk '{print $1}'; }
+
 expected_sha_of() {
-  # Read sha256 from manifest by trailing path. Strips comments and blank lines.
+  # Read sha256 from manifest by trailing path. Splits on a 2-space separator
+  # (so paths and sources may contain spaces safely).
   local rel="$1"
-  awk -v rel="$rel" '
+  awk -F '  +' -v rel="$rel" '
     /^[[:space:]]*#/ {next}
     /^[[:space:]]*$/  {next}
     {
@@ -39,7 +44,6 @@ expected_sha_of() {
 }
 
 verify_or_die() {
-  # $1 = path on disk (absolute), $2 = path key in manifest (relative to project root)
   local path="$1" key="$2"
   local got expected
   got=$(sha_of "$path")
@@ -57,7 +61,6 @@ verify_or_die() {
   echo "[ok] $key  sha256 verified"
 }
 
-# fetch_with_verify <url> <abs_dest> <manifest_key>
 fetch_with_verify() {
   local url="$1" dest="$2" key="$3"
   local expected; expected=$(expected_sha_of "$key")
@@ -96,8 +99,25 @@ for so in "${SO_FILES[@]}"; do
     || { echo "FATAL: $so is not aarch64 ELF" >&2; exit 1; }
 done
 
-# 3. Model (~2.41 GB, pinned commit)
-fetch_with_verify "$MODEL_URL" "$MODEL_DIR/gemma-4-E2B-it.litertlm" "models/gemma-4-E2B-it.litertlm"
+# 3. Model — default Qwen3-0.6B (works with v0.9.0). MODEL=both also fetches Gemma-4
+# (kept only for reproducibility; v0.9.0 binary cannot load it).
+MODEL="${MODEL:-qwen3}"
+case "$MODEL" in
+  qwen3)
+    fetch_with_verify "$QWEN3_URL" "$MODEL_DIR/Qwen3-0.6B.litertlm" "models/Qwen3-0.6B.litertlm"
+    ;;
+  gemma)
+    fetch_with_verify "$GEMMA4_URL" "$MODEL_DIR/gemma-4-E2B-it.litertlm" "models/gemma-4-E2B-it.litertlm"
+    ;;
+  both)
+    fetch_with_verify "$QWEN3_URL" "$MODEL_DIR/Qwen3-0.6B.litertlm" "models/Qwen3-0.6B.litertlm"
+    fetch_with_verify "$GEMMA4_URL" "$MODEL_DIR/gemma-4-E2B-it.litertlm" "models/gemma-4-E2B-it.litertlm"
+    ;;
+  *)
+    echo "FATAL: unknown MODEL='$MODEL' (use qwen3, gemma, or both)" >&2
+    exit 1
+    ;;
+esac
 
 echo
 echo "=== fetch_artifacts.sh done — all sha256 verified ==="

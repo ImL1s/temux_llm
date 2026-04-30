@@ -5,7 +5,12 @@ set -euo pipefail
 
 DEVICE_SERIAL="${DEVICE_SERIAL:-RFCNC0WNT9H}"   # default = S21+
 DEVICE_FOLDER="${DEVICE_FOLDER:-/data/local/tmp/litertlm}"
-MIN_TMP_FREE_MB="${MIN_TMP_FREE_MB:-3000}"      # 2,544 MiB artifact + ~456 MiB safety (S21+ ceiling after preserving user files)
+MODEL_FILE="${MODEL_FILE:-Qwen3-0.6B.litertlm}"  # default model that v0.9.0 supports
+MIN_TMP_FREE_MB="${MIN_TMP_FREE_MB:-3000}"      # 2,544 MiB artifact + ~456 MiB safety (real-world S21+ ceiling)
+
+# shellcheck source=scripts/_lib.sh
+source "$(cd "$(dirname "$0")" && pwd)/_lib.sh"
+omc_validate_device_folder "$DEVICE_FOLDER" || exit 1
 
 die() { echo "FATAL: $*" >&2; exit 1; }
 ok()  { echo "[ok] $*"; }
@@ -28,7 +33,7 @@ ok "ABI: $abi"
 soc=$(adb -s "$DEVICE_SERIAL" shell getprop ro.soc.model | tr -d '\r')
 case "$soc" in
   SM8350) ok "SoC: $soc (Snapdragon 888 — expected for S21+)" ;;
-  SM8750) ok "SoC: $soc (Snapdragon 8 Elite for Galaxy — backup S25)" ;;
+  SM8750) ok "SoC: $soc (Snapdragon 8 Elite for Galaxy — expected for S25)" ;;
   *) echo "[warn] unrecognized SoC: $soc — proceeding anyway" ;;
 esac
 
@@ -56,7 +61,7 @@ adb -s "$DEVICE_SERIAL" shell "touch /data/local/tmp/_omc_probe && rm /data/loca
   || die "/data/local/tmp not writable"
 ok "/data/local/tmp writable"
 
-# 7. Free space (parse `stat -f`, blocks * %s / MiB)
+# 7. Free space — Android 12+ toybox supports `stat -f -c '%s %a'`. Older Android may not.
 read -r blk_size avail_blk < <(adb -s "$DEVICE_SERIAL" shell "stat -f -c '%s %a' /data/local/tmp" | tr -d '\r')
 free_mb=$(( blk_size * avail_blk / 1024 / 1024 ))
 echo "[info] /data/local/tmp free: ${free_mb} MiB (need >= ${MIN_TMP_FREE_MB})"
@@ -69,8 +74,8 @@ ok "free space sufficient"
 PROJECT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 [[ -x "$PROJECT_ROOT/bin/litert_lm_main" ]] || die "bin/litert_lm_main missing — run scripts/fetch_artifacts.sh"
 [[ -d "$PROJECT_ROOT/bin/android_arm64" ]]  || die "bin/android_arm64/ missing — run scripts/fetch_artifacts.sh"
-[[ -f "$PROJECT_ROOT/models/gemma-4-E2B-it.litertlm" ]] || die "model missing — run scripts/fetch_artifacts.sh"
-ok "host artifacts present"
+[[ -f "$PROJECT_ROOT/models/$MODEL_FILE" ]] || die "model $MODEL_FILE missing — run scripts/fetch_artifacts.sh (or set MODEL_FILE=...)"
+ok "host artifacts present (model: $MODEL_FILE)"
 
 echo
 echo "=== preflight passed ==="

@@ -5,6 +5,8 @@
 # don't accidentally match the same words inside the input prompt body.
 #
 # Output: logs/summary.txt
+#
+# All grep pipelines append `|| true` so a missing field doesn't trip set -euo pipefail.
 set -euo pipefail
 PROJECT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 LOGS="$PROJECT_ROOT/logs"
@@ -14,10 +16,9 @@ trim() { sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//'; }
 
 extract_field() {
   # $1 = exact label inside BenchmarkInfo block, $2 = log file
-  # Matches lines like:   "    Time to first token: 1.62 s"
-  #                       "      Prefill Speed: 199.67 tokens/sec."
-  #                       "    - Init Total: 1565.57 ms"
-  grep -E "^[[:space:]]*-?[[:space:]]*${1}:" "$2" 2>/dev/null \
+  # Matches lines like "    Time to first token: 1.62 s" or "    - Init Total: 1565.57 ms".
+  # `|| true` swallows grep's exit-1 on no match so set -euo pipefail does not abort.
+  { grep -E "^[[:space:]]*-?[[:space:]]*${1}:" "$2" 2>/dev/null || true; } \
     | head -1 \
     | sed -E "s/^[[:space:]]*-?[[:space:]]*${1}:[[:space:]]*//" \
     | trim
@@ -25,17 +26,30 @@ extract_field() {
 
 extract_processed() {
   # "Prefill Turn 1: Processed 982 tokens in 4.918169165s duration."
-  # we want "982 tokens in 4.918s"
-  grep -E "^[[:space:]]*${1} Turn 1: Processed " "$2" 2>/dev/null \
+  { grep -E "^[[:space:]]*${1} Turn 1: Processed " "$2" 2>/dev/null || true; } \
     | head -1 \
     | sed -E "s/^[[:space:]]*${1} Turn 1: //" \
     | trim
 }
 
 count_signal() {
-  # Use grep | wc -l so the result is always exactly one number on stdout, even when there
-  # are zero matches (avoids set -e tripping or double-zero output from `grep -c`).
+  # grep | wc -l — always prints exactly one number, even on zero matches.
   grep -iE "$1" "$2" 2>/dev/null | wc -l | tr -d ' '
+}
+
+# Detect the model that was actually used in a benchmark log. The binary prints
+# "input_prompt_file=$DEVICE_FOLDER/long_prompt.txt" but the model path is in
+# "--model_path=...". We capture model name from `Init Model assets` ms line context, or
+# just report the model file present in models/ that was last modified.
+model_name_from_log() {
+  local f="$1"
+  # Try: line of the form "model_path=/data/local/tmp/litertlm/model.litertlm" (in v0.9.0
+  # the device-side basename is always model.litertlm because setup_litertlm_android.sh
+  # renames to that). So we cannot recover the original model name from the log alone —
+  # fall back to the most-recently-modified .litertlm in models/.
+  local most_recent
+  most_recent=$(ls -1t "$PROJECT_ROOT"/models/*.litertlm 2>/dev/null | head -1)
+  [[ -n "$most_recent" ]] && basename "$most_recent" || echo "unknown"
 }
 
 print_block() {
@@ -66,7 +80,8 @@ print_block() {
   echo "# LiteRT-LM benchmark summary  ($(date -u +%FT%TZ))"
   echo "# device:        ${DEVICE_SERIAL:-(unset)}"
   echo "# binary:        litert_lm_main v0.9.0 (android arm64)"
-  echo "# model:         $(basename "$(ls "$PROJECT_ROOT"/models/*.litertlm 2>/dev/null | head -1)" 2>/dev/null || echo unknown)"
+  echo "# model (host):  $(model_name_from_log "$LOGS/cpu_benchmark.log")"
+  echo "# (device-side filename is always 'model.litertlm' regardless of source)"
   echo
 
   for kind in cpu gpu; do
