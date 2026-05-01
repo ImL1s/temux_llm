@@ -8,7 +8,14 @@
 
 ## TL;DR
 
-A Termux user (or any HTTP client) on the S25 can now POST to `http://127.0.0.1:11434/api/generate`, and an Android foreground service in this repo's APK will spawn the v0.9.0 `litert_lm_main` binary, run inference on the GPU (Adreno 830 via OpenCL) or CPU, and return the generated text plus benchmark metrics as JSON. End-to-end latency for a tiny prompt: **2.3 s init + 1.5 s TTFT on CPU**, **18.7 s init + 0.24 s TTFT on GPU** (the GPU init paying its one-time OpenCL kernel-compile cost).
+A Termux user on the S21+ types `curl 127.0.0.1:11434/api/generate -d '{"prompt":"你好","backend":"gpu"}'` and the local model on the same device replies in Chinese — no network round-trip. The Android foreground service in this repo's APK spawns the v0.9.0 `litert_lm_main` binary, runs inference on the GPU (Adreno 660 via OpenCL) or CPU, and returns the generated text plus benchmark metrics as JSON.
+
+The brief's stated end goal — Termux / CLI / agents calling a local LLM the same way they'd call Ollama, on Android, with the runtime being LiteRT-LM — is achieved. Screenshot proof at `docs/screenshots/2026-05-01-termux-s21plus-end-to-end.png`.
+
+End-to-end latency on S21+ for the prompt "你好":
+- backend=gpu, **TTFT 0.71 s**, prefill 16 t/s, decode 12.23 t/s
+
+(S25 was also fully validated; numbers in earlier sections.)
 
 Brief constraint compliance:
 - bind only to `127.0.0.1` ✓ (`ss -tnlp | grep 11434` shows `[::ffff:127.0.0.1]:11434`)
