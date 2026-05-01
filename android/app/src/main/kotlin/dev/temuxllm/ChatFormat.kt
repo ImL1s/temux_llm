@@ -2,6 +2,7 @@ package dev.temuxllm
 
 import org.json.JSONArray
 import org.json.JSONObject
+import java.util.UUID
 
 /**
  * Flatten a chat-style messages array (OpenAI / Ollama / Anthropic shape) into a
@@ -119,6 +120,145 @@ object ChatFormat {
             return Result.Ok(sb.toString())
         }
         return Result.Ok(content.toString())
+    }
+
+    /**
+     * Render a list of tool definitions into a system-prompt instruction
+     * block. Accepts the three input shapes used by clients:
+     *
+     *   Anthropic   { name, description, input_schema:{type,properties,...} }
+     *   OpenAI Chat { type:"function", function:{ name, description, parameters } }
+     *   Ollama      { type:"function", function:{ name, description, parameters } }
+     *
+     * The block tells the model to emit a `{"tool_calls":[...]}` JSON object
+     * when it wants to invoke a tool — this is the lowest-common-denominator
+     * format we can reliably round-trip through any sufficiently capable
+     * model without depending on Gemma 4's native `<|tool_call>` tokens or
+     * model-specific chat templates. The HTTP layer parses the JSON back
+     * out and re-encodes per envelope (Anthropic tool_use, OpenAI tool_calls,
+     * Ollama tool_calls).
+     *
+     * Returns null if [tools] is null/empty (caller skips injection).
+     */
+    fun renderToolBlock(tools: JSONArray?): String? {
+        if (tools == null || tools.length() == 0) return null
+        val sb = StringBuilder()
+        sb.append("You have access to the following tools. ")
+        sb.append("If a tool is useful for the user's request, respond with ONLY a JSON object on its own — no prose, no markdown — in this exact format:\n\n")
+        sb.append("{\"tool_calls\":[{\"name\":\"<tool_name>\",\"arguments\":{<key>:<value>, ...}}]}\n\n")
+        sb.append("Use this format only when calling a tool. Otherwise respond normally with plain text.\n\n")
+        sb.append("Available tools:\n\n")
+        for (i in 0 until tools.length()) {
+            val t = tools.optJSONObject(i) ?: continue
+            val name: String
+            val desc: String
+            val params: Any?
+            val fn = t.optJSONObject("function")
+            if (fn != null) {
+                // OpenAI / Ollama style.
+                name = fn.optString("name", "")
+                desc = fn.optString("description", "")
+                params = fn.opt("parameters")
+            } else {
+                // Anthropic style.
+                name = t.optString("name", "")
+                desc = t.optString("description", "")
+                params = t.opt("input_schema") ?: t.opt("parameters")
+            }
+            if (name.isBlank()) continue
+            sb.append("- ").append(name)
+            if (desc.isNotBlank()) sb.append(": ").append(desc)
+            sb.append('\n')
+            if (params != null && params != JSONObject.NULL) {
+                sb.append("  schema: ").append(params.toString()).append('\n')
+            }
+        }
+        sb.append('\n')
+        return sb.toString()
+    }
+
+    /**
+     * Parse the model's raw output for tool-call JSON.
+     *
+     * Strategy: scan for the FIRST top-level JSON object that contains a
+     * `tool_calls` array. The model's surrounding chatter (if any) becomes
+     * `text`; the JSON itself is consumed. Tool calls without a `name` field
+     * are dropped silently. Argument-object parsing tolerates string keys
+     * with non-string values and is forgiving on whitespace.
+     */
+    data class ToolCall(val id: String, val name: String, val arguments: JSONObject)
+    data class ParsedOutput(val text: String, val toolCalls: List<ToolCall>)
+
+    fun parseToolCalls(raw: String): ParsedOutput {
+        if (raw.isBlank()) return ParsedOutput(raw, emptyList())
+        // Look for { ... "tool_calls" ... } anywhere in the buffer. Use a
+        // brace-balance walker (regex won't reliably balance nested braces).
+        val idx = findToolCallsObjectStart(raw)
+        if (idx < 0) return ParsedOutput(raw.trim(), emptyList())
+        val end = findMatchingBrace(raw, idx)
+        if (end < 0) return ParsedOutput(raw.trim(), emptyList())
+        val candidate = raw.substring(idx, end + 1)
+        val parsed = try { JSONObject(candidate) } catch (_: Throwable) { return ParsedOutput(raw.trim(), emptyList()) }
+        val arr = parsed.optJSONArray("tool_calls") ?: return ParsedOutput(raw.trim(), emptyList())
+        val calls = mutableListOf<ToolCall>()
+        for (i in 0 until arr.length()) {
+            val o = arr.optJSONObject(i) ?: continue
+            val n = o.optString("name").ifBlank { o.optJSONObject("function")?.optString("name") ?: "" }
+            if (n.isBlank()) continue
+            val a = when {
+                o.opt("arguments") is JSONObject -> o.optJSONObject("arguments")!!
+                o.opt("arguments") is String -> try { JSONObject(o.optString("arguments")) } catch (_: Throwable) { JSONObject() }
+                o.optJSONObject("function")?.opt("arguments") is JSONObject -> o.optJSONObject("function")!!.optJSONObject("arguments")!!
+                o.optJSONObject("function")?.opt("arguments") is String ->
+                    try { JSONObject(o.optJSONObject("function")!!.optString("arguments")) } catch (_: Throwable) { JSONObject() }
+                else -> JSONObject()
+            }
+            val id = "call_" + UUID.randomUUID().toString().replace("-", "").take(20)
+            calls += ToolCall(id = id, name = n, arguments = a)
+        }
+        val text = (raw.substring(0, idx) + raw.substring(end + 1)).trim()
+        return ParsedOutput(text, calls)
+    }
+
+    private fun findToolCallsObjectStart(s: String): Int {
+        // Scan for `"tool_calls"` (with quotes) and back up to the enclosing `{`.
+        val key = "\"tool_calls\""
+        val i = s.indexOf(key)
+        if (i < 0) return -1
+        var j = i - 1
+        while (j >= 0) {
+            if (s[j] == '{') return j
+            j -= 1
+        }
+        return -1
+    }
+
+    /** Returns the index of the `}` that closes the `{` at [start], or -1. */
+    private fun findMatchingBrace(s: String, start: Int): Int {
+        if (start < 0 || start >= s.length || s[start] != '{') return -1
+        var depth = 0
+        var inString = false
+        var escaped = false
+        var i = start
+        while (i < s.length) {
+            val c = s[i]
+            if (inString) {
+                if (escaped) { escaped = false }
+                else if (c == '\\') { escaped = true }
+                else if (c == '"') { inString = false }
+            } else {
+                when (c) {
+                    '"' -> inString = true
+                    '{' -> depth += 1
+                    '}' -> {
+                        depth -= 1
+                        if (depth == 0) return i
+                    }
+                }
+            }
+            i += 1
+        }
+        return -1
     }
 
     /**

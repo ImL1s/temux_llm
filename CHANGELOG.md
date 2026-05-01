@@ -9,6 +9,80 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 (no unreleased changes)
 
+## [0.3.2] — 2026-05-02
+
+### Tool calling — actually shipping this time
+
+`temux_llm` now parses tool calls out of the model's output and re-encodes
+them in each wire envelope's tool-use shape. Verified end-to-end on Galaxy
+S25 (SD 8 Elite, Adreno 830, 12 GB) with Gemma 4 E4B + 16k context: a
+`get_weather(city)` tool sent to all four envelopes round-trips through
+the model and comes back as the correct shape per protocol.
+
+How it works (no LiteRT-LM SDK `@Tool` compile-time API; we use a
+prompt-injection + output-parse approach so the same code works for any
+model that can follow simple instructions):
+
+1. The HTTP request's `tools` array is rendered into a system-prompt
+   block by `ChatFormat.renderToolBlock()`. Block accepts all three
+   client shapes — Anthropic `{name, description, input_schema}`,
+   OpenAI Chat / Ollama `{type:"function", function:{...}}` —
+   auto-detected per entry.
+2. The model is instructed to emit a `{"tool_calls":[...]}` JSON object
+   on its own when it wants to call a tool. Otherwise plain text.
+3. After inference, `ChatFormat.parseToolCalls()` walks the output
+   buffer with a brace-balance scanner (ignores `"` strings, escapes)
+   to find the first top-level JSON object containing `"tool_calls"`.
+4. Each parsed tool call is re-encoded per envelope:
+   - Ollama `/api/chat`: `message.tool_calls[].function.{name, arguments: object}`, `done_reason: "tool_calls"`
+   - OpenAI `/v1/chat/completions`: `choices[0].message.tool_calls[].{id, type, function:{name, arguments: stringified}}`, `finish_reason: "tool_calls"`, `content: null`
+   - Anthropic `/v1/messages`: `content[]` with `tool_use` blocks `{id, name, input: object}`, `stop_reason: "tool_use"`
+   - OpenAI `/v1/responses`: `output[]` with `function_call` items `{call_id, name, arguments: stringified}`
+
+### Streaming with tools
+
+When `tools` is present, the request follows the buffered path even when
+the client asked for streaming — we cannot spray the model's tool-call
+JSON to the client one token at a time. Instead, `runStreamBuffered`
+collects the full output, parses for tool calls, then synthesizes the
+wire-correct streaming frames via each encoder's new `emitBuffered`
+method. The client sees a real SSE stream (Anthropic content_block_start
+type:"tool_use" → input_json_delta → content_block_stop, OpenAI Chat
+tool_calls deltas → finish_reason: tool_calls + [DONE], OpenAI Responses
+function_call output_item.added → function_call_arguments.delta/.done →
+response.completed, etc.) but the deltas all arrive at once.
+
+Real-time streaming of tool-arg JSON characters one-at-a-time is
+deferred (it's a streaming-state-machine problem of ~Ollama's
+`tools/tools.go` complexity; minimal user-visible benefit when the
+agent client is waiting for the full call before executing).
+
+### CLI wrapper parity (`scripts/litertlm-native-wrapper.sh`)
+
+Adds `--tools <JSON>` flag matching the HTTP server's contract. Same
+Python-based tool-block renderer; same output parser. Termux users
+running `litertlm` directly (without the APK service) get equivalent
+tool-calling capability. Note: requires `python3` in Termux
+(`pkg install python`); install-termux-native.sh's embedded wrapper
+heredoc does NOT yet ship the new logic — sync deferred to a follow-up.
+
+### PR review fixes (chatgpt-codex-connector commit `77d3202`)
+
+1. **`/v1/models` listed IDs that resolve() didn't honor.** Before:
+   /v1/models returned all `.litertlm` files on disk; resolve() only
+   accepted names that mapped to the active staged file. Result:
+   model-pickers in client UIs would offer IDs that 404 on
+   `/v1/chat/completions`, `/v1/messages`, `/v1/responses`. Now: only
+   the active model is listed.
+2. **`temuxllm status` skipped `ensure_forward()`.** Host-side users
+   saw "service not reachable" even with the device fine, because
+   the script forgot to set up `adb forward tcp:11434 tcp:11434`.
+   `cmd_status` now calls `ensure_forward` like `launch` does.
+
+### Constraints unchanged
+HTTP binds 127.0.0.1 only • arm64-v8a • minSdk 33 • no new deps • no
+LlmEngine.kt API changes from v0.2.x callers.
+
 ## [0.3.1] — 2026-05-02
 
 ### Real Claude Code and Codex CLI now actually work end-to-end

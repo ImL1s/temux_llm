@@ -234,15 +234,21 @@ class ModelRegistry(private val context: Context, private val engine: LlmEngine)
      * the path is OpenAI-style. We include both shapes in the same document
      * — pure-OpenAI clients see `data:[...]`, Codex sees `models:[...]`,
      * neither breaks. Strict OpenAI parsers ignore unknown fields.
+     *
+     * Lists ONLY the active model. resolve() only honors names that map to
+     * the active staged file, so listing additional discovered .litertlm
+     * files would let model-pickers pick an ID that 404s on inference
+     * (caught by chatgpt-codex-connector's PR review).
      */
     fun openAiModels(): JSONObject {
         val openaiData = JSONArray()
         val ollamaModels = JSONArray()
         val createdEpoch = System.currentTimeMillis() / 1000
-        for (e in list()) {
+        val activeEntry = active()
+        if (activeEntry != null) {
             openaiData.put(
                 JSONObject().apply {
-                    put("id", e.name)
+                    put("id", activeEntry.name)
                     put("object", "model")
                     put("created", createdEpoch)
                     put("owned_by", "temuxllm")
@@ -250,24 +256,24 @@ class ModelRegistry(private val context: Context, private val engine: LlmEngine)
             )
             ollamaModels.put(
                 JSONObject().apply {
-                    put("name", e.name)
-                    put("model", e.name)
+                    put("name", activeEntry.name)
+                    put("model", activeEntry.name)
                     // Codex CLI 0.125 strictly requires `slug` and
                     // `display_name` per model — not in real Ollama's
                     // /api/tags shape, but harmless extras for parsers
                     // that ignore unknown fields.
-                    put("slug", e.name)
-                    put("display_name", e.name)
-                    put("modified_at", iso8601(e.modifiedAtMs))
-                    put("size", e.sizeBytes)
-                    put("digest", e.digest)
+                    put("slug", activeEntry.name)
+                    put("display_name", activeEntry.name)
+                    put("modified_at", iso8601(activeEntry.modifiedAtMs))
+                    put("size", activeEntry.sizeBytes)
+                    put("digest", activeEntry.digest)
                     put(
                         "details",
                         JSONObject().apply {
                             put("format", "litertlm")
-                            put("family", e.family)
-                            put("families", JSONArray().put(e.family))
-                            put("parameter_size", e.parameterSize)
+                            put("family", activeEntry.family)
+                            put("families", JSONArray().put(activeEntry.family))
+                            put("parameter_size", activeEntry.parameterSize)
                             put("quantization_level", "unknown")
                         },
                     )

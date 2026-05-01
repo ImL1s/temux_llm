@@ -106,6 +106,10 @@ pick_model() {
 }
 
 cmd_status() {
+  # `status` should be a no-friction probe — make sure adb forward is set up
+  # the same way `launch` does, otherwise host-side users see a misleading
+  # "service not reachable" while the device is actually fine.
+  ensure_forward
   local host
   host=$(probe_service)
   curl -fsS --max-time 3 "$host/api/version"

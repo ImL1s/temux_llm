@@ -193,7 +193,9 @@ class HttpServer(
                 ?: return errorJson(Response.Status.NOT_FOUND, "model '$requestedModel' not found")
         }
         val messages = body.optJSONArray("messages")
-        val prompt = when (val r = ChatFormat.flatten(messages)) {
+        val tools = body.optJSONArray("tools")
+        val toolBlock = ChatFormat.renderToolBlock(tools)
+        val prompt = when (val r = ChatFormat.flatten(messages, toolBlock)) {
             is ChatFormat.Result.Ok -> r.prompt
             is ChatFormat.Result.Bad -> return errorJson(Response.Status.BAD_REQUEST, r.message)
         }
@@ -201,12 +203,12 @@ class HttpServer(
         if (backend != "cpu" && backend != "gpu") {
             return errorJson(Response.Status.BAD_REQUEST, "backend must be cpu|gpu (got $backend)")
         }
-        // Ollama /api/chat convention: default stream=true.
         val stream = body.optBoolean("stream", true)
-        return if (stream) {
-            runStream(prompt, backend, NdjsonChatEncoder(resolved.name))
-        } else {
-            blockingGenerate(prompt, backend, resolved.name, ResponseShape.OllamaChat)
+        val hasTools = toolBlock != null
+        return when {
+            stream && hasTools -> runStreamBuffered(prompt, backend, NdjsonChatEncoder(resolved.name))
+            stream -> runStream(prompt, backend, NdjsonChatEncoder(resolved.name))
+            else -> blockingGenerate(prompt, backend, resolved.name, ResponseShape.OllamaChat, parseTools = hasTools)
         }
     }
 
@@ -220,7 +222,9 @@ class HttpServer(
                 ?: return errorJson(Response.Status.NOT_FOUND, "model '$requestedModel' not found")
         }
         val messages = body.optJSONArray("messages")
-        val prompt = when (val r = ChatFormat.flatten(messages)) {
+        val tools = body.optJSONArray("tools")
+        val toolBlock = ChatFormat.renderToolBlock(tools)
+        val prompt = when (val r = ChatFormat.flatten(messages, toolBlock)) {
             is ChatFormat.Result.Ok -> r.prompt
             is ChatFormat.Result.Bad -> return errorJson(Response.Status.BAD_REQUEST, r.message)
         }
@@ -229,10 +233,11 @@ class HttpServer(
             return errorJson(Response.Status.BAD_REQUEST, "backend must be cpu|gpu (got $backend)")
         }
         val stream = body.optBoolean("stream", false)
-        return if (stream) {
-            runStream(prompt, backend, OpenAiSseEncoder(resolved.name))
-        } else {
-            blockingGenerate(prompt, backend, resolved.name, ResponseShape.OpenAiChat)
+        val hasTools = toolBlock != null
+        return when {
+            stream && hasTools -> runStreamBuffered(prompt, backend, OpenAiSseEncoder(resolved.name))
+            stream -> runStream(prompt, backend, OpenAiSseEncoder(resolved.name))
+            else -> blockingGenerate(prompt, backend, resolved.name, ResponseShape.OpenAiChat, parseTools = hasTools)
         }
     }
 
@@ -260,7 +265,15 @@ class HttpServer(
             }
             else -> systemRaw.toString().takeIf { it.isNotBlank() }
         }
-        val prompt = when (val r = ChatFormat.flatten(messages, systemText)) {
+        val tools = body.optJSONArray("tools")
+        val toolBlock = ChatFormat.renderToolBlock(tools)
+        // Combine Anthropic top-level system text with the tool definitions
+        // block. If both are present the tool block goes first so the model
+        // sees its constraints up front.
+        val combinedSystem = listOfNotNull(toolBlock, systemText).filter { it.isNotBlank() }.let {
+            if (it.isEmpty()) null else it.joinToString("\n")
+        }
+        val prompt = when (val r = ChatFormat.flatten(messages, combinedSystem)) {
             is ChatFormat.Result.Ok -> r.prompt
             is ChatFormat.Result.Bad -> return errorJson(Response.Status.BAD_REQUEST, r.message)
         }
@@ -269,10 +282,11 @@ class HttpServer(
             return errorJson(Response.Status.BAD_REQUEST, "backend must be cpu|gpu (got $backend)")
         }
         val stream = body.optBoolean("stream", false)
-        return if (stream) {
-            runStream(prompt, backend, AnthropicSseEncoder(resolved.name))
-        } else {
-            blockingGenerate(prompt, backend, resolved.name, ResponseShape.AnthropicMessages)
+        val hasTools = toolBlock != null
+        return when {
+            stream && hasTools -> runStreamBuffered(prompt, backend, AnthropicSseEncoder(resolved.name))
+            stream -> runStream(prompt, backend, AnthropicSseEncoder(resolved.name))
+            else -> blockingGenerate(prompt, backend, resolved.name, ResponseShape.AnthropicMessages, parseTools = hasTools)
         }
     }
 
@@ -291,7 +305,12 @@ class HttpServer(
         // so Codex's agent loop with tool turns is parsed correctly.
         val input = body.opt("input")
         val instructions = body.optString("instructions").ifBlank { null }
-        val prompt: String = when (val r = ChatFormat.flattenResponsesInput(input, instructions)) {
+        val tools = body.optJSONArray("tools")
+        val toolBlock = ChatFormat.renderToolBlock(tools)
+        val combinedInstructions = listOfNotNull(toolBlock, instructions).filter { it.isNotBlank() }.let {
+            if (it.isEmpty()) null else it.joinToString("\n")
+        }
+        val prompt: String = when (val r = ChatFormat.flattenResponsesInput(input, combinedInstructions)) {
             is ChatFormat.Result.Ok -> r.prompt
             is ChatFormat.Result.Bad -> return errorJson(Response.Status.BAD_REQUEST, r.message)
         }
@@ -300,11 +319,83 @@ class HttpServer(
             return errorJson(Response.Status.BAD_REQUEST, "backend must be cpu|gpu (got $backend)")
         }
         val stream = body.optBoolean("stream", false)
-        return if (stream) {
-            runStream(prompt, backend, ResponsesSseEncoder(resolved.name))
-        } else {
-            blockingResponses(prompt, backend, resolved.name)
+        val hasTools = toolBlock != null
+        return when {
+            stream && hasTools -> runStreamBuffered(prompt, backend, ResponsesSseEncoder(resolved.name))
+            stream -> runStream(prompt, backend, ResponsesSseEncoder(resolved.name))
+            hasTools -> blockingResponsesWithTools(prompt, backend, resolved.name)
+            else -> blockingResponses(prompt, backend, resolved.name)
         }
+    }
+
+    /**
+     * Non-streaming /v1/responses with tool parsing. Same wire shape as
+     * Codex expects: an `output` array containing either a `message` item
+     * (text) or `function_call` items (tool calls), or both.
+     */
+    private fun blockingResponsesWithTools(prompt: String, backend: String, model: String): Response {
+        val r = engine.generateBlocking(prompt, backend)
+        if (r.error != null) {
+            return json(Response.Status.INTERNAL_ERROR, JSONObject().apply {
+                put("type", "error")
+                put("error", JSONObject().apply { put("code", "server_error"); put("message", r.error) })
+            })
+        }
+        val parsed = ChatFormat.parseToolCalls(r.text)
+        val outputItems = JSONArray()
+        if (parsed.text.isNotEmpty()) {
+            val msgId = "msg_" + UUID.randomUUID().toString().replace("-", "").take(20)
+            outputItems.put(
+                JSONObject().apply {
+                    put("id", msgId)
+                    put("type", "message")
+                    put("role", "assistant")
+                    put("status", "completed")
+                    put(
+                        "content",
+                        JSONArray().put(
+                            JSONObject().apply {
+                                put("type", "output_text")
+                                put("text", parsed.text)
+                                put("annotations", JSONArray())
+                            },
+                        ),
+                    )
+                },
+            )
+        }
+        for (tc in parsed.toolCalls) {
+            val callItemId = "fc_" + UUID.randomUUID().toString().replace("-", "").take(20)
+            outputItems.put(
+                JSONObject().apply {
+                    put("id", callItemId)
+                    put("type", "function_call")
+                    put("call_id", tc.id)
+                    put("name", tc.name)
+                    put("arguments", tc.arguments.toString())
+                    put("status", "completed")
+                },
+            )
+        }
+        return json(
+            Response.Status.OK,
+            JSONObject().apply {
+                put("id", "resp_" + UUID.randomUUID().toString().replace("-", "").take(24))
+                put("object", "response")
+                put("status", "completed")
+                put("model", model)
+                put("created_at", System.currentTimeMillis() / 1000)
+                put("output", outputItems)
+                put(
+                    "usage",
+                    JSONObject().apply {
+                        put("input_tokens", 0)
+                        put("output_tokens", r.outputTokens)
+                        put("total_tokens", r.outputTokens)
+                    },
+                )
+            },
+        )
     }
 
     private fun blockingResponses(prompt: String, backend: String, model: String): Response {
@@ -358,6 +449,52 @@ class HttpServer(
     }
 
     /* --------------------------- Shared streaming core --------------------------- */
+
+    /**
+     * Buffered streaming path. Used when the request includes `tools` and we
+     * therefore must NOT spray the model's tool-call JSON to the client one
+     * token at a time. Instead: run the engine to completion, parse for
+     * `{"tool_calls":[...]}`, then synthesize the wire-correct streaming
+     * frames via encoder.emitBuffered (which knows how to encode each
+     * envelope's tool_use / tool_calls / function_call shape).
+     *
+     * Trade-off: the client doesn't see partial deltas during the model's
+     * generation. For tool-driven turns this is fine — the agent is waiting
+     * for the tool selection, not displaying partial thoughts.
+     */
+    private fun runStreamBuffered(prompt: String, backend: String, encoder: StreamEncoder): Response {
+        val pipeIn = PipedInputStream(64 * 1024)
+        val pipeOut = PipedOutputStream(pipeIn)
+        thread(start = true, name = "litertlm-buffered") {
+            val writer = PrintWriter(pipeOut.writer(Charsets.UTF_8), false)
+            try {
+                val r = engine.generateBlocking(prompt, backend)
+                if (r.error != null) {
+                    encoder.emitError(writer, r.error!!)
+                } else {
+                    val parsed = ChatFormat.parseToolCalls(r.text)
+                    encoder.emitBuffered(
+                        writer,
+                        BufferedResult(
+                            text = parsed.text,
+                            toolCalls = parsed.toolCalls,
+                            durationMs = r.totalDurationMs,
+                            outputTokens = r.outputTokens,
+                            outputChars = r.text.length,
+                            backend = r.backend,
+                        ),
+                    )
+                }
+            } catch (t: Throwable) {
+                Log.e(TAG, "buffered worker failed", t)
+                try { encoder.emitError(writer, t.message ?: t.javaClass.simpleName) } catch (_: Throwable) {}
+            } finally {
+                try { writer.flush() } catch (_: Throwable) {}
+                try { writer.close() } catch (_: Throwable) {}
+            }
+        }
+        return newChunkedResponse(Response.Status.OK, encoder.contentType, pipeIn)
+    }
 
     /**
      * Drive one inference and frame each token through [encoder]. Pattern:
@@ -432,8 +569,14 @@ class HttpServer(
 
     private enum class ResponseShape { LegacyGenerate, OllamaChat, OpenAiChat, AnthropicMessages }
 
-    private fun blockingGenerate(prompt: String, backend: String, model: String, shape: ResponseShape): Response {
-        Log.i(TAG, "generate blocking shape=$shape backend=$backend model=$model prompt=${prompt.take(80)}…")
+    private fun blockingGenerate(
+        prompt: String,
+        backend: String,
+        model: String,
+        shape: ResponseShape,
+        parseTools: Boolean = false,
+    ): Response {
+        Log.i(TAG, "generate blocking shape=$shape backend=$backend model=$model tools=$parseTools prompt=${prompt.take(80)}…")
         val r = engine.generateBlocking(prompt, backend)
         if (r.error != null) {
             return when (shape) {
@@ -455,6 +598,14 @@ class HttpServer(
             }
         }
         val durationNs = r.totalDurationMs * 1_000_000L
+        // When tools are advertised, look in the model's output for the
+        // `{"tool_calls":[...]}` JSON object and split it out from any
+        // surrounding chatter. parsed.text is the prose remnant; parsed.toolCalls
+        // are the structured calls (may be empty if the model just chatted).
+        val parsed = if (parseTools) ChatFormat.parseToolCalls(r.text) else ChatFormat.ParsedOutput(r.text, emptyList())
+        val text = parsed.text
+        val toolCalls = parsed.toolCalls
+        val hasTools = toolCalls.isNotEmpty()
         return when (shape) {
             ResponseShape.LegacyGenerate -> json(
                 Response.Status.OK,
@@ -479,10 +630,30 @@ class HttpServer(
                     put("created_at", ModelRegistry.iso8601(System.currentTimeMillis()))
                     put(
                         "message",
-                        JSONObject().apply { put("role", "assistant"); put("content", r.text) },
+                        JSONObject().apply {
+                            put("role", "assistant")
+                            put("content", text)
+                            if (hasTools) {
+                                val arr = JSONArray()
+                                for (tc in toolCalls) {
+                                    arr.put(
+                                        JSONObject().apply {
+                                            put(
+                                                "function",
+                                                JSONObject().apply {
+                                                    put("name", tc.name)
+                                                    put("arguments", tc.arguments)
+                                                },
+                                            )
+                                        },
+                                    )
+                                }
+                                put("tool_calls", arr)
+                            }
+                        },
                     )
                     put("done", true)
-                    put("done_reason", "stop")
+                    put("done_reason", if (hasTools) "tool_calls" else "stop")
                     put("total_duration", durationNs)
                     put("eval_count", r.outputTokens)
                     put("backend", r.backend)
@@ -504,10 +675,30 @@ class HttpServer(
                                     "message",
                                     JSONObject().apply {
                                         put("role", "assistant")
-                                        put("content", r.text)
+                                        put("content", if (text.isEmpty() && hasTools) JSONObject.NULL else text)
+                                        if (hasTools) {
+                                            val arr = JSONArray()
+                                            for (tc in toolCalls) {
+                                                arr.put(
+                                                    JSONObject().apply {
+                                                        put("id", tc.id)
+                                                        put("type", "function")
+                                                        put(
+                                                            "function",
+                                                            JSONObject().apply {
+                                                                put("name", tc.name)
+                                                                // OpenAI requires `arguments` as a string.
+                                                                put("arguments", tc.arguments.toString())
+                                                            },
+                                                        )
+                                                    },
+                                                )
+                                            }
+                                            put("tool_calls", arr)
+                                        }
                                     },
                                 )
-                                put("finish_reason", "stop")
+                                put("finish_reason", if (hasTools) "tool_calls" else "stop")
                             },
                         ),
                     )
@@ -529,15 +720,42 @@ class HttpServer(
                     put("role", "assistant")
                     put(
                         "content",
-                        JSONArray().put(
-                            JSONObject().apply {
-                                put("type", "text")
-                                put("text", r.text)
-                            },
-                        ),
+                        JSONArray().apply {
+                            // Anthropic content array: text block (if any),
+                            // followed by one tool_use block per parsed call.
+                            if (text.isNotEmpty()) {
+                                put(
+                                    JSONObject().apply {
+                                        put("type", "text")
+                                        put("text", text)
+                                    },
+                                )
+                            }
+                            for (tc in toolCalls) {
+                                val toolUseId = "toolu_" + UUID.randomUUID().toString().replace("-", "").take(20)
+                                put(
+                                    JSONObject().apply {
+                                        put("type", "tool_use")
+                                        put("id", toolUseId)
+                                        put("name", tc.name)
+                                        put("input", tc.arguments)
+                                    },
+                                )
+                            }
+                            // If neither text nor tools, emit an empty text block
+                            // so clients with strict shape parsers don't choke.
+                            if (this.length() == 0) {
+                                put(
+                                    JSONObject().apply {
+                                        put("type", "text")
+                                        put("text", "")
+                                    },
+                                )
+                            }
+                        },
                     )
                     put("model", model)
-                    put("stop_reason", "end_turn")
+                    put("stop_reason", if (hasTools) "tool_use" else "end_turn")
                     put("stop_sequence", JSONObject.NULL)
                     put(
                         "usage",
