@@ -1,6 +1,7 @@
 package dev.temuxllm
 
 import android.content.Context
+import android.os.Build
 import android.util.Log
 import com.google.ai.edge.litertlm.Backend
 import com.google.ai.edge.litertlm.Engine
@@ -9,6 +10,7 @@ import com.google.ai.edge.litertlm.Message
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.sync.withLock
 import java.io.File
 
 /**
@@ -31,7 +33,7 @@ import java.io.File
  * calls with a single mutex. NanoHTTPD's per-request thread will block until prior
  * requests finish, which is correct behavior for a single-GPU device.
  */
-class LlmEngine(private val context: Context) {
+class LlmEngine(private val context: Context) : LlmEngineApi {
 
     companion object {
         private const val TAG = "LlmEngine"
@@ -42,9 +44,21 @@ class LlmEngine(private val context: Context) {
     @Volatile private var activeBackend: String = ""
     private val lock = Any()
 
-    fun modelDir(): File = File(context.filesDir, "litertlm").apply { mkdirs() }
-    fun activeModelPath(): File = File(modelDir(), "model.litertlm")
-    fun isLoaded(): Boolean = engine != null
+    /**
+     * Serializes inference requests across the entire generate() collect path.
+     * The previous code only locked ensureEngine() — concurrent /api/chat
+     * requests could call createConversation().sendMessageAsync() in parallel,
+     * which the SDK's single-Engine + single-Conversation model does not
+     * support (codex outside-review caught this race v0.4.0). All callers of
+     * generate() / generateBlocking() pass through this lock so that NanoHTTPD's
+     * per-request worker thread blocks until the prior inference finishes,
+     * which is the correct behavior on a single-GPU device.
+     */
+    private val inferenceMutex = kotlinx.coroutines.sync.Mutex()
+
+    override fun modelDir(): File = File(context.filesDir, "litertlm").apply { mkdirs() }
+    override fun activeModelPath(): File = File(modelDir(), "model.litertlm")
+    override fun isLoaded(): Boolean = engine != null
 
     /**
      * One-time model copy from /data/local/tmp/litertlm/model.litertlm into our
@@ -114,7 +128,7 @@ class LlmEngine(private val context: Context) {
             backend = backendInst,
             maxNumTokens = maxTokens,
         )
-        Log.i(TAG, "Engine.initialize(backend=$backend) starting")
+        Log.i(TAG, "Engine.initialize(backend=$backend) starting maxTokens=$maxTokens")
         val t0 = System.currentTimeMillis()
         val e = Engine(cfg)
         e.initialize()
@@ -122,6 +136,21 @@ class LlmEngine(private val context: Context) {
         Log.i(TAG, "Engine.initialize(backend=$backend) done in $dt ms")
         engine = e
         activeBackend = backend
+        // Stamp the running configuration into the process so a future LMK
+        // post-mortem can recover it via getHistoricalProcessExitReasons.
+        try {
+            if (Build.VERSION.SDK_INT >= 30) {
+                val am = context.getSystemService(Context.ACTIVITY_SERVICE) as android.app.ActivityManager
+                val packed = AutoFallback.packStateSummary(
+                    maxNumTokens = maxTokens,
+                    backend = backend,
+                    modelName = activeModelPath().nameWithoutExtension,
+                )
+                am.setProcessStateSummary(packed)
+            }
+        } catch (t: Throwable) {
+            Log.w(TAG, "setProcessStateSummary failed", t)
+        }
         return e
     }
 
@@ -131,47 +160,43 @@ class LlmEngine(private val context: Context) {
      *
      * The SDK's sendMessageAsync returns Flow<Message>; we re-emit each Message's
      * text into our own GenerateEvent stream and close with a Done summary.
+     *
+     * The full collect path is serialized on [inferenceMutex]: concurrent
+     * /api/chat requests must NOT call createConversation().sendMessageAsync()
+     * in parallel (the SDK's Engine is single-inference-at-a-time). Per
+     * codex outside-review, the prior code only locked engine init, not
+     * the whole inference path.
      */
-    sealed class GenerateEvent {
-        data class Token(val text: String) : GenerateEvent()
-        data class Done(
-            val backend: String,
-            val totalDurationMs: Long,
-            val outputTokens: Int,
-            val outputChars: Int,
-        ) : GenerateEvent()
-        data class Error(val message: String, val cause: Throwable? = null) : GenerateEvent()
-    }
-
-    fun generate(prompt: String, backend: String): Flow<GenerateEvent> = flow {
-        val started = System.currentTimeMillis()
-        val accum = StringBuilder()
-        var tokens = 0
-        try {
-            val e = synchronized(lock) { ensureEngine(backend) }
-            // Single-conversation per request — fresh state, deterministic.
-            e.createConversation().use { conv ->
-                conv.sendMessageAsync(prompt).collect { msg: Message ->
-                    val piece = msg.toString()
-                    if (piece.isNotEmpty()) {
-                        accum.append(piece)
-                        tokens += 1
-                        emit(GenerateEvent.Token(piece))
+    override fun generate(prompt: String, backend: String): Flow<GenerateEvent> = flow {
+        inferenceMutex.withLock {
+            val started = System.currentTimeMillis()
+            val accum = StringBuilder()
+            var tokens = 0
+            try {
+                val e = synchronized(lock) { ensureEngine(backend) }
+                e.createConversation().use { conv ->
+                    conv.sendMessageAsync(prompt).collect { msg: Message ->
+                        val piece = msg.toString()
+                        if (piece.isNotEmpty()) {
+                            accum.append(piece)
+                            tokens += 1
+                            emit(GenerateEvent.Token(piece))
+                        }
                     }
                 }
-            }
-            val total = System.currentTimeMillis() - started
-            emit(
-                GenerateEvent.Done(
-                    backend = backend,
-                    totalDurationMs = total,
-                    outputTokens = tokens,
-                    outputChars = accum.length,
+                val total = System.currentTimeMillis() - started
+                emit(
+                    GenerateEvent.Done(
+                        backend = backend,
+                        totalDurationMs = total,
+                        outputTokens = tokens,
+                        outputChars = accum.length,
+                    )
                 )
-            )
-        } catch (t: Throwable) {
-            Log.e(TAG, "generate failed", t)
-            emit(GenerateEvent.Error(t.message ?: t.javaClass.simpleName, t))
+            } catch (t: Throwable) {
+                Log.e(TAG, "generate failed", t)
+                emit(GenerateEvent.Error(t.message ?: t.javaClass.simpleName, t))
+            }
         }
     }
 
@@ -179,7 +204,7 @@ class LlmEngine(private val context: Context) {
      * Blocking convenience for non-streaming `/api/generate`. Drains the flow into
      * one final string + metrics.
      */
-    fun generateBlocking(prompt: String, backend: String): GenerateResult = runBlocking {
+    override fun generateBlocking(prompt: String, backend: String): GenerateResult = runBlocking {
         val text = StringBuilder()
         var tokens = 0
         var doneEvent: GenerateEvent.Done? = null
@@ -200,20 +225,22 @@ class LlmEngine(private val context: Context) {
         )
     }
 
-    data class GenerateResult(
-        val text: String,
-        val backend: String,
-        val outputTokens: Int,
-        val totalDurationMs: Long,
-        val error: String?,
-    )
-
     fun close() {
         synchronized(lock) {
             try { engine?.close() } catch (t: Throwable) { Log.w(TAG, "close failed", t) }
             engine = null
             activeBackend = ""
         }
+    }
+
+    /**
+     * Variant of [close] that also acquires [inferenceMutex] so concurrent
+     * generate() flows finish (or fail safely) before we tear down the
+     * JNI handle. Called by LlmService.onTrimMemory(RUNNING_CRITICAL) per
+     * codex outside-review v0.4.0 (close was racing with in-flight work).
+     */
+    fun closeUnderInferenceLock() {
+        runBlocking { inferenceMutex.withLock { close() } }
     }
 
     /**
@@ -228,7 +255,17 @@ class LlmEngine(private val context: Context) {
      *   else    → 32768  (Tab S10 Ultra and similar 24+ GB devices)
      */
     private fun computeMaxNumTokens(): Int {
-        // 1) <filesDir>/temuxllm.conf, line `max_tokens=<int>`.
+        // Priority chain (highest first):
+        //   1)  <filesDir>/temuxllm.conf            user-owned, app-private
+        //   1b) /data/local/tmp/litertlm/temuxllm.conf  user-owned, adb-pushable
+        //   2)  <filesDir>/auto_max_tokens.conf     post-LMK auto-downshift
+        //   3)  TEMUXLLM_MAX_TOKENS env var         rarely propagated
+        //   4)  /proc/meminfo tier table            auto-detect
+        //
+        // codex outside-review v0.4.0 caught that the auto-downshift file
+        // must NOT take precedence over the manual /data/local/tmp path —
+        // that's the existing supported override channel for users who
+        // can't write into the app's filesDir.
         try {
             val cfg = File(context.filesDir, "temuxllm.conf")
             if (cfg.exists()) {
@@ -265,7 +302,22 @@ class LlmEngine(private val context: Context) {
         } catch (t: Throwable) {
             Log.w(TAG, "computeMaxNumTokens: /data/local/tmp/.../temuxllm.conf read failed", t)
         }
-        // 2) Env var (rarely honored by Android service inheritance).
+        // 2) auto_max_tokens.conf — populated by AutoFallback after a
+        //    previous LMK kill. Below both manual override paths so a
+        //    user adb-push to /data/local/tmp/.../temuxllm.conf always
+        //    wins. Fingerprint check invalidates the value if hardware
+        //    has changed between the recorded LMK and now.
+        try {
+            val fp = AutoFallback.deviceFingerprint(context)
+            val auto = AutoFallback.readPersistedFallback(context, fp)
+            if (auto != null && auto > 0) {
+                Log.i(TAG, "computeMaxNumTokens: $auto from auto_max_tokens.conf (post-LMK fallback)")
+                return auto
+            }
+        } catch (t: Throwable) {
+            Log.w(TAG, "computeMaxNumTokens: auto_max_tokens.conf read failed", t)
+        }
+        // 3) Env var (rarely honored by Android service inheritance).
         val ctxEnv = System.getenv("TEMUXLLM_MAX_TOKENS")?.toIntOrNull()
         if (ctxEnv != null && ctxEnv > 0) {
             Log.i(TAG, "computeMaxNumTokens: $ctxEnv from TEMUXLLM_MAX_TOKENS env")

@@ -12,7 +12,7 @@ import java.util.UUID
  *   - OpenAI-compat /v1/chat/completions -> SSE (data: ... [DONE])
  *   - Anthropic-compat /v1/messages -> SSE (named events)
  *
- * All four encoders consume the same LlmEngine.GenerateEvent stream; the
+ * All four encoders consume the same GenerateEvent stream; the
  * difference is purely framing + final/error event vocabulary.
  *
  * Convention: encoders flush after every frame so the client sees tokens as

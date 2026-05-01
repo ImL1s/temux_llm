@@ -29,7 +29,7 @@ import java.util.TimeZone
  * 0.11's tool-calling support depends on the loaded model and the SDK's
  * ConversationConfig.tools API path. Default ["completion"].
  */
-class ModelRegistry(private val context: Context, private val engine: LlmEngine) {
+class ModelRegistry(private val context: Context, private val engine: LlmEngineApi) {
 
     data class Entry(
         val name: String,

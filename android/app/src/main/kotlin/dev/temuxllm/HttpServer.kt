@@ -40,7 +40,7 @@ import kotlin.concurrent.thread
  */
 class HttpServer(
     private val context: Context,
-    private val engine: LlmEngine,
+    private val engine: LlmEngineApi,
     private val registry: ModelRegistry,
 ) : NanoHTTPD(BIND, PORT) {
 
@@ -540,14 +540,14 @@ class HttpServer(
                 runBlocking {
                     engine.generate(prompt, backend).collect { ev ->
                         when (ev) {
-                            is LlmEngine.GenerateEvent.Token -> {
+                            is GenerateEvent.Token -> {
                                 if (!startEmitted) {
                                     encoder.emitStart(writer)
                                     startEmitted = true
                                 }
                                 encoder.emitToken(writer, ev.text)
                             }
-                            is LlmEngine.GenerateEvent.Done -> {
+                            is GenerateEvent.Done -> {
                                 if (!startEmitted) {
                                     encoder.emitStart(writer)
                                     startEmitted = true
@@ -555,7 +555,7 @@ class HttpServer(
                                 encoder.emitDone(writer, ev.totalDurationMs, ev.outputTokens, ev.outputChars, ev.backend)
                                 terminated = true
                             }
-                            is LlmEngine.GenerateEvent.Error -> {
+                            is GenerateEvent.Error -> {
                                 encoder.emitError(writer, ev.message)
                                 terminated = true
                             }
@@ -809,19 +809,54 @@ class HttpServer(
     }
 
     private fun readPostBodyAsUtf8(session: IHTTPSession): String {
-        val cl = session.headers["content-length"]?.toLongOrNull() ?: 0L
-        if (cl <= 0L) return ""
-        if (cl > MAX_BODY) throw BodyTooLarge()
-        val limit = cl.toInt()
-        val buf = ByteArray(limit)
-        var pos = 0
+        // Two paths:
+        //   1) Content-Length header set -> short-circuit: reject early with
+        //      413 if larger than MAX_BODY, otherwise bounded read.
+        //   2) Chunked / unknown-length body -> stream up to MAX_BODY+1 bytes.
+        //      If we read past MAX_BODY without EOF, throw BodyTooLarge so
+        //      the outer serve() catch returns a real 413 instead of silently
+        //      truncating (codex outside-review v0.4.0 caught the silent
+        //      truncation case).
+        val cl = session.headers["content-length"]?.toLongOrNull()
         val ins = session.inputStream
-        while (pos < limit) {
-            val n = ins.read(buf, pos, limit - pos)
-            if (n <= 0) break
-            pos += n
+        if (cl != null) {
+            // Content-Length: 0 -> empty body. Don't fall through to the
+            // streaming path (codex review v0.4.0: would tie up a worker
+            // thread blocked on a keep-alive connection).
+            if (cl == 0L) return ""
+            if (cl > 0L) {
+                if (cl > MAX_BODY) throw BodyTooLarge()
+                val limit = cl.toInt()
+                val buf = ByteArray(limit)
+                var pos = 0
+                while (pos < limit) {
+                    val n = ins.read(buf, pos, limit - pos)
+                    if (n <= 0) break
+                    pos += n
+                }
+                return String(buf, 0, pos, Charsets.UTF_8)
+            }
+            // Negative Content-Length is malformed; treat as empty.
+            return ""
         }
-        return String(buf, 0, pos, Charsets.UTF_8)
+        // No Content-Length header at all -> chunked / unknown-length body.
+        // Read defensively: as soon as we exceed MAX_BODY by even one
+        // byte, abort with 413 so an attacker can't drive memory by
+        // streaming a multi-GB body. codex review v0.4.0 caught the
+        // off-by-one (`total > MAX_BODY+1` would silently accept exactly
+        // MAX_BODY+1 bytes); now we throw the moment we cross MAX_BODY.
+        val out = java.io.ByteArrayOutputStream()
+        val chunk = ByteArray(8 * 1024)
+        var total = 0
+        while (true) {
+            val n = ins.read(chunk)
+            if (n <= 0) break
+            total += n
+            if (total > MAX_BODY) throw BodyTooLarge()
+            out.write(chunk, 0, n)
+        }
+        if (total == 0) return ""
+        return String(out.toByteArray(), Charsets.UTF_8)
     }
 
     private fun text(status: Response.Status, body: String): Response =

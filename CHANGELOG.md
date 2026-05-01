@@ -9,6 +9,121 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 (no unreleased changes)
 
+## [0.4.0] — 2026-05-02
+
+### Test foundation + memory observability + Codex pre-merge fixes
+
+The first release with a unit-test suite. v0.3.x had no tests; v0.4.0 adds
+JUnit 4 + MockK + kotlinx-coroutines-test + JSONassert and a 45-test
+regression net covering ChatFormat, StreamEncoders, AutoFallback,
+plus the prompt-injection guard introduced in v0.3.2. `./gradlew
+:app:testDebugUnitTest` is now part of the build matrix.
+
+#### TDD foundation
+
+- `LlmEngineApi` interface extracted from `LlmEngine`. `GenerateEvent`
+  and `GenerateResult` moved to top-level so test fakes don't drag in
+  the concrete LiteRT-LM JNI wrapper.
+- 45 tests across 4 files covering the wire formats and contract
+  surfaces an HTTP server tests should never let regress:
+  `ChatFormatTest` (22 tests), `StreamEncodersTest` (14 tests),
+  `AutoFallbackTest` (7 tests), `SmokeTest` (2 tests).
+
+#### Engine inference mutex (codex BLOCKER fix)
+
+The previous lock only synchronized `ensureEngine()`. Concurrent
+`/api/chat` requests could call `createConversation().sendMessageAsync()`
+in parallel, which the SDK does not support — codex outside-review
+caught this as a pre-existing race. `LlmEngine.generate()` now holds
+`inferenceMutex.withLock` around the whole collect path. NanoHTTPD's
+per-request worker threads serialize on the mutex, which is correct on
+a single-GPU device.
+
+#### Memory observability + auto-fallback after LMK
+
+- `MemoryProbe` utility samples PSS / VmHWM / VmSwap /
+  `oom_score_adj` / `summary.graphics` / availMem every 5 s and writes
+  a structured logcat tag `MemProbe` plus `<filesDir>/memory.csv` for
+  off-device analysis. Reuses a single BufferedWriter to avoid the
+  probe driving its own RSS up.
+- `AutoFallback` reads `getHistoricalProcessExitReasons` (most-recent
+  record only — codex caught that scanning 5 history entries would
+  re-trigger downshift on every restart even after a clean exit). If
+  the previous exit was `REASON_LOW_MEMORY` or a SIGKILL with the
+  packed state summary present, `nextLowerTier()` steps the
+  `maxNumTokens` ceiling one rung down (4096 / 8192 / 16384 / 24576 /
+  32768), and persists the new value to
+  `<filesDir>/auto_max_tokens.conf` with a device fingerprint
+  (BOARD + SOC_MODEL + GB-tier).
+- `setProcessStateSummary(byte[14])` is called at engine init with a
+  binary-packed `(version=1, maxNumTokens=int32, backend=byte,
+  modelHash=int64)` payload so the next post-mortem can identify
+  exactly what was loaded when the LMK fired.
+- `Service.onTrimMemory(level)` matches `RUNNING_CRITICAL` AND
+  `COMPLETE` only (codex caught: `>= RUNNING_CRITICAL` would catch
+  `UI_HIDDEN`, which is benign — TRIM constants are not linearly
+  ordered). When triggered, `engine.closeUnderInferenceLock()`
+  serializes with any in-flight `generate()` flow before tearing
+  down the JNI handle.
+
+#### `computeMaxNumTokens()` priority chain
+
+Updated for v0.4.0 so manual user overrides always win over
+auto-fallback:
+
+  1. `<filesDir>/temuxllm.conf` (user-owned, app-private)
+  2. `/data/local/tmp/litertlm/temuxllm.conf` (user-owned, adb-pushable)
+  3. `<filesDir>/auto_max_tokens.conf` (post-LMK auto-downshift)
+  4. `TEMUXLLM_MAX_TOKENS` env var
+  5. /proc/meminfo tier auto-detect
+
+Codex caught that v0.3.3 placed the auto file above the
+adb-pushable override; v0.4.0 fixes the order.
+
+#### `readPostBodyAsUtf8` chunked-body 413
+
+The 4 MiB body cap was previously enforced only via `Content-Length`
+header. Chunked or unknown-length bodies bypassed it. v0.4.0 streams
+the body with `MAX_BODY` cap regardless: as soon as we cross the cap
+even by one byte, we throw `BodyTooLarge` and the outer catch
+returns `413 Request Entity Too Large`. Codex caught the off-by-one
+(was `total > MAX_BODY + 1`, i.e. silently accepted exactly
+`MAX_BODY + 1` bytes); v0.4.0 throws on `total > MAX_BODY`. Plus
+`Content-Length: 0` is treated as an empty body explicitly and does
+NOT fall through to the streaming path (would have tied up a worker
+thread on keep-alive connections).
+
+#### `install.sh` model picker now factors RAM
+
+Choosing `gemma-4-E2B-it.litertlm` vs `gemma-4-E4B-it.litertlm` now
+considers BOTH SoC class and total RAM. High-end SoC + ≥ 11 GB RAM
+gets E4B; high-end SoC + < 11 GB gets E2B (2.4 GB on disk frees
+~1 GB more KV headroom on tight devices). Documented in the
+installer banner.
+
+### Deferred (out of scope, will revisit)
+
+- **FGS type → `mediaPlayback`** (was originally targeted for v0.4):
+  codex caught that targetSdk 35 + Android 15+ disallows starting a
+  `mediaPlayback` foreground service from `BOOT_COMPLETED`, breaking
+  our boot autostart. Possible fix: declare
+  `dataSync|mediaPlayback`, start with `dataSync` from boot, upgrade
+  on user interaction. Its own design problem; deferred.
+- **Stateful ConversationPool**: codex caught (a) standard CLI
+  clients resend full message history every turn → naive pooling
+  duplicates content; (b) without `Conversation::Clone()` JNI the
+  pool gives no real KV-sharing benefit. Defer to v0.5+.
+- **llama.cpp + Adreno OpenCL backend** as an alternative engine
+  path (Q4 KV cache → 32 k+ context). Long-term lever, large
+  engineering effort.
+- **Native JNI binding for `Conversation::Clone()`** in LiteRT-LM.
+  File upstream feature request first.
+
+### Constraints unchanged
+
+HTTP binds 127.0.0.1 only • arm64-v8a • minSdk 33 • no new runtime
+dependencies (test deps only).
+
 ## [0.3.3] — 2026-05-02
 
 ### Tool name validation (codex outside-review blocker)

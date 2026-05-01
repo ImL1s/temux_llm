@@ -70,14 +70,30 @@ echo "  $DEVICE_SERIAL  $MODEL_NAME  SoC=$SOC  ABI=$ABI  Android=$RELEASE"
 [[ "$ABI" == "arm64-v8a" ]] || die "device ABI is $ABI, expected arm64-v8a"
 
 # ---- 3. pick model ----
+# Choice depends on BOTH SoC class AND total RAM. E4B is 3.4 GB on disk and
+# wants ~6 GB process RSS at 16 k context — that fits comfortably on a 12 GB
+# device but pushes 8 GB phones close to the lowmemorykiller cliff. E2B
+# (2.4 GB on disk, ~4 GB RSS) leaves ~1 GB more KV headroom on tight devices,
+# at the cost of being a smaller model. Auto-detect via /proc/meminfo
+# (in kB) and step down to E2B if RAM is < 11 GB physical (8 GB tier).
+TOTAL_MEM_KB=$(adb -s "$DEVICE_SERIAL" shell 'cat /proc/meminfo' | sed -n 's/^MemTotal:[[:space:]]*\([0-9]*\) kB.*/\1/p')
+TOTAL_MEM_GB=$(( (TOTAL_MEM_KB + 524288) / 1024 / 1024 ))
+echo "  device RAM ≈ ${TOTAL_MEM_GB} GB"
 if [[ -z "${MODEL:-}" ]]; then
   case "$SOC" in
     SM8750|SM8650|SM8550|SM8450|MT6989|MT6991|MT6993)
-      MODEL=e4b
-      echo "  detected high-end SoC ($SOC); defaulting to gemma-4-E4B (3.4 GB)" ;;
+      if [[ "$TOTAL_MEM_GB" -ge 11 ]]; then
+        MODEL=e4b
+        echo "  high-end SoC ($SOC) + ${TOTAL_MEM_GB} GB RAM -> gemma-4-E4B (3.4 GB)"
+      else
+        MODEL=e2b
+        echo "  high-end SoC ($SOC) but only ${TOTAL_MEM_GB} GB RAM -> gemma-4-E2B (2.4 GB) for KV headroom"
+      fi
+      ;;
     *)
       MODEL=e2b
-      echo "  defaulting to gemma-4-E2B (2.4 GB) — set MODEL=e4b to try the bigger one" ;;
+      echo "  ${SOC} (${TOTAL_MEM_GB} GB) -> gemma-4-E2B (2.4 GB); set MODEL=e4b to try the bigger one"
+      ;;
   esac
 fi
 case "$MODEL" in
