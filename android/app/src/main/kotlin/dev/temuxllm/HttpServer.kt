@@ -42,6 +42,7 @@ class HttpServer(
     private val context: Context,
     private val engine: LlmEngineApi,
     private val registry: ModelRegistry,
+    private val memoryProbe: MemoryProbe? = null,
 ) : NanoHTTPD(BIND, PORT) {
 
     companion object {
@@ -481,6 +482,7 @@ class HttpServer(
         val pipeOut = PipedOutputStream(pipeIn)
         thread(start = true, name = "litertlm-buffered") {
             val writer = PrintWriter(pipeOut.writer(Charsets.UTF_8), false)
+            memoryProbe?.start("buffered backend=$backend tools=${allowedToolNames.size}")
             try {
                 val r = engine.generateBlocking(prompt, backend)
                 if (r.error != null) {
@@ -508,6 +510,7 @@ class HttpServer(
             } finally {
                 try { writer.flush() } catch (_: Throwable) {}
                 try { writer.close() } catch (_: Throwable) {}
+                try { memoryProbe?.stop() } catch (_: Throwable) {}
             }
         }
         return newChunkedResponse(Response.Status.OK, encoder.contentType, pipeIn)
@@ -527,6 +530,7 @@ class HttpServer(
         val pipeOut = PipedOutputStream(pipeIn)
         thread(start = true, name = "litertlm-stream") {
             val writer = PrintWriter(pipeOut.writer(Charsets.UTF_8), false)
+            memoryProbe?.start("stream backend=$backend")
             // Defer emitStart() until the first token actually arrives. If the
             // engine errors during init (e.g. token-limit overflow or backend
             // failure) BEFORE producing any output, we emit only the error
@@ -577,6 +581,7 @@ class HttpServer(
             } finally {
                 try { writer.flush() } catch (_: Throwable) {}
                 try { writer.close() } catch (_: Throwable) {}
+                try { memoryProbe?.stop() } catch (_: Throwable) {}
             }
         }
         return newChunkedResponse(Response.Status.OK, encoder.contentType, pipeIn)
@@ -595,7 +600,8 @@ class HttpServer(
         allowedToolNames: Set<String> = emptySet(),
     ): Response {
         Log.i(TAG, "generate blocking shape=$shape backend=$backend model=$model tools=$parseTools prompt=${prompt.take(80)}…")
-        val r = engine.generateBlocking(prompt, backend)
+        memoryProbe?.start("blocking shape=$shape backend=$backend tools=$parseTools")
+        val r = try { engine.generateBlocking(prompt, backend) } finally { memoryProbe?.stop() }
         if (r.error != null) {
             return when (shape) {
                 ResponseShape.OpenAiChat ->

@@ -131,6 +131,13 @@ fi
 # call one. Same convention as the APK service's /api/chat /v1/messages
 # /v1/chat/completions /v1/responses; we parse the same `{"tool_calls":[...]}`
 # pattern out of the response on this side.
+# PR codex bot v0.4.0 P2: printf '%b' interprets backslash escapes in user
+# input (e.g. \n \t \\ \"). When the prompt is just the user's raw text, %b
+# is fine. When --tools is set we glue a tool block + a literal newline +
+# the user's prompt. We MUST keep the newline literal (not \n) so the
+# inference binary sees the boundary, but we MUST NOT pass the user's
+# prompt through %b — it could contain escape sequences they meant
+# verbatim.
 FINAL_PROMPT="$PROMPT"
 if [ -n "$TOOLS_JSON" ]; then
     if ! command -v python3 >/dev/null 2>&1; then
@@ -177,15 +184,22 @@ for t in tools:
         print("  schema: " + json.dumps(params, ensure_ascii=False))
 print()
 ') || exit 2
-    FINAL_PROMPT="${TOOL_BLOCK}\n${PROMPT}"
+    # Use a real newline ($'\n' is bash POSIX-compatible; works in dash/sh
+    # via printf-newline emission) instead of "\n" so we don't have to %b
+    # the result later.
+    FINAL_PROMPT="${TOOL_BLOCK}
+${PROMPT}"
 fi
 
 # Run the binary. LD_LIBRARY_PATH ensures it finds the bundled .so accelerators.
+# FINAL_PROMPT is passed verbatim — we deliberately do NOT %b it, so user
+# input containing legitimate \n / \\ / \" sequences reaches the model
+# unchanged.
 RAW=$(LD_LIBRARY_PATH="${LITERTLM_DIR}:${LD_LIBRARY_PATH:-}" \
       "$BINARY" \
       --backend "$BACKEND" \
       --model_path "$MODEL_PATH" \
-      --input_prompt "$(printf '%b' "$FINAL_PROMPT")" 2>&1) || {
+      --input_prompt "$FINAL_PROMPT" 2>&1) || {
     code=$?
     printf 'error: litert_lm_main exited with code %d\n' "$code" >&2
     printf '%s\n' "$RAW" >&2

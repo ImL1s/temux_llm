@@ -151,13 +151,14 @@ class LlmService : Service() {
     private fun startEngineAndServer() {
         val e = LlmEngine(applicationContext).also { engine = it }
         val registry = ModelRegistry(applicationContext, e)
-        memoryProbe = MemoryProbe(applicationContext)
+        val probe = MemoryProbe(applicationContext).also { memoryProbe = it }
 
         // Start HTTP first so /healthz responds quickly. Engine init is heavy
         // (model staging copy + first inference still cold) — defer to a worker
         // so the service doesn't ANR if the staging copy of a 2-3 GB model
         // takes 10-30 s on first launch.
-        val s = HttpServer(applicationContext, e, registry).also { server = it }
+        // Pass the probe so HttpServer can sample memory during inference.
+        val s = HttpServer(applicationContext, e, registry, probe).also { server = it }
         s.start(fi.iki.elonen.NanoHTTPD.SOCKET_READ_TIMEOUT, false)
         Log.i(tag, "http server started on 127.0.0.1:${HttpServer.PORT}")
 

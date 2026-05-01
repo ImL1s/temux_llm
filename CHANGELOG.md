@@ -9,6 +9,55 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 (no unreleased changes)
 
+## [0.4.1] — 2026-05-02
+
+Patch release addressing two PR-review issues caught by
+chatgpt-codex-connector on the v0.4.0 commit, plus integrating
+v0.5.0 deep-research into the spec/research log.
+
+### Fixed
+
+- **`scripts/litertlm-native-wrapper.sh`** (P2): the `--input_prompt`
+  argument was passed through `printf '%b'`, which expands `\n`,
+  `\\`, `\"` etc. inside any user-provided text. A user who
+  legitimately wanted a literal `\n` in their prompt would have it
+  silently transformed into a newline. Switched to passing
+  `FINAL_PROMPT` verbatim (no `%b`) and use a real shell newline to
+  separate the tool block from the user prompt when `--tools` is set.
+- **`MemoryProbe`** wired into the inference lifecycle (P2): v0.4.0
+  constructed the probe but never called `start()` / `stop()`
+  anywhere, so no samples were ever logged despite the LMK auto-
+  fallback design depending on per-inference memory data. Now
+  `runStream`, `runStreamBuffered`, and `blockingGenerate` all
+  bracket their work with `memoryProbe.start(label)` /
+  `memoryProbe.stop()`. Probe context label includes
+  `backend / shape / tools` so the CSV can be filtered.
+
+### Research / planning (no behavior change)
+
+5 parallel research agents + codex deep-search ran for v0.5.0
+planning. Findings stored under `.omc/research/16-20.md`:
+
+- **NPU (Hexagon) — NO-GO**: NPU on SD 8 Elite uses LPDDR5X system
+  RAM (lmkd kills us identically). Available NPU bundles regress
+  context to 4096. QAIRT licensing blocks non-Play sideload.
+- **Process splitting — NO-GO**: engine restart still costs 4–9 s
+  warm; ashmem doesn't exempt from LMK. Revisit only if profiling
+  shows >30 % of sessions hit FGS-kill mid-conversation.
+- **`metricspace/gemma4-*-litert-128k-mtp` — opt-in only**: 68
+  downloads, no phone evidence, license inheritance unclear, CPU
+  only. Add as `MODEL=e4b-128k` flag with banner; do NOT default.
+- **Out-of-tree `Conversation::Clone()` JNI shim — INFEASIBLE**:
+  `nm` of the shipped `liblitertlm_jni.so` shows zero exported
+  C++ symbols, hidden visibility, statically linked. The path is
+  to push upstream Issue #966 (already filed; we'll comment with
+  our use case).
+- **llama.cpp + Adreno OpenCL backend — GO for v0.5.0**: Q4 KV
+  cache (`-ctk q4_0 -ctv q4_0 -fa`) breaks the 16 k wall — math
+  shows 32 k context fits 12 GB (4.84 GB weights + 4.2 GB Q4 KV
+  + 1 GB scratch ≈ 10 GB). Adreno 830 on the verified-support
+  list. ~600 LOC integration. Confidence 75 %.
+
 ## [0.4.0] — 2026-05-02
 
 ### Test foundation + memory observability + Codex pre-merge fixes
