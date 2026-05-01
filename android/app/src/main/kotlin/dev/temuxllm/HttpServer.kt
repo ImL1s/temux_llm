@@ -174,6 +174,7 @@ class HttpServer(
             registry.resolve(requestedModel)
                 ?: return errorJson(Response.Status.NOT_FOUND, "model '$requestedModel' not found")
         }
+        // Ollama /api/generate convention: default stream=true.
         val stream = body.optBoolean("stream", true)
         return if (stream) {
             runStream(prompt, backend, NdjsonGenerateEncoder(resolved.name))
@@ -200,6 +201,7 @@ class HttpServer(
         if (backend != "cpu" && backend != "gpu") {
             return errorJson(Response.Status.BAD_REQUEST, "backend must be cpu|gpu (got $backend)")
         }
+        // Ollama /api/chat convention: default stream=true.
         val stream = body.optBoolean("stream", true)
         return if (stream) {
             runStream(prompt, backend, NdjsonChatEncoder(resolved.name))
@@ -226,7 +228,7 @@ class HttpServer(
         if (backend != "cpu" && backend != "gpu") {
             return errorJson(Response.Status.BAD_REQUEST, "backend must be cpu|gpu (got $backend)")
         }
-        val stream = body.optBoolean("stream", true)
+        val stream = body.optBoolean("stream", false)
         return if (stream) {
             runStream(prompt, backend, OpenAiSseEncoder(resolved.name))
         } else {
@@ -266,7 +268,7 @@ class HttpServer(
         if (backend != "cpu" && backend != "gpu") {
             return errorJson(Response.Status.BAD_REQUEST, "backend must be cpu|gpu (got $backend)")
         }
-        val stream = body.optBoolean("stream", true)
+        val stream = body.optBoolean("stream", false)
         return if (stream) {
             runStream(prompt, backend, AnthropicSseEncoder(resolved.name))
         } else {
@@ -297,7 +299,7 @@ class HttpServer(
         if (backend != "cpu" && backend != "gpu") {
             return errorJson(Response.Status.BAD_REQUEST, "backend must be cpu|gpu (got $backend)")
         }
-        val stream = body.optBoolean("stream", true)
+        val stream = body.optBoolean("stream", false)
         return if (stream) {
             runStream(prompt, backend, ResponsesSseEncoder(resolved.name))
         } else {

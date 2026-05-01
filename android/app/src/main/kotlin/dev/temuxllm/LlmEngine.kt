@@ -90,7 +90,23 @@ class LlmEngine(private val context: Context) {
         }
         val modelPath = ensureModelStaged()
         val backendInst = if (backend == "gpu") Backend.GPU() else Backend.CPU()
-        val cfg = EngineConfig(modelPath = modelPath, backend = backendInst)
+        // EngineConfig.maxNumTokens caps prefill+decode kv-cache size. The
+        // SDK default is the model's compiled default (4096 for the Gemma 4
+        // .litertlm bundles), which can't fit Claude Code's ~16k built-in
+        // agent system prompt or Codex CLI's ~8k. KV-cache grows with this
+        // value; Adreno 830 + 32k cache + Gemma 4 E4B exceeds a 12 GB device
+        // and triggers Android's lowmemorykiller. 16384 is the sweet spot:
+        // exactly Claude Code's prompt size (no headroom — `--print` just
+        // fits), comfortable for Codex (~8k). Override via
+        // TEMUXLLM_MAX_TOKENS at service start for ≥16 GB devices (Fold7,
+        // Tab S10 Ultra) that can hold a bigger window.
+        val ctxOverride = System.getenv("TEMUXLLM_MAX_TOKENS")?.toIntOrNull()
+        val maxTokens = ctxOverride ?: 16384
+        val cfg = EngineConfig(
+            modelPath = modelPath,
+            backend = backendInst,
+            maxNumTokens = maxTokens,
+        )
         Log.i(TAG, "Engine.initialize(backend=$backend) starting")
         val t0 = System.currentTimeMillis()
         val e = Engine(cfg)

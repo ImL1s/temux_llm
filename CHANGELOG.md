@@ -9,6 +9,105 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 (no unreleased changes)
 
+## [0.3.1] — 2026-05-02
+
+### Real Claude Code and Codex CLI now actually work end-to-end
+
+v0.3.0 had every protocol-layer piece in place but the bundled model
+context (4096 tokens) was too small for Claude Code's ~16k built-in
+agent system prompt or Codex CLI's ~8k. v0.3.1 lifts that ceiling
+and addresses the four pre-merge codex review blockers.
+
+#### Engine: 16k context window
+
+`EngineConfig.maxNumTokens` is now set to **16384** by default (was
+the model's compiled 4096). Override at service start via
+`TEMUXLLM_MAX_TOKENS=24576` (or any positive integer) for ≥16 GB
+devices that can hold a bigger KV-cache. Memory cost scales linearly
+with context size — Galaxy S25 (12 GB) tops out around 16k–20k for
+Gemma 4 E4B; 32k OOMs the foreground service on Adreno 830 + 12 GB.
+
+Verified on Galaxy S25 (SD 8 Elite, Adreno 830, 12 GB, Android 16):
+
+```
+$ ANTHROPIC_BASE_URL=http://127.0.0.1:11434 ANTHROPIC_AUTH_TOKEN=ollama \
+  claude --print "..."
+Hello! I see you are ready to start working on the project. ...
+
+$ codex exec --oss --local-provider ollama -c model=local "say: hi"
+codex> Hello! How can I help you today?
+```
+
+Both CLIs send their full agent system prompt and receive real
+on-device Gemma 4 E4B responses through their respective wire
+envelopes (`/v1/messages` SSE for Claude, `/v1/responses` SSE for
+Codex). The launcher script `scripts/temuxllm launch claude/codex`
+sets the env vars correctly and `exec`s the target CLI.
+
+#### Codex review blockers addressed
+
+`codex exec --sandbox read-only` was run on the v0.3.0 diff per the
+project's "release-tag must have outside-reviewer pass" rule. Four
+blocking findings, all fixed:
+
+1. **`runStream()` could double-frame on error or empty streams.**
+   `emitStart()` is now deferred until the first token actually
+   arrives. If the engine errors before any output (token-limit
+   overflow, backend init failure), only the error event is emitted
+   — no misleading `message_start`/`content_block_start` preamble
+   that would confuse Anthropic / OpenAI parsers.
+
+2. **`/v1/responses` input flattening dropped Codex agent-loop items.**
+   Codex echoes prior `output_text` / `function_call` /
+   `function_call_output` / `reasoning` items back into `input` on
+   subsequent turns per OpenAI's "Unrolling the Codex agent loop"
+   docs. Our flattener only handled `text` / `input_text`, so
+   multi-turn continuity broke. Added
+   `ChatFormat.flattenResponsesInput()` that handles the full
+   Responses input vocabulary.
+
+3. **Resolved-but-not-loaded model.** `handle*` methods resolved a
+   request name to a registry entry but never loaded that file
+   before generating, so inference always ran on whatever
+   `LlmEngine.activeModelPath()` pointed to. `ModelRegistry.resolve()`
+   now ALWAYS returns the active entry (or null), so the `model`
+   field in responses honestly reflects which model produced the
+   text. Multi-model hot-swap is out of scope for this release.
+
+4. **`/api/version` leaked filesystem paths.** `model_path` and
+   `source_model_path` exposed `/data/...` paths to any local
+   process. Both removed; a new `/api/temuxllm/info` debug endpoint
+   keeps them available for install scripts that need them.
+
+5. **Default `stream` matches each protocol's convention.**
+   `/api/generate` and `/api/chat` default `true` (Ollama).
+   `/v1/chat/completions`, `/v1/messages`, `/v1/responses` default
+   `false` (OpenAI / Anthropic). Earlier blanket `true` default
+   confused SDK callers that omitted `stream` and expected JSON.
+
+6. **Codex `/v1/models` parser fully satisfied.** Codex CLI 0.125's
+   ollama provider strictly requires `slug` AND `display_name` per
+   model entry in `/v1/models` (in addition to `models[]` array
+   alongside OpenAI `data[]`). Both fields now emitted.
+
+7. **`413 Request Entity Too Large` path is now reachable.**
+   Previously `readJsonBody()` swallowed `BodyTooLarge` and turned
+   it into a `400 invalid JSON body`. Now the sentinel propagates
+   to `serve()`'s outer catch where it returns a real 413 with a
+   helpful error message.
+
+#### Other
+
+- `looksLikeBrandedModel()` matches tighter prefixes (`claude-*`,
+  `gpt-*`, `o1-*`, `o3-*`, `o4-*`) — earlier `startsWith("o3")`
+  would have matched `orca3-7b`.
+
+#### Constraints unchanged
+
+- HTTP binds 127.0.0.1 only; arm64-v8a; minSdk 33.
+- No new dependencies. No `LlmEngine.kt` API changes from v0.2.x callers.
+- No `AndroidManifest.xml` changes.
+
 ## [0.3.0] — 2026-05-01
 
 ### Added — Ollama-compatible endpoints (Layer A) + launcher CLI (Layer B)

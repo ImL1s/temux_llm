@@ -93,28 +93,46 @@ class ModelRegistry(private val context: Context, private val engine: LlmEngine)
     fun activeName(): String = active()?.name ?: "unknown"
 
     /**
-     * alias-or-route. Returns null if the requested name is not recognized AND
-     * not eligible for default-routing.
+     * alias-or-route. The single LlmEngine instance only ever serves the
+     * active staged file — we don't hot-swap models per request, because
+     * each swap invalidates the xnnpack and mldrift caches and rebuilds
+     * the engine (multi-second cost). So `resolve()` either returns the
+     * active entry (when the requested name plausibly references it) or
+     * null (when the request can't be honored without a service restart).
+     *
+     * We never return a non-active entry — that would advertise a name in
+     * the response while inference actually came from the staged file,
+     * which is what codex's pre-merge review caught as a P1 bug.
      */
     fun resolve(requested: String?): Entry? {
         val name = requested?.trim() ?: ""
         val active = active() ?: return null
         if (name in wildcardAliases) return active
-        val all = list()
-        // Exact filename match
-        all.firstOrNull { it.name == name }?.let { return it }
-        // Optional sidecar mapping (e.g. "claude-3-5-sonnet" -> "gemma-4-E2B-it")
+
+        // Exact filename match against the active model.
+        if (active.name == name) return active
+
+        // Sidecar alias that maps to the active model name.
         sidecarAliases[name]?.let { mapped ->
-            all.firstOrNull { it.name == mapped }?.let { return it }
+            if (mapped == active.name) return active
         }
-        // Family-prefix (lowercased)
+
+        // Family-prefix (lowercased) — matches active if its family or name
+        // starts with the request token.
         val lower = name.lowercase(Locale.ROOT)
-        all.firstOrNull { it.family == lower || it.name.lowercase(Locale.ROOT).startsWith(lower) }
-            ?.let { return it }
-        // Coding-agent brand-name heuristic: any "claude*" / "gpt*" / "anthropic*" / "openai*"
-        // routes to the active model so Claude Code / Codex CLI can send their default
-        // model strings without the user pre-aliasing them.
+        if (active.family == lower || active.name.lowercase(Locale.ROOT).startsWith(lower)) {
+            return active
+        }
+
+        // Coding-agent brand-name heuristic: any "claude-*" / "gpt-*" / "o1-*"
+        // routes to the active model so Claude Code / Codex CLI can send
+        // their default model strings without the user pre-aliasing them.
         if (looksLikeBrandedModel(lower)) return active
+
+        // Request mentions a name that isn't the active model AND isn't a
+        // wildcard / brand. We could pretend to honor it, but that would
+        // be the bug codex's review flagged. 404 instead so the client
+        // knows their model selection didn't take effect.
         return null
     }
 
@@ -234,9 +252,12 @@ class ModelRegistry(private val context: Context, private val engine: LlmEngine)
                 JSONObject().apply {
                     put("name", e.name)
                     put("model", e.name)
-                    // Codex CLI 0.125 strictly requires `slug` per model;
-                    // not in real Ollama's /api/tags shape, but harmless extra.
+                    // Codex CLI 0.125 strictly requires `slug` and
+                    // `display_name` per model — not in real Ollama's
+                    // /api/tags shape, but harmless extras for parsers
+                    // that ignore unknown fields.
                     put("slug", e.name)
+                    put("display_name", e.name)
                     put("modified_at", iso8601(e.modifiedAtMs))
                     put("size", e.sizeBytes)
                     put("digest", e.digest)
