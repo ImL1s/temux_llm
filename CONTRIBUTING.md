@@ -33,8 +33,11 @@ That same script is what users run. If it works for you, the project works.
   will be rejected.
 - A model marketplace / model auto-discovery. Users pick a `.litertlm` and
   push it themselves.
-- Termux-native LiteRT-LM (running the runtime inside Termux's app sandbox).
-  The Android-app architecture is deliberate.
+- CLI GPU acceleration via Termux. Termux's manifest doesn't declare
+  `<uses-native-library>` for vendor OpenCL, so the linker namespace blocks
+  the load — and we don't ship Termux. CLI CPU is the supported Termux path
+  (and on Snapdragon flagships, raw CLI CPU decode beats APK GPU end-to-end
+  anyway, see README "Performance").
 
 ## Code style
 
@@ -57,7 +60,40 @@ Apache 2.0 license (see `LICENSE`).
 
 ## Releasing
 
-Tag-driven release (maintainers only):
+### Pre-tag checklist (maintainers)
+
+Before pushing a `v*.*.*` tag, walk through this list. Three of v0.1.0–v0.1.3
+shipped with claims that needed correction in a follow-up release. Most of
+those would have been caught here.
+
+- [ ] Both install paths run clean from a fresh clone:
+  `bash scripts/install.sh` (with phone connected) and
+  `bash scripts/install-termux-native.sh` (in Termux).
+- [ ] After install, run the *installed* commands themselves
+  (`litertlm "..."`, `litertlm-native "..."`) — not just the underlying
+  binary or impl script. Path-resolution bugs in the installed shim
+  (e.g., wrong relative path between the shim and its impl) can only
+  be caught by exercising the real entry point.
+- [ ] `litertlm --help` and `litertlm-native --help` print correct
+  defaults that match what the wrappers actually do, and reflect what
+  works on real devices today (not aspirational).
+- [ ] Default backend in code matches what the README claims, and that
+  backend actually works on the platform it defaults to.
+- [ ] Every artifact `scripts/install*.sh` downloads is sha256-pinned to a
+  specific commit, not `resolve/main`. Hashes live in
+  `scripts/sha256_manifest.txt` (host downloader) or inline (Termux
+  installer). Re-run the installer end-to-end to confirm the hashes
+  still match upstream.
+- [ ] At least one independent reviewer has signed off on the diff.
+  In-context Claude reviewers and out-of-context tools (Codex CLI,
+  human PR review) catch different classes of mistake — use both for
+  release commits. Every prior misdiagnosis here was caught only by an
+  outside review pass.
+- [ ] CHANGELOG entry distinguishes user-visible changes from internal
+  refactors, and states what was *measured* vs what was *believed*.
+  Performance numbers list which device + which model + which path.
+
+### Tagging
 
 ```bash
 git tag -a v0.x.y -m "release v0.x.y"

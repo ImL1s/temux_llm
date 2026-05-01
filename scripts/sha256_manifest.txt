@@ -16,5 +16,8 @@ e3386a53095e13c37ea0b0f63ebcf5ec1698404e63baf606558664ebe8c5dcf1  bin/android_ar
 # v0.11.0-rc.1 binary CAN load this (v0.9.0 could not — INVALID_ARGUMENT).
 ab7838cdfc8f77e54d8ca45eadceb20452d9f01e4bfade03e5dce27911b27e42  models/gemma-4-E2B-it.litertlm  # size=2583085056
 
+# HuggingFace gemma-4-E4B-it model — pinned to commit 55b6eef (chat_template upload).
+f335f2bfd1b758dc6476db16c0f41854bd6237e2658d604cbe566bcefd00a7bc  models/gemma-4-E4B-it.litertlm  # size=3654467584
+
 # HuggingFace Qwen3-0.6B model — fallback small model.
 555579ff2f4fd13379abe69c1c3ab5200f7338bc92471557f1d6614a6e5ab0b4  models/Qwen3-0.6B.litertlm  # size=614236160

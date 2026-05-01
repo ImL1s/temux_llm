@@ -23,7 +23,7 @@ hi.
 **Galaxy S24 Ultra**（SD 8 Gen 3 / Adreno 750，Android 16）、
 **Galaxy S25**（SD 8 Elite / Adreno 830，Android 16）。
 理論上任何 arm64-v8a Android 13+ Snapdragon 機都能跑。CPU + GPU 實測數字見
-[裝置矩陣](#裝置矩陣)。
+[效能](#效能)。
 
 ## 用途 / Use cases
 
@@ -113,12 +113,19 @@ litertlm-native --help
 
 | | APK 路徑（`install.sh`） | Native 路徑（`install-termux-native.sh`） |
 |---|---|---|
-| 每次 call 的延遲 | 不到 1 秒（模型常駐） | 1-7 秒（暖）/ 12-60 秒（冷） |
-| 需要 USB + 主機 | 要（一次性 sideload） | 不用 |
+| 安裝環境 | 主機 + USB（一次性） | 只在 Termux 裡 |
 | 需要 sideload APK | 要 | 不用 |
-| 適合場景 | 互動聊天、腳本 | 偶爾 / 批次使用 |
+| 每次 call 啟動成本 | 不到 1 秒（engine 常駐） | 3-8 秒（暖）/ 10-20 秒（首次） |
+| 穩態 decode 速度 | 看 backend（見矩陣） | **CLI CPU 在 Snapdragon 上贏過或追平 APK GPU** |
+| GPU 加速 | Adreno 上可用（v0.1.2 起） | 被 Termux 的 vendor namespace 擋掉 |
+| 適合場景 | 短互動、要秒回 | 長段生成、無 USB 工作流、腳本 |
 
-Native 路徑用「每次 call 多花一點 load 時間」換「完全不依賴 APK」。
+**反直覺但實測過：** CLI 的純 CPU decode 在所有測過的 Snapdragon 機上都贏過或
+追平 APK 的 GPU 端到端速度（見[效能](#效能)）。原因：CLI 是緊湊的 native
+binary，多執行緒 CPU 推理；APK 走 JNI + service + foreground 通知 +
+loopback HTTP，每個 call 都要付這些 overhead。APK 還是贏在「每次 call 啟動
+延遲」（engine 常駐）；CLI 每次 call 要重新 init engine。
+
 兩條路都用 LiteRT-LM 0.11.0-rc.1（APK 走 Maven artifact
 `com.google.ai.edge.litertlm:litertlm-android:0.11.0-rc1`，Termux-native
 走 GitHub release `v0.11.0-rc.1` 的 `litert_lm_main` CLI binary），
@@ -202,27 +209,60 @@ Service 只綁 `127.0.0.1`。每次重啟後驗證：`ss -tnlp | grep 11434` 必
 
 ---
 
-## 裝置矩陣
+## 效能
 
-`gemma-4-E2B-it`（2.4 GB）和 `gemma-4-E4B-it`（3.4 GB）的 decode 速率，50 字
-output prompt，暖機後（已 drop 冷啟動），透過 APK service 的 in-process Engine。
+`gemma-4-E2B-it`（2.4 GB），50 字 output prompt，暖機後。
 
-| 裝置 | SoC | Android | RAM | E2B CPU | E2B GPU | E4B CPU | E4B GPU | GPU 冷啟動 |
-|---|---|---|---|---|---|---|---|---|
-| Galaxy S21+ | SD 888 (Adreno 660) | 15 | 8 GB | 8.0 t/s | 10.5 t/s | 4.1 t/s | （未測） | ~20 秒 |
-| Galaxy S24 Ultra | SD 8 Gen 3 (Adreno 750) | 16 | 12 GB | 10.3 t/s | 22.0 t/s | 5.7 t/s | （未測） | ~11 秒 |
-| Galaxy S25 | SD 8 Elite (Adreno 830) | 16 | 12 GB | 12.4 t/s | 23.2 t/s | 7.8 t/s | 15.0 t/s | ~8 秒 |
-| Galaxy Note 9 | Exynos 9810 | 10 | 6 GB | 不支援（minSdk=33 / Android 13+） | | | | |
+| 裝置 | SoC | APK CPU<br>(end-to-end) | APK GPU<br>(end-to-end) | CLI CPU<br>(decode-only) |
+|---|---|---|---|---|
+| Galaxy S21+ | SD 888 / Adreno 660 | 8.0 t/s | 10.5 t/s | **12.1 t/s** |
+| Galaxy S24 Ultra | SD 8 Gen 3 / Adreno 750 | 10.3 t/s | 22.0 t/s | 21.5 t/s |
+| Galaxy S25 | SD 8 Elite / Adreno 830 | 12.4 t/s | 23.2 t/s | **35.4 t/s** |
 
-`decode = output_tokens / (total_duration_ms / 1000)` 的 end-to-end（包含 prefill）。
+兩個欄位量的東西不一樣，不能直接拿百分比比。各自報自己場景的誠實值：
+
+- **APK end-to-end** = `output_tokens / (total_duration_ms / 1000)`，一次暖
+  `/api/generate` 整個來回 — 含 prefill、decode、loopback HTTP/JNI
+  overhead，就是使用者實際感受到的延遲。不算常駐 engine 的一次性 init。
+- **CLI decode-only** = binary 的 `BenchmarkInfo` 報的 `Decode Speed` —
+  engine 開始產 token 之後的穩態吞吐量，跟 prefill / 每次 call init 分開算。
+
+看 CLI 端到端：暖機後每次 call wall time **3-8 秒**（短 prompt 是 init
+主導；長段生成把 init 攤掉）。
+S25 上 60 token 輸出大約 3 秒 wall ≈ 20 t/s 端到端，vs APK GPU
+3 秒 / 62 token ≈ 23 t/s — 短輸出大致打平。CLI 的 decode-only 優勢
+（S25 35 t/s）要在生成夠長、init 被攤掉時才看得出來。架構原因見下面
+「為什麼 CLI CPU 贏過 APK GPU」。
+
+**每次 call 啟動延遲**是另一個面向：APK 把 `Engine` 常駐記憶體，所以暖機後
+`/api/generate` 短回答 200-1000 毫秒。CLI 每次 call 都要重新 init engine，
+所以每次 wall 大概是 **3-8 秒（暖）/ 10-20 秒（首次）**。要選哪條路看你
+要優化「每次 call 延遲」（APK）還是「穩態 decode 吞吐量」（CLI）。
+
+`gemma-4-E4B-it`（3.4 GB）— 只有 APK 路徑測過：
+
+| 裝置 | E4B CPU | E4B GPU |
+|---|---|---|
+| Galaxy S21+ | 4.1 t/s | （未測） |
+| Galaxy S24 Ultra | 5.7 t/s | （未測） |
+| Galaxy S25 | 7.8 t/s | 15.0 t/s |
+| Galaxy Note 9 | 不支援（minSdk=33 / Android 13+） | |
 
 **第一次 call 的初始化成本：**
 
-- **GPU：** OpenCL kernel-compile 第一次跑 engine 時要 8-22 秒。SDK 會把
-  `model.litertlm_*_mldrift_program_cache.bin` 寫到 app filesDir；之後重啟
-  service 會跳過 compile 直接用 cache。如果你重新推一次模型，cache 會失效，
-  又要再付一次這個成本。
-- **CPU：** XNNPack weight cache 第一次要 3-7 秒；暖啟動降到 0.5-0.8 秒。
+- **APK GPU：** OpenCL kernel-compile 第一次要 8-22 秒。SDK 把
+  `model.litertlm_*_mldrift_program_cache.bin` 寫進 app filesDir；之後
+  重啟 service 跳過 compile 直接用 cache。重推模型會讓 cache 失效。
+- **APK CPU：** XNNPack weight cache 第一次 3-7 秒；暖機降到 0.5-0.8 秒。
+- **CLI CPU：** 首次 call 在模型旁邊建 xnnpack cache（~10-20 秒、一次性）。
+  之後每 call 只付 engine init（~2-3 秒）。`install-termux-native.sh` 安裝
+  最後會自動跑一次暖機，所以使用者第一次互動已經是暖機狀態。
+
+**為什麼 CLI CPU 贏過 APK GPU：** CLI 是緊湊的 native binary，多執行緒
+CPU 推理 — 沒 JNI、沒 service framework 開銷、沒 foreground 通知、沒
+per-call socket round-trip。APK GPU 要付 SDK 的 JVM↔native 橋接 + 每次
+loopback HTTP。長段生成（decode 主導）CLI 的原始吞吐量贏；短互動
+（init 主導）APK 的常駐 engine 贏。
 
 ---
 

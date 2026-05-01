@@ -9,6 +9,90 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 (no unreleased changes)
 
+## [0.2.0] — 2026-05-01
+
+CLI path re-characterized. Once you push the right binary and the right
+model, the CLI's raw CPU decode beats or ties the APK service's GPU
+end-to-end on every Snapdragon device we tested.
+
+### Performance characterized
+
+E2B, 50-word warm output. APK numbers are end-to-end including prefill;
+CLI numbers are decode-only (the binary's BenchmarkInfo `Decode Speed`).
+The two metrics measure different things and aren't directly comparable
+as a percentage — see README "Performance" for the full disclosure.
+
+| Device | APK CPU e2e | APK GPU e2e | CLI CPU decode |
+|---|---|---|---|
+| S21+ (SD 888) | 8.0 | 10.5 | 12.1 |
+| S24 Ultra (SD 8 Gen 3) | 10.3 | 22.0 | 21.5 |
+| S25 (SD 8 Elite) | 12.4 | 23.2 | 35.4 |
+
+CLI wins on raw decode throughput because it is a tight native binary —
+no JNI bridge, no service framework, no foreground-service notification,
+no localhost HTTP round-trip. APK wins on per-call latency for short
+interactive replies because its engine stays resident; CLI rebuilds the
+engine each call (3-8 s warm / 10-20 s first ever). Pick by axis: APK
+for sub-second turns, CLI for sustained throughput and no-USB workflows.
+
+### Changed
+- **CLI default backend reverted to `cpu`** in
+  `scripts/litertlm-native-wrapper.sh` and the embedded copy inside
+  `scripts/install-termux-native.sh`. CLI GPU is blocked by Termux's
+  linker namespace (vendor `libOpenCL.so` requires
+  `<uses-native-library>`, which Termux's manifest doesn't declare). A
+  default of `gpu` would have failed for any new user running
+  `litertlm-native "你好"` out of the box. CLI GPU is documented as a
+  known limit; per-request `--backend gpu` still works on devices where
+  it does work (none of ours).
+- **`scripts/install-termux-native.sh`** runs a one-time post-install
+  CPU warmup so the user's first real call hits a warm cache, and
+  reports the measured decode rate so they see what their device does
+  before they run anything. Skip with `SKIP_WARMUP=1`; bound with
+  `WARMUP_TIMEOUT=N` (default 90 s, uses `timeout` if available).
+- **`scripts/install-termux-native.sh` and
+  `scripts/litertlm-native-wrapper.sh` output parser** rewritten as a
+  three-state machine (`prelude → response → bench`) keyed on the
+  binary's `input_prompt:` and `BenchmarkInfo:` markers. Old parser
+  expected a single-line `BenchmarkInfo: key=value ...` format that
+  v0.11.0-rc.1 doesn't emit; users got `total=?ms tokens=? decode=? t/s`
+  on every call. Now correctly extracts `Init Total`, `Prefill Turn`,
+  `Decode Turn`, `Decode Speed` from the multi-line block and sums into
+  total ms.
+- **`scripts/fetch_artifacts.sh`** E4B model is now sha256-pinned to
+  HF commit `55b6eef9...` (was `resolve/main` + size-only check, same
+  bug class as the v0.1.0 install-termux-native.sh issue Codex caught
+  earlier). E4B sha256 added to `scripts/sha256_manifest.txt`.
+- **`CONTRIBUTING.md`**: dropped the stale "Termux-native LiteRT-LM is
+  out of scope" line (we ship it now). Added a pre-tag release
+  checklist covering both install paths, default-backend sanity, pinned
+  artifact verification, and outside-reviewer sign-off.
+- **README + README.zh-TW**: new "Performance" section that puts CLI
+  CPU next to APK CPU/GPU with explicit `(end-to-end)` vs
+  `(decode-only)` column annotations. Removed the misleading
+  "CLI vs APK GPU %" column. Added an end-to-end CLI walkthrough so
+  the comparison is honest at all output lengths.
+
+### Known limits
+- **CLI GPU is blocked** by Termux's manifest. Termux runs as
+  `untrusted_app`; the linker namespace blocks
+  `dlopen("libOpenCL.so")`. We don't ship Termux. CLI CPU is the
+  supported Termux path — and given that CLI CPU beats APK GPU
+  end-to-end on every device tested, this is not a practical
+  limitation.
+
+### Process note
+This is the fourth correction in the v0.1.x series (v0.1.1 wrong
+upstream-blame → v0.1.2 fix → v0.1.3 install.sh smoke + wrapper error
+detection → v0.2.0 CLI re-characterization + wrapper parser + E4B
+pin). Three of those corrections were caught only by an outside
+reviewer pass after the in-context Claude reviewers approved. The
+release checklist in `CONTRIBUTING.md` codifies an outside-review
+requirement before tag, and a fresh end-to-end install on both paths
+to catch the kind of "default backend doesn't actually work" /
+"installer parses a field the engine never emits" bugs that the prior
+releases shipped with.
+
 ## [0.1.3] — 2026-05-01
 
 Fixes a broken installer smoke test and a silent-failure path in the
@@ -178,7 +262,8 @@ First open-source-ready release.
   > E4B on S21+ likewise runs faster than 0.5 t/s under the corrected
   > setup (E4B CPU on S21+ measured at 4.1 t/s in v0.1.2's matrix).
 
-[Unreleased]: https://github.com/ImL1s/temux_llm/compare/v0.1.3...HEAD
+[Unreleased]: https://github.com/ImL1s/temux_llm/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/ImL1s/temux_llm/compare/v0.1.3...v0.2.0
 [0.1.3]: https://github.com/ImL1s/temux_llm/compare/v0.1.2...v0.1.3
 [0.1.2]: https://github.com/ImL1s/temux_llm/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/ImL1s/temux_llm/compare/v0.1.0...v0.1.1

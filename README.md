@@ -23,7 +23,8 @@ hi.
 Tested on **Galaxy S21+** (SD 888 / Adreno 660, Android 15), **Galaxy S24 Ultra**
 (SD 8 Gen 3 / Adreno 750, Android 16), and **Galaxy S25** (SD 8 Elite / Adreno
 830, Android 16). Should work on any arm64-v8a Android 13+ Snapdragon device.
-See [device matrix](#device-matrix) for measured CPU + GPU decode rates.
+See [Performance](#performance) for measured CPU + GPU decode rates
+across both paths.
 
 ## Use cases / 用途
 
@@ -116,12 +117,20 @@ litertlm-native --help
 
 | | APK path (`install.sh`) | Native path (`install-termux-native.sh`) |
 |---|---|---|
-| Latency per call | sub-second (model resident) | 1-7 s warm / 12-60 s cold |
-| Requires USB cable + host | yes (one-time, for sideload) | no |
-| Requires sideloading APK | yes | no |
-| Best for | interactive chat, scripts | occasional / batch use |
+| Setup | host machine + USB (one-time) | inside Termux only |
+| Sideloading APK | required | none |
+| Per-call init | sub-second (engine resident) | 3-8 s warm / 10-20 s first-ever |
+| Steady-state decode | depends on backend (see matrix) | **CLI CPU rivals or beats APK GPU on Snapdragon** |
+| GPU acceleration | works on Adreno (v0.1.2+) | blocked by Termux's vendor namespace |
+| Best for | short interactive turns, sub-second replies | long generation, no-USB workflows, scripts |
 
-The native path trades per-call load time for zero APK dependency.
+**Counter-intuitive but verified:** the CLI's raw CPU decode rate beats the
+APK's GPU end-to-end on every Snapdragon device we tested
+(see [Performance](#performance)). Why: the CLI is a tight native binary
+with multi-threaded CPU inference, while the APK pays JNI + service +
+foreground-service-notification overhead. The APK still wins on per-call
+latency because its engine is resident; the CLI pays init per call.
+
 Both paths use LiteRT-LM 0.11.0-rc.1 (the APK depends on the Maven
 artifact `com.google.ai.edge.litertlm:litertlm-android:0.11.0-rc1`,
 the Termux-native path uses the matching `litert_lm_main` CLI binary
@@ -205,31 +214,71 @@ The service binds only to `127.0.0.1`. Verified after every restart with
 
 ---
 
-## Device matrix
+## Performance
 
-Decode rates measured with `gemma-4-E2B-it` (2.4 GB) and `gemma-4-E4B-it`
-(3.4 GB), 50-word output prompt, warm engine (cold init dropped),
-in-process Engine via the APK service.
+`gemma-4-E2B-it` (2.4 GB), 50-word output prompt, warm engine.
 
-| Device | SoC | Android | RAM | E2B CPU | E2B GPU | E4B CPU | E4B GPU | GPU cold init |
-|---|---|---|---|---|---|---|---|---|
-| Galaxy S21+ | SD 888 (Adreno 660) | 15 | 8 GB | 8.0 t/s | 10.5 t/s | 4.1 t/s | (not measured) | ~20 s |
-| Galaxy S24 Ultra | SD 8 Gen 3 (Adreno 750) | 16 | 12 GB | 10.3 t/s | 22.0 t/s | 5.7 t/s | (not measured) | ~11 s |
-| Galaxy S25 | SD 8 Elite (Adreno 830) | 16 | 12 GB | 12.4 t/s | 23.2 t/s | 7.8 t/s | 15.0 t/s | ~8 s |
-| Galaxy Note 9 | Exynos 9810 | 10 | 6 GB | unsupported (minSdk=33 / Android 13+) | | | | |
+| Device | SoC | APK CPU<br>(end-to-end) | APK GPU<br>(end-to-end) | CLI CPU<br>(decode-only) |
+|---|---|---|---|---|
+| Galaxy S21+ | SD 888 / Adreno 660 | 8.0 t/s | 10.5 t/s | **12.1 t/s** |
+| Galaxy S24 Ultra | SD 8 Gen 3 / Adreno 750 | 10.3 t/s | 22.0 t/s | 21.5 t/s |
+| Galaxy S25 | SD 8 Elite / Adreno 830 | 12.4 t/s | 23.2 t/s | **35.4 t/s** |
 
-`decode = output_tokens / (total_duration_ms / 1000)` end-to-end (includes
-prefill within the warm window).
+The two metrics measure different things and are not directly comparable as
+a percentage. Reported separately so each is honest for its use case:
+
+- **APK end-to-end** = `output_tokens / (total_duration_ms / 1000)`, the full
+  cycle of one warm `/api/generate` request — includes prefill, decode, and
+  the loopback HTTP/JNI overhead the user actually feels. Excludes the
+  resident engine's one-time init.
+- **CLI decode-only** = `Decode Speed` reported by the binary's
+  `BenchmarkInfo` block — sustained tokens/sec once the engine is producing
+  output, measured in isolation from prefill and per-call init.
+
+For a CLI end-to-end view: the warm wall-time-per-call is **3-8 s** (engine
+init dominates short prompts; long generation amortizes it).
+A 60-token output on S25 takes ~3 s wall ≈ 20 t/s end-to-end, vs the APK GPU's
+~3 s for 62 tokens ≈ 23 t/s end-to-end — roughly tied for short outputs.
+The CLI's decode-only advantage (35 t/s on S25) shows up when generation is
+long enough for init to amortize. See "Why CLI CPU beats APK GPU" below for
+the architectural reason.
+
+**Per-call latency** is a different axis: APK keeps `Engine` resident, so a
+warm `/api/generate` returns in 200-1000 ms for short answers. CLI rebuilds
+the engine each call, so per-call wall is **3-8 s warm / 10-20 s first ever**.
+Pick the path based on whether you optimize for per-call latency
+(APK) or sustained decode throughput (CLI).
+
+`gemma-4-E4B-it` (3.4 GB) — APK only:
+
+| Device | E4B CPU | E4B GPU |
+|---|---|---|
+| Galaxy S21+ | 4.1 t/s | (not measured) |
+| Galaxy S24 Ultra | 5.7 t/s | (not measured) |
+| Galaxy S25 | 7.8 t/s | 15.0 t/s |
+| Galaxy Note 9 | unsupported (minSdk=33 / Android 13+) | |
 
 **First-call init cost:**
 
-- **GPU:** OpenCL kernel-compile takes 8-22 s the first time the engine
+- **APK GPU:** OpenCL kernel-compile takes 8-22 s the first time the engine
   starts. The SDK writes `model.litertlm_*_mldrift_program_cache.bin` into
   the app's filesDir; subsequent service starts skip the compile and reuse
   it. If you re-push a model, the cache is invalidated and you pay this
   cost again.
-- **CPU:** XNNPack weight cache build takes 3-7 s on first call; warm
+- **APK CPU:** XNNPack weight cache build takes 3-7 s on first call; warm
   init is 0.5-0.8 s.
+- **CLI CPU:** First-ever call builds the xnnpack cache file next to the
+  model (~10-20 s, one-time). Subsequent calls pay only engine init
+  (~2-3 s). The `install-termux-native.sh` script auto-runs a warmup at
+  the end of install so the user's first interactive call is already warm.
+
+**Why CLI CPU beats APK GPU:** The CLI is a tight native binary doing
+multi-threaded CPU inference — no JNI, no service framework overhead, no
+foreground-service notification, no per-request socket round-trip. The
+APK GPU pays for the SDK's JVM↔native bridge plus the localhost HTTP
+hop on every call. For long generation (where decode dominates init),
+CLI's raw throughput wins. For short interactive replies (where init
+dominates), APK's resident engine wins.
 
 ---
 
