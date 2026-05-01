@@ -38,7 +38,7 @@ class HttpServer(private val context: Context) : NanoHTTPD(BIND, PORT) {
                     json(Response.Status.OK, JSONObject().apply {
                         put("service", "temuxllm")
                         put("phase", "2b")
-                        put("binary", "litert_lm_main v0.9.0 (android arm64)")
+                        put("binary", "litert_lm_main v0.11.0-rc.1 (android arm64)")
                         put("default_backend", "gpu")
                         put("model_path", runner.activeModelPath().absolutePath)
                         put("source_model_path", LiteRtLmRunner.SOURCE_MODEL_PATH)

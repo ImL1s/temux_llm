@@ -3,9 +3,10 @@
 # Idempotent: skips files whose sha256 already matches the manifest.
 # Verifies every download against scripts/sha256_manifest.txt; bails on mismatch.
 #
-# Default model is Qwen3-0.6B (works with v0.9.0 binary). Set MODEL=gemma to also
-# fetch gemma-4-E2B-it.litertlm (larger; not loadable by v0.9.0 — kept only for
-# reproducibility / future when a newer Android binary is built from source).
+# Default model is Qwen3-0.6B (614 MB, smallest, fastest). Set MODEL=gemma to fetch
+# gemma-4-E2B-it.litertlm (2.4 GB, Google's latest small phone model — supported by
+# the v0.11.0-rc.1 binary; v0.9.0 returned INVALID_ARGUMENT on it).
+# MODEL=both fetches both.
 set -euo pipefail
 
 PROJECT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -16,7 +17,7 @@ MANIFEST="$PROJECT_ROOT/scripts/sha256_manifest.txt"
 mkdir -p "$BIN_DIR" "$SO_DIR" "$MODEL_DIR"
 
 # --- Pin every artifact for ABI / content stability ---
-LITERTLM_TAG="v0.9.0"
+LITERTLM_TAG="v0.11.0-rc.1"
 
 QWEN3_COMMIT="49837332af6863b008a73a5394ed60789504069d"
 GEMMA4_COMMIT="7fa1d78473894f7e736a21d920c3aa80f950c0db"
@@ -84,7 +85,7 @@ chmod +x "$BIN_DIR/litert_lm_main"
 file "$BIN_DIR/litert_lm_main" | grep -q "ARM aarch64" \
   || { echo "FATAL: binary is not aarch64 ELF" >&2; exit 1; }
 
-# 2. .so set (Git LFS dereferenced via media subdomain at v0.9.0)
+# 2. .so set (Git LFS dereferenced via media subdomain at the pinned tag)
 declare -a SO_FILES=(
   "libGemmaModelConstraintProvider.so"
   "libLiteRtGpuAccelerator.so"
@@ -99,8 +100,8 @@ for so in "${SO_FILES[@]}"; do
     || { echo "FATAL: $so is not aarch64 ELF" >&2; exit 1; }
 done
 
-# 3. Model — default Qwen3-0.6B (works with v0.9.0). MODEL=both also fetches Gemma-4
-# (kept only for reproducibility; v0.9.0 binary cannot load it).
+# 3. Model — default Qwen3-0.6B (smallest). MODEL=gemma to use Gemma-4 instead.
+# Both work with v0.11.0-rc.1 binary.
 MODEL="${MODEL:-qwen3}"
 case "$MODEL" in
   qwen3)
