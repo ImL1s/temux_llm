@@ -40,7 +40,8 @@ class HttpServer(private val context: Context) : NanoHTTPD(BIND, PORT) {
                         put("phase", "2b")
                         put("binary", "litert_lm_main v0.9.0 (android arm64)")
                         put("default_backend", "gpu")
-                        put("model_path", LiteRtLmRunner.DEFAULT_MODEL_PATH)
+                        put("model_path", runner.activeModelPath().absolutePath)
+                        put("source_model_path", LiteRtLmRunner.SOURCE_MODEL_PATH)
                     })
 
                 session.uri == "/api/tags" && session.method == Method.GET ->
@@ -77,7 +78,7 @@ class HttpServer(private val context: Context) : NanoHTTPD(BIND, PORT) {
         if (backend != "cpu" && backend != "gpu") {
             return errorJson(Response.Status.BAD_REQUEST, "backend must be cpu|gpu (got $backend)")
         }
-        val modelPath = body.optString("model_path", LiteRtLmRunner.DEFAULT_MODEL_PATH)
+        val modelPath = body.optString("model_path", "").ifBlank { runner.ensureModelStaged() }
         val timeoutMs = body.optLong("timeout_ms", LiteRtLmRunner.DEFAULT_TIMEOUT_MS)
 
         Log.i(TAG, "generate backend=$backend prompt=${prompt.take(80)}…")
@@ -106,14 +107,18 @@ class HttpServer(private val context: Context) : NanoHTTPD(BIND, PORT) {
     private fun listModels(): JSONObject {
         val tags = JSONObject()
         val arr = org.json.JSONArray()
-        // Look in /data/local/tmp/litertlm/ for *.litertlm.
+        // Active model lives in our app's filesDir; we also list any host-pushed
+        // copy in /data/local/tmp/ for transparency.
         val candidates = listOf(
+            runner.modelDir(),
             File("/data/local/tmp/litertlm"),
             File(context.filesDir, "models")
         )
+        val seen = mutableSetOf<String>()
         for (dir in candidates) {
             val files = dir.listFiles { f -> f.isFile && f.name.endsWith(".litertlm") } ?: continue
             for (f in files) {
+                if (!seen.add(f.absolutePath)) continue
                 val item = JSONObject()
                 item.put("name", f.nameWithoutExtension)
                 item.put("path", f.absolutePath)

@@ -26,14 +26,19 @@ class LiteRtLmRunner(private val context: Context) {
     companion object {
         private const val TAG = "LiteRtLmRunner"
 
-        const val DEFAULT_MODEL_PATH = "/data/local/tmp/litertlm/model.litertlm"
+        // Source location pushed by host-side scripts/setup_litertlm_android.sh.
+        const val SOURCE_MODEL_PATH = "/data/local/tmp/litertlm/model.litertlm"
 
-        // Default timeout per generate(): 120 s. Phase-1 worst case was ~12 s init +
-        // a few seconds generation, so 120 s is plenty even with a long prompt.
+        // Active model path lives inside our app's filesDir so the binary's
+        // XNNPack weight-cache + OpenCL kernel-cache files (which it writes next
+        // to the model) can actually persist. SELinux denies untrusted_app writes
+        // to /data/local/tmp (shell_data_file), so caching there silently fails
+        // and every /api/generate would pay the full cold-start init cost.
+        // We compute this lazily because we need a Context to resolve filesDir.
+        // See [activeModelPath].
+
         const val DEFAULT_TIMEOUT_MS = 120_000L
 
-        // Renamed CLI binary inside jniLibs. Filename must start with `lib` and end
-        // with `.so` so Android Gradle Plugin packages it correctly.
         const val BINARY_FILENAME = "liblitert_lm_main.so"
     }
 
@@ -55,14 +60,57 @@ class LiteRtLmRunner(private val context: Context) {
 
     fun binPath(): File = File(runDir(), BINARY_FILENAME)
 
+    /** filesDir/litertlm/ — owned by us, writeable by us, exec-readable by us. */
+    fun modelDir(): File = File(context.filesDir, "litertlm").apply { mkdirs() }
+
+    /** filesDir/litertlm/model.litertlm — XNNPack cache will land alongside. */
+    fun activeModelPath(): File = File(modelDir(), "model.litertlm")
+
     /**
-     * Verify the binary is in place and executable. Useful as a startup probe.
+     * Make sure the model is copied into our app's filesDir so the runtime's
+     * weight cache can persist next to it. Idempotent: skips when sizes match.
+     * Returns the absolute path the binary should load.
+     */
+    @Synchronized
+    fun ensureModelStaged(sourcePath: String = SOURCE_MODEL_PATH): String {
+        val src = File(sourcePath)
+        val dst = activeModelPath()
+        if (!src.exists()) {
+            Log.w(TAG, "source model missing at $sourcePath; using filesDir copy if any")
+            if (dst.exists() && dst.length() > 0L) return dst.absolutePath
+            throw java.io.FileNotFoundException("no model at $sourcePath and none staged in $dst")
+        }
+        if (dst.exists() && dst.length() == src.length()) {
+            Log.i(TAG, "model already staged at $dst (${dst.length()} bytes)")
+            return dst.absolutePath
+        }
+        Log.i(TAG, "staging model: $src (${src.length()} bytes) -> $dst")
+        val t0 = System.currentTimeMillis()
+        src.inputStream().use { input ->
+            dst.outputStream().use { output -> input.copyTo(output, bufferSize = 1024 * 1024) }
+        }
+        val dt = System.currentTimeMillis() - t0
+        Log.i(TAG, "model staged in ${dt} ms (${dst.length()} bytes)")
+        return dst.absolutePath
+    }
+
+    /**
+     * Verify the binary is in place and executable AND the model is staged. Used
+     * as a startup probe in onCreate so the first /api/generate doesn't pay the
+     * model-copy cost on the request path.
      */
     fun checkReady(): Boolean {
         val bin = binPath()
-        val ok = bin.exists() && bin.canExecute()
+        val binOk = bin.exists() && bin.canExecute()
         Log.i(TAG, "checkReady: $bin exists=${bin.exists()} canExecute=${bin.canExecute()}")
-        return ok
+        if (!binOk) return false
+        return try {
+            ensureModelStaged()
+            true
+        } catch (t: Throwable) {
+            Log.w(TAG, "model not yet staged (host scripts/setup_litertlm_android.sh required first)", t)
+            false
+        }
     }
 
     /**
@@ -72,7 +120,7 @@ class LiteRtLmRunner(private val context: Context) {
     fun generate(
         prompt: String,
         backend: String = "gpu",
-        modelPath: String = DEFAULT_MODEL_PATH,
+        modelPath: String? = null,
         timeoutMs: Long = DEFAULT_TIMEOUT_MS,
     ): GenerateResult {
         require(backend == "cpu" || backend == "gpu") { "backend must be cpu|gpu (got $backend)" }
@@ -80,16 +128,20 @@ class LiteRtLmRunner(private val context: Context) {
             throw IllegalStateException("binary not ready at ${binPath()}; check jniLibs packaging")
         }
         val dir = runDir()
+        val effectiveModelPath = modelPath ?: ensureModelStaged()
 
         val pb = ProcessBuilder(
             binPath().absolutePath,
             "--backend=$backend",
-            "--model_path=$modelPath",
+            "--model_path=$effectiveModelPath",
             "--input_prompt=$prompt",
         ).apply {
             environment()["LD_LIBRARY_PATH"] = dir.absolutePath
             redirectErrorStream(true)
-            directory(dir)
+            // Run from the model's directory so the binary's relative-path cache
+            // writes (XNNPack weight cache, OpenCL program cache) land in a place
+            // we own and can persist for warm-cache reuse on subsequent calls.
+            directory(File(effectiveModelPath).parentFile ?: dir)
         }
 
         val started = System.currentTimeMillis()
