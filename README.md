@@ -66,6 +66,44 @@ litertlm --help
 
 ---
 
+## Termux-native (no APK)
+
+Don't want to sideload the APK? Run the LiteRT-LM binary directly inside
+Termux — no USB cable, no Android service, no host machine required.
+
+**Inside Termux on the phone:**
+
+```sh
+# download installer from your clone, or copy it manually
+bash install-termux-native.sh          # default: gemma-4-E2B-it (2.4 GB)
+MODEL=qwen3 bash install-termux-native.sh   # 614 MB fallback
+MODEL=e4b   bash install-termux-native.sh   # 3.4 GB, high-end SoC only
+```
+
+The installer writes everything to `~/.litertlm/` and drops the wrapper at
+`~/.local/bin/litertlm-native`. Add `~/.local/bin` to PATH once, then:
+
+```sh
+litertlm-native "你好"
+litertlm-native --backend cpu "Reply OK in 3 words."
+litertlm-native --json "what is 2+2?"
+litertlm-native --help
+```
+
+**When to pick which path:**
+
+| | APK path (`install.sh`) | Native path (`install-termux-native.sh`) |
+|---|---|---|
+| Latency per call | sub-second (model resident) | 1-7 s warm / 12-60 s cold |
+| Requires USB + host | yes (one-time) | no |
+| Requires sideloading APK | yes | no |
+| Best for | interactive chat, scripts | occasional / batch use |
+
+The native path trades per-call load time for zero APK dependency.
+Both paths use the same v0.11.0-rc.1 binary and the same models.
+
+---
+
 ## What it ships
 
 ```

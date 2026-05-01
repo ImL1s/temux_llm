@@ -5,6 +5,7 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
 
     <application
         android:label="temuxllm"
@@ -20,6 +21,35 @@
                 <action android:name="dev.temuxllm.service.START" />
             </intent-filter>
         </service>
+
+        <!-- Auto-start the LLM service after device reboot. We register both
+             the locked- and unlocked-boot intents because we run as a Direct
+             Boot-aware service is *not* needed (we use the user's data dir),
+             so we wait for BOOT_COMPLETED. exported=true is required for the
+             system to deliver the broadcast. -->
+        <receiver
+            android:name=".BootReceiver"
+            android:exported="true"
+            android:enabled="true">
+            <intent-filter>
+                <action android:name="android.intent.action.BOOT_COMPLETED" />
+                <action android:name="android.intent.action.QUICKBOOT_POWERON" />
+            </intent-filter>
+        </receiver>
+
+        <!-- Tiny launcher activity. The user taps the temuxllm icon in the
+             launcher; we start the foreground service and immediately
+             finish() so the activity is invisible. -->
+        <activity
+            android:name=".LauncherActivity"
+            android:exported="true"
+            android:theme="@android:style/Theme.NoDisplay"
+            android:noHistory="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
 
     </application>
 </manifest>
