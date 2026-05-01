@@ -208,12 +208,21 @@ class ModelRegistry(private val context: Context, private val engine: LlmEngine)
         return JSONObject().apply { put("models", arr) }
     }
 
-    /** OpenAI-compat /v1/models. */
+    /**
+     * OpenAI-compat /v1/models.
+     *
+     * Codex CLI 0.125's "ollama" provider probes this endpoint and decodes
+     * it expecting an Ollama-shaped `{"models":[...]}` payload, even though
+     * the path is OpenAI-style. We include both shapes in the same document
+     * — pure-OpenAI clients see `data:[...]`, Codex sees `models:[...]`,
+     * neither breaks. Strict OpenAI parsers ignore unknown fields.
+     */
     fun openAiModels(): JSONObject {
-        val arr = JSONArray()
+        val openaiData = JSONArray()
+        val ollamaModels = JSONArray()
         val createdEpoch = System.currentTimeMillis() / 1000
         for (e in list()) {
-            arr.put(
+            openaiData.put(
                 JSONObject().apply {
                     put("id", e.name)
                     put("object", "model")
@@ -221,10 +230,33 @@ class ModelRegistry(private val context: Context, private val engine: LlmEngine)
                     put("owned_by", "temuxllm")
                 },
             )
+            ollamaModels.put(
+                JSONObject().apply {
+                    put("name", e.name)
+                    put("model", e.name)
+                    // Codex CLI 0.125 strictly requires `slug` per model;
+                    // not in real Ollama's /api/tags shape, but harmless extra.
+                    put("slug", e.name)
+                    put("modified_at", iso8601(e.modifiedAtMs))
+                    put("size", e.sizeBytes)
+                    put("digest", e.digest)
+                    put(
+                        "details",
+                        JSONObject().apply {
+                            put("format", "litertlm")
+                            put("family", e.family)
+                            put("families", JSONArray().put(e.family))
+                            put("parameter_size", e.parameterSize)
+                            put("quantization_level", "unknown")
+                        },
+                    )
+                },
+            )
         }
         return JSONObject().apply {
             put("object", "list")
-            put("data", arr)
+            put("data", openaiData)
+            put("models", ollamaModels)
         }
     }
 

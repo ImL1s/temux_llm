@@ -47,7 +47,12 @@ class HttpServer(
     companion object {
         const val BIND = "127.0.0.1"
         const val PORT = 11434
-        const val VERSION = "0.13.0-temuxllm"
+        // Advertise a pure SemVer version ≥ Ollama 0.13.4 so Codex CLI and
+        // other clients' version checks pass. SemVer prerelease suffixes
+        // (e.g. `0.13.4-temuxllm`) sort BELOW the same release without
+        // suffix per spec §11, which Codex's `>= 0.13.4` check rejects.
+        // The "this is temux_llm" flag lives in the `service` field instead.
+        const val VERSION = "0.13.5"
         private const val TAG = "HttpServer"
         private const val MAX_BODY = 4 * 1024 * 1024
     }
@@ -362,19 +367,31 @@ class HttpServer(
         val pipeOut = PipedOutputStream(pipeIn)
         thread(start = true, name = "litertlm-stream") {
             val writer = PrintWriter(pipeOut.writer(Charsets.UTF_8), false)
-            // Track whether Done or Error has been emitted so we don't double-frame
-            // an envelope: an empty/cancelled stream synthesizes one Done; an Error
-            // followed by no Done must not also synthesize one.
+            // Defer emitStart() until the first token actually arrives. If the
+            // engine errors during init (e.g. token-limit overflow or backend
+            // failure) BEFORE producing any output, we emit only the error
+            // event — no misleading message_start/content_block_start preamble
+            // that would confuse Anthropic / OpenAI parsers into reporting an
+            // "empty or malformed response" instead of the real error.
+            var startEmitted = false
             var terminated = false
             try {
-                encoder.emitStart(writer)
                 val started = System.currentTimeMillis()
                 runBlocking {
                     engine.generate(prompt, backend).collect { ev ->
                         when (ev) {
-                            is LlmEngine.GenerateEvent.Token ->
+                            is LlmEngine.GenerateEvent.Token -> {
+                                if (!startEmitted) {
+                                    encoder.emitStart(writer)
+                                    startEmitted = true
+                                }
                                 encoder.emitToken(writer, ev.text)
+                            }
                             is LlmEngine.GenerateEvent.Done -> {
+                                if (!startEmitted) {
+                                    encoder.emitStart(writer)
+                                    startEmitted = true
+                                }
                                 encoder.emitDone(writer, ev.totalDurationMs, ev.outputTokens, ev.outputChars, ev.backend)
                                 terminated = true
                             }
@@ -386,8 +403,10 @@ class HttpServer(
                     }
                 }
                 if (!terminated) {
-                    // Engine ended without Done or Error (cancellation, empty stream).
-                    // Emit one synthetic Done so the framing closes cleanly.
+                    if (!startEmitted) {
+                        encoder.emitStart(writer)
+                        startEmitted = true
+                    }
                     encoder.emitDone(writer, System.currentTimeMillis() - started, 0, 0, backend)
                 }
             } catch (t: Throwable) {

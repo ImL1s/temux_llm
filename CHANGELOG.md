@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+(no unreleased changes)
+
+## [0.3.0] — 2026-05-01
+
 ### Added — Ollama-compatible endpoints (Layer A) + launcher CLI (Layer B)
 
 `temux_llm` now impersonates an Ollama 0.13+ server closely enough that
@@ -93,6 +97,31 @@ already so behavior is forward-compatible.
 - arm64-v8a only, `minSdk = 33`.
 - Single staged `.litertlm` model file.
 - No outbound traffic.
+
+#### Real-CLI compat: model context size matters
+
+The protocol layer is fully verified by direct curl against every
+endpoint. End-to-end real-CLI use is bounded by the underlying
+model's context window, not by the HTTP layer:
+
+- Real **Claude Code** sends a ~16k-token built-in agent system prompt
+  on every request. Models with ≥17k context are needed for usable
+  sessions; the bundled Gemma 4 E2B/E4B (4096-token context) returns
+  `Input token ids are too long: 16xxx >= 4096` from LiteRT-LM and the
+  CLI surfaces this as "API returned an empty or malformed response".
+- Real **Codex CLI** (--oss + ollama provider) sends a ~8k-token
+  agent prompt — also above 4k. Same overflow behavior.
+- **OpenCode / OpenClaw** typically have smaller defaults; mileage
+  varies per agent config.
+- **Direct curl / programmatic clients** with short prompts work
+  end-to-end against all four envelopes (verified on Galaxy S21+ /
+  SD888 / Android 15).
+
+If you need real-CLI agent loops on-device, plan for a model with
+larger context. Streaming framing, error-event recovery, model-name
+aliasing, and `/api/version` / `/api/pull` / `/v1/models` probes that
+the CLIs run before chat all pass on the bundled models — only the
+final inference call is gated by context capacity.
 
 ## [0.2.0] — 2026-05-01
 
