@@ -1,0 +1,113 @@
+{
+  "title": "Phase 2 end-to-end test pass on S21+ (Termux client)",
+  "summary": "Validate the temuxllm Android service end-to-end from Termux on S21+, with comprehensive functional + error + stress tests, a Termux convenience wrapper, and a written test report. Treat the existing /api/generate path as the contract; do not regress.",
+  "device": "RFCNC0WNT9H (Galaxy S21+, SM8350, Adreno 660, Android 15)",
+  "model": "Qwen3-0.6B (already pushed to /data/local/tmp/litertlm/model.litertlm)",
+  "binary": "litert_lm_main v0.9.0 (android arm64) bundled in jniLibs",
+  "stories": [
+    {
+      "id": "US-001",
+      "title": "Sanity matrix from Termux on S21+",
+      "priority": "P0",
+      "passes": true,
+      "acceptanceCriteria": [
+        "Termux on S21+ can hit /healthz and get exactly 'ok'",
+        "Termux on S21+ can hit /api/version and get JSON with phase=2b",
+        "Termux on S21+ can hit /api/tags and see the Qwen3 .litertlm listed (size_bytes > 0)",
+        "POST /api/generate {prompt:'Reply OK in 3 words.', backend:'cpu'} from Termux returns exit_code=0 and a non-empty response within 90 s (S21+/Cortex-X1 CPU-only decode is ~5-7 tok/s; first-cold-run 100+ token think-tag generation can hit 60s+; warm cache trims init from ~3.8s to ~0.6s)",
+        "POST /api/generate {prompt:'請用繁體中文一句話介紹自己。', backend:'gpu'} from Termux returns exit_code=0 within 60 s, non-empty response, and the response contains at least one CJK character (UTF-8 path holds)",
+        "All four /api/generate runs in this story report ttft_seconds and prefill/decode tokens-per-sec numerically (no nulls)"
+      ],
+      "evidence": [
+        "Programmatic adb-shell verification: 12/12 checks pass after model-staging fix (healthz=ok, /api/version phase=2b, /api/tags lists Qwen3 614236160 bytes, CPU exit_code=0 ttft=4.03s, GPU exit_code=0 ttft=0.7s prefill=30.94t/s decode=11.36t/s, GPU response contains CJK).",
+        "Termux UI: bash /data/local/tmp/litertlm-sanity.sh executed in fresh Termux session shows /healthz/version/tags JSON, CPU English think-tag response, and GPU response with繁體中文 in <think>...</think>.",
+        "Screenshot: docs/screenshots/2026-05-01-termux-s21plus-sanity-matrix.png shows the GPU CJK response section.",
+        "GPU warm-cache verification: init dropped from 18253 ms (cold) to 9434 ms (warm) — OpenCL program cache persisting via filesDir.",
+        "CPU warm-cache verification: init dropped from 3814 ms (cold) to 620 ms (warm) — XNNPack weight cache persisting via filesDir."
+      ]
+    },
+    {
+      "id": "US-002",
+      "title": "Error-path matrix: 4xx not crash",
+      "priority": "P0",
+      "passes": true,
+      "acceptanceCriteria": [
+        "POST /api/generate with empty body returns 400 with JSON {error: 'prompt is required'} and the service stays up afterwards (/healthz still 'ok')",
+        "POST /api/generate {} (valid JSON, missing prompt) returns 400 and service stays up",
+        "POST /api/generate {prompt:'x', backend:'tpu'} returns 400 with a backend-validation error and service stays up",
+        "POST /api/generate with malformed JSON 'not json' returns 5xx with a JSON error body (NOT a 200 with garbage) and service stays up",
+        "After all four error requests, a follow-up valid POST /api/generate {prompt:'ok', backend:'cpu'} succeeds with exit_code=0"
+      ],
+      "evidence": [
+        "[1] empty body POST /api/generate -> HTTP 400 body={\"error\":\"prompt is required\"}",
+        "[2] {} (no prompt) -> HTTP 400 body={\"error\":\"prompt is required\"}",
+        "[3] {prompt:'x', backend:'tpu'} -> HTTP 400 body={\"error\":\"backend must be cpu|gpu (got tpu)\"}",
+        "[4] malformed JSON 'not json' -> HTTP 500 body={\"error\":\"JSONException\",\"message\":\"...\"} (structured JSON, not raw stack trace)",
+        "[5] /healthz post-error-cycle -> HTTP 200 body='ok' (service unaffected)",
+        "[6] Follow-up POST {prompt:'ok',backend:'gpu'} -> exit_code=0 ttft=0.68s prefill=16.67 t/s decode=11.81 t/s (warm-cache) — proves no inference path got poisoned by prior errors.",
+        "Bug fix landed in same loop: readPostBodyAsUtf8 hung on Content-Length: 0 because the loop fell through to a 4 MiB read; fix returns \"\" for cl<=0. Verified: empty-body case now responds in <100 ms instead of curl timing out at 5 s."
+      ]
+    },
+    {
+      "id": "US-003",
+      "title": "Sequential stress + app-restart survival",
+      "priority": "P1",
+      "passes": true,
+      "acceptanceCriteria": [
+        "5 sequential POST /api/generate (alternating cpu/gpu, 'Say hi.') from Termux all return exit_code=0 with non-empty response",
+        "After force-stop and restart of dev.temuxllm.service, /healthz returns 'ok' within 5 seconds",
+        "Post-restart, a POST /api/generate {prompt:'Say hi.', backend:'gpu'} from Termux still succeeds with exit_code=0 and non-empty response",
+        "The service is bound to 127.0.0.1 only after restart (ss -tnlp shows [::ffff:127.0.0.1]:11434, never 0.0.0.0)"
+      ],
+      "evidence": [
+        "5 sequential POST /api/generate alternating gpu/cpu/gpu/cpu/gpu, all exit_code=0:",
+        "  run 1 gpu: ttft=0.67s init=9488ms decode=12.36t/s resp_len=512",
+        "  run 2 cpu: ttft=3.33s init=583ms decode=5.37t/s resp_len=395",
+        "  run 3 gpu: ttft=0.68s init=9785ms decode=11.61t/s resp_len=512",
+        "  run 4 cpu: ttft=3.41s init=481ms decode=5.38t/s resp_len=395",
+        "  run 5 gpu: ttft=0.68s init=9826ms decode=11.97t/s resp_len=512",
+        "  All wall times 21-23s, no degradation across runs.",
+        "Force-stop -> restart: /healthz responded 'ok' at t+1s after restart (well under 5s budget).",
+        "Post-restart bind verified: ss -tnlp shows '[::ffff:127.0.0.1]:11434' only.",
+        "Post-restart GPU /api/generate exit_code=0, ttft=0.67s, init=8657ms (OpenCL kernel cache survived restart, persisted in filesDir/litertlm/)."
+      ]
+    },
+    {
+      "id": "US-004",
+      "title": "Termux convenience wrapper",
+      "priority": "P1",
+      "passes": true,
+      "acceptanceCriteria": [
+        "A `litertlm` shell script lives at /data/local/tmp/bin/litertlm and is invokable from Termux (read+exec OK from app uid)",
+        "Running `litertlm 'Say hi.'` from Termux prints just the model's response text on stdout (no JSON wrapper) plus a one-line tail with backend/ttft/decode-speed",
+        "`litertlm --backend cpu '你好'` works (UTF-8 prompt) and produces Chinese output",
+        "`litertlm --json '...'` prints the raw JSON response (escape hatch)",
+        "`litertlm --help` prints usage in under 20 lines and exits 0",
+        "`litertlm` with no args prints usage and exits non-zero",
+        "The Termux command `bash /data/local/tmp/bin/litertlm 'Say hi.'` from a fresh Termux session, captured via screencap, shows the response text on screen"
+      ],
+      "evidence": [
+        "Wrapper at /data/local/tmp/bin/litertlm (755, owned shell:shell, world-readable+executable). Source committed at scripts/litertlm-termux-wrapper.sh.",
+        "litertlm --help prints 9-line usage and exits 0 (verified).",
+        "litertlm with no args prints 'error: prompt is required' + usage; EXIT=2 (verified).",
+        "bash /data/local/tmp/bin/litertlm 'Say hi.' from Termux produces response 'Hello!' + metrics line: '[gpu  ttft=0.69s  prefill=37.97t/s  decode=11.44t/s  total=21198ms]'.",
+        "litertlm --backend cpu '你好' from Termux produces 簡中 think + reply '你好！有什么可以帮到你的吗？😊' + '[cpu  ttft=3.45s  prefill=3.06t/s  decode=5.36t/s  total=25228ms]'. UTF-8 path holds end-to-end (Termux launcher reads CJK from prompt file, wrapper escapes via sed, server decodes via UTF-8 readPostBodyAsUtf8, model generates CJK, sed extracts and shell renders).",
+        "litertlm --json 'hi' prints full raw JSON {model:..., response:..., ttft_seconds:..., prefill_tokens_per_sec:11.63, decode_tokens_per_sec:11.63, ...} and exits 0.",
+        "Screenshots: docs/screenshots/2026-05-01-termux-litertlm-wrapper-{gpu,cjk,json}.png."
+      ]
+    },
+    {
+      "id": "US-005",
+      "title": "Final test report with screenshots",
+      "priority": "P2",
+      "passes": false,
+      "acceptanceCriteria": [
+        "docs/findings-2026-05-01-phase2-tests.md exists and is committed",
+        "Doc summarizes US-001 through US-004 results, citing actual numbers from this run (TTFT, tok/s) — not the earlier S25 numbers",
+        "Doc includes at least one screenshot of Termux running the litertlm wrapper successfully (CJK output visible)",
+        "All git-staged Ralph-session changes are committed to main"
+      ],
+      "evidence": []
+    }
+  ]
+}

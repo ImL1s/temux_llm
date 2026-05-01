@@ -135,13 +135,16 @@ class HttpServer(private val context: Context) : NanoHTTPD(BIND, PORT) {
      * regardless of whether the client supplied "; charset=utf-8" on Content-Type.
      * NanoHTTPD's own `parseBody` defaults to ISO-8859-1 which corrupts CJK input.
      *
-     * We honor an optional "Content-Length" to bound the read; if absent we cap at
-     * 4 MiB which is plenty for prompts.
+     * Behavior:
+     *   - Content-Length == 0 (or absent) → return "" immediately. Reading the
+     *     stream would block forever waiting for bytes that never come.
+     *   - Content-Length > 0 → read exactly that many bytes (capped at 4 MiB).
      */
     private fun readPostBodyAsUtf8(session: IHTTPSession): String {
-        val cl = session.headers["content-length"]?.toIntOrNull()?.coerceAtLeast(0) ?: 0
         val cap = 4 * 1024 * 1024
-        val limit = if (cl in 1..cap) cl else cap
+        val cl = session.headers["content-length"]?.toIntOrNull() ?: 0
+        if (cl <= 0) return ""
+        val limit = cl.coerceAtMost(cap)
         val buf = ByteArray(limit)
         var pos = 0
         val ins = session.inputStream
