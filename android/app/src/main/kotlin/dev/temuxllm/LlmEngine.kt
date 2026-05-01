@@ -21,10 +21,11 @@ import java.io.File
  * close to instant.
  *
  * Single-Engine, single-backend per process. The first request after service start
- * fixes the backend (default: CPU — GPU regressed in LiteRT-LM 0.11.0-rc1, see
- * README "Known issues"); a per-request `backend` override is honored by tearing
- * down and rebuilding the Engine (slow — several seconds re-init), so callers
- * should pin to one backend in steady-state use.
+ * fixes the backend (default: GPU — Adreno OpenCL kernel-compile takes 8–22 s on
+ * first run, then `mldrift_program_cache.bin` is reused on subsequent starts);
+ * a per-request `backend` override is honored by tearing down and rebuilding
+ * the Engine (slow — several seconds re-init), so callers should pin to one
+ * backend in steady-state use.
  *
  * Concurrency: Engine is not safe for parallel inference. We serialize generate()
  * calls with a single mutex. NanoHTTPD's per-request thread will block until prior

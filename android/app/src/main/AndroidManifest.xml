@@ -13,6 +13,18 @@
         android:hasFragileUserData="false"
         android:requestLegacyExternalStorage="false">
 
+        <!-- LiteRT-LM GPU backend needs to dlopen libOpenCL.so from the vendor
+             namespace (Adreno on Snapdragon) plus libvndksupport.so. Since
+             targetSdk >= 31 (Android 12), apps must explicitly declare native
+             libs they depend on; without these tags the linker namespace
+             blocks the loads and the SDK falls back to OpenGL (which is
+             incomplete in MLDrift -> CreateSharedMemoryManager UNIMPLEMENTED).
+             See google-ai-edge/LiteRT-LM #2114. required=false so devices
+             missing any one of these still install. -->
+        <uses-native-library android:name="libvndksupport.so" android:required="false"/>
+        <uses-native-library android:name="libOpenCL.so" android:required="false"/>
+        <uses-native-library android:name="libOpenCL-pixel.so" android:required="false"/>
+
         <service
             android:name=".LlmService"
             android:exported="true"

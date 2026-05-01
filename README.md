@@ -7,26 +7,39 @@
 [![runtime](https://img.shields.io/badge/runtime-LiteRT--LM%200.11.0--rc1-yellow)](https://github.com/google-ai-edge/LiteRT-LM)
 
 A self-contained Android app + Termux client that runs Google's **Gemma 4** (or
-Qwen3) on your phone and exposes it as `http://127.0.0.1:11434/api/generate`.
-No network. No cloud. No data leaves the device.
+Qwen3) on your phone's GPU and exposes it as
+`http://127.0.0.1:11434/api/generate`. No network. No cloud. No data leaves
+the device.
 
 ```
 $ litertlm "Reply with just: hi."
 hi.
 
-[cpu  total=4918ms  tokens=61  decode=12.4 t/s]
+[gpu  total=2676ms  tokens=62  decode=23.2 t/s]
 ```
 
-Tested on **Galaxy S21+** (SD 888, Android 15), **Galaxy S24 Ultra** (SD 8 Gen 3,
-Android 16), and **Galaxy S25** (SD 8 Elite, Android 16). Should work on any
-arm64-v8a Android 13+ device. See [device matrix](#device-matrix) for measured
-decode rates.
+Tested on **Galaxy S21+** (SD 888 / Adreno 660, Android 15), **Galaxy S24 Ultra**
+(SD 8 Gen 3 / Adreno 750, Android 16), and **Galaxy S25** (SD 8 Elite / Adreno
+830, Android 16). Should work on any arm64-v8a Android 13+ Snapdragon device.
+See [device matrix](#device-matrix) for measured CPU + GPU decode rates.
 
-> **Known issue (v0.1.x):** GPU acceleration is currently regressed on all
-> tested devices — LiteRT-LM 0.11.0-rc1 fails to load OpenCL via
-> `libvndksupport.so` and the OpenGL fallback returns
-> `UNIMPLEMENTED: CreateSharedMemoryManager`. The service therefore
-> defaults to **CPU**. See [Known issues](#known-issues) for details.
+## Use cases / 用途
+
+- **No network or cloud:** Run LLM prompts on airplane mode, in subways, in
+  sensitive contexts where queries cannot leave the device.
+- **Ollama-compatible endpoint:** Apps and scripts expecting
+  `http://127.0.0.1:11434` (Ollama's standard port) work without modification.
+- **Termux scripting:** Pipe LLM output into shell pipelines:
+  `curl -s ... | jq .response` for structured queries on the phone.
+- **Offline assistant:** Gemma-class model resident in memory, sub-second
+  replies for short queries.
+- **Interchangeable models:** Load any `.litertlm` model (Gemma, Qwen, future
+  releases) and swap freely.
+- **Private prototyping:** Build against a local endpoint during early
+  dev — no API keys, no token costs, no prompts sent to third parties.
+
+**Not for:** production traffic (single device, single tenant), long-context
+work (8k context max), multi-user serving (localhost only by design).
 
 ---
 
@@ -189,64 +202,58 @@ The service binds only to `127.0.0.1`. Verified after every restart with
 
 ## Device matrix
 
-CPU decode rates measured with `gemma-4-E2B-it` and `gemma-4-E4B-it`,
-50-word output prompt, warm engine (cold init dropped), in-process Engine
-via the APK service.
+Decode rates measured with `gemma-4-E2B-it` (2.4 GB) and `gemma-4-E4B-it`
+(3.4 GB), 50-word output prompt, warm engine (cold init dropped),
+in-process Engine via the APK service.
 
-| Device | SoC | Android | RAM | E2B CPU | E4B CPU |
-|---|---|---|---|---|---|
-| Galaxy S21+ | SD 888 (SM8350) | 15 | 8 GB | 8.0 t/s | 4.1 t/s |
-| Galaxy S24 Ultra | SD 8 Gen 3 (SM8650) | 16 | 12 GB | 10.3 t/s | 5.7 t/s |
-| Galaxy S25 | SD 8 Elite (SM8750) | 16 | 12 GB | 12.4 t/s | 7.8 t/s |
-| Galaxy Note 9 | Exynos 9810 | 10 | 6 GB | unsupported (minSdk=33 / Android 13+) | — |
+| Device | SoC | Android | RAM | E2B CPU | E2B GPU | E4B CPU | E4B GPU | GPU cold init |
+|---|---|---|---|---|---|---|---|---|
+| Galaxy S21+ | SD 888 (Adreno 660) | 15 | 8 GB | 8.0 t/s | 10.5 t/s | 4.1 t/s | (not measured) | ~20 s |
+| Galaxy S24 Ultra | SD 8 Gen 3 (Adreno 750) | 16 | 12 GB | 10.3 t/s | 22.0 t/s | 5.7 t/s | (not measured) | ~11 s |
+| Galaxy S25 | SD 8 Elite (Adreno 830) | 16 | 12 GB | 12.4 t/s | 23.2 t/s | 7.8 t/s | 15.0 t/s | ~8 s |
+| Galaxy Note 9 | Exynos 9810 | 10 | 6 GB | unsupported (minSdk=33 / Android 13+) | | | | |
 
 `decode = output_tokens / (total_duration_ms / 1000)` end-to-end (includes
-prefill within the warm window). First call after service start pays
-~3-7 s rebuilding the XNNPack weight cache; warm init drops to ~0.5-0.8 s.
+prefill within the warm window).
 
-GPU rows are intentionally omitted — see Known issues below.
+**First-call init cost:**
+
+- **GPU:** OpenCL kernel-compile takes 8-22 s the first time the engine
+  starts. The SDK writes `model.litertlm_*_mldrift_program_cache.bin` into
+  the app's filesDir; subsequent service starts skip the compile and reuse
+  it. If you re-push a model, the cache is invalidated and you pay this
+  cost again.
+- **CPU:** XNNPack weight cache build takes 3-7 s on first call; warm
+  init is 0.5-0.8 s.
 
 ---
 
 ## Known issues
-
-### GPU acceleration regressed in LiteRT-LM 0.11.0-rc1 (v0.1.x)
-
-On every device tested (S21+ Android 15, S24 Ultra Android 16, S25 Android 16),
-selecting `backend: "gpu"` fails with:
-
-```
-INTERNAL: ERROR: [.../llm_litert_compiled_model_executor.cc:1928]
-└ ERROR: [./third_party/odml/litert/litert/cc/litert_compiled_model.h:1780]
-```
-
-Logcat shows the SDK trying to load OpenCL via `libvndksupport.so`:
-
-```
-ml_drift_cl_gl_accelerator.cc:126  OpenCL not supported on this platform. Using OpenGL instead.
-tflite                              Failed to load OpenCL library with dlopen:
-                                    dlopen failed: library "libvndksupport.so" not found.
-delegate_opengl.cc:218              UNIMPLEMENTED: CreateSharedMemoryManager is not implemented.
-```
-
-The OpenCL → OpenGL fallback path in 0.11.0-rc1 is incomplete on Android
-14/15/16 untrusted_app linker namespaces. This is upstream — not something
-this project introduced — and will be fixed when LiteRT-LM picks up the
-shared-memory implementation.
-
-**Workaround:** run on CPU (which is the default since v0.1.1):
-
-```bash
-curl -s http://127.0.0.1:11434/api/generate \
-  -H 'Content-Type: application/json' \
-  -d '{"prompt":"hi","backend":"cpu","stream":false}'
-```
 
 ### Note 9 / Android < 13
 
 `minSdk=33` (Android 13). Older devices like Galaxy Note 9 (Android 10) reject
 the APK install with `INSTALL_FAILED_OLDER_SDK`. There is no plan to lower the
 floor — the LiteRT-LM SDK targets API 33+.
+
+### Non-Snapdragon SoCs (Tensor, Exynos)
+
+GPU is verified on Adreno (Qualcomm Snapdragon) only. Other SoC families have
+their own LiteRT-LM upstream issues:
+
+- **Pixel / Tensor G3+:** OpenCL not exposed by Tensor — see
+  [LiteRT-LM #1860](https://github.com/google-ai-edge/LiteRT-LM/issues/1860).
+- **Exynos (S26 / Xclipse):** Clspv kernel bug under ANGLE-CL — see
+  [LiteRT-LM #2114](https://github.com/google-ai-edge/LiteRT-LM/issues/2114).
+
+If GPU init returns `INTERNAL ERROR ... compiled_model_executor.cc:1928` on
+your device, fall back to CPU per request:
+
+```bash
+curl -s http://127.0.0.1:11434/api/generate \
+  -H 'Content-Type: application/json' \
+  -d '{"prompt":"hi","backend":"cpu","stream":false}'
+```
 
 ---
 

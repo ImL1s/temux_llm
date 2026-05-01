@@ -9,6 +9,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 (no unreleased changes)
 
+## [0.1.2] — 2026-05-01
+
+GPU works again. v0.1.1 misdiagnosed the cause — apologies for the noise.
+
+### Fixed
+- **GPU acceleration restored** on Adreno (Snapdragon) devices. v0.1.1
+  attributed the regression to LiteRT-LM 0.11.0-rc1 upstream. That was
+  wrong. The actual cause was an `AndroidManifest.xml` regression
+  introduced when we pivoted from the subprocess CLI binary path to the
+  in-process Maven SDK at commit `94fc38e`: the in-process JNI runs
+  inside the app's linker namespace and needs explicit
+  `<uses-native-library>` declarations to dlopen vendor `libOpenCL.so`
+  (and `libvndksupport.so`); without them the SDK falls back to OpenGL
+  and that path is incomplete. Added the three required declarations
+  (`libvndksupport.so`, `libOpenCL.so`, `libOpenCL-pixel.so`,
+  `required="false"` so non-Adreno devices still install). Verified
+  GPU init now succeeds and `model.litertlm_*_mldrift_program_cache.bin`
+  is written. References upstream
+  [LiteRT-LM #2114](https://github.com/google-ai-edge/LiteRT-LM/issues/2114).
+
+### Changed
+- Default backend reverted to **`gpu`** (was forced to `cpu` in v0.1.1
+  because of the misdiagnosis). Per-request `{"backend":"cpu"}` override
+  still works; useful for non-Adreno SoCs where GPU init fails.
+- Device matrix in README now reports both CPU and GPU decode rates.
+
+### Verified on hardware
+- S21+ (SD 888 / Adreno 660 / Android 15): GPU 10.5 t/s, CPU 8.0 t/s, cold init ~20 s
+- S24 Ultra (SD 8 Gen 3 / Adreno 750 / Android 16): GPU 22.0 t/s, CPU 10.3 t/s, cold init ~11 s
+- S25 (SD 8 Elite / Adreno 830 / Android 16): GPU 23.2 t/s (E2B) / 15.0 t/s (E4B), CPU 12.4 t/s, cold init ~8 s
+
+### Known issues
+- Non-Snapdragon SoCs (Tensor / Exynos / others) may fail GPU init with the
+  same `INTERNAL ERROR` because they have separate upstream LiteRT-LM bugs:
+  Tensor lacks OpenCL exposure ([#1860](https://github.com/google-ai-edge/LiteRT-LM/issues/1860)),
+  Exynos hits a Clspv kernel bug under ANGLE-CL ([#2114](https://github.com/google-ai-edge/LiteRT-LM/issues/2114)).
+  Use `{"backend":"cpu"}` per request on those devices.
+
 ## [0.1.1] — 2026-05-01
 
 Open-source polish + honest device matrix. No new features.
@@ -92,6 +130,7 @@ First open-source-ready release.
 - Gemma-4-E4B works on CPU only on S21+ (decode 0.5 t/s — too slow to
   be interactive). Use Gemma-4-E2B on phones with ≤8 GB RAM.
 
-[Unreleased]: https://github.com/ImL1s/temux_llm/compare/v0.1.1...HEAD
+[Unreleased]: https://github.com/ImL1s/temux_llm/compare/v0.1.2...HEAD
+[0.1.2]: https://github.com/ImL1s/temux_llm/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/ImL1s/temux_llm/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/ImL1s/temux_llm/releases/tag/v0.1.0
