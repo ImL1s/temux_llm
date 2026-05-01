@@ -86,17 +86,19 @@ case "$MODEL" in
   qwen3) FETCH_MODEL=qwen3; MODEL_FILE=Qwen3-0.6B.litertlm ;;
   *) die "unknown MODEL=$MODEL (use e2b, e4b, or qwen3)" ;;
 esac
-say "host artifacts (binary + .so + model: $MODEL_FILE)"
+say "host artifacts (model: $MODEL_FILE — binary/.so come from the Maven SDK)"
+# fetch_artifacts.sh still fetches the v0.11.0-rc.1 CLI binary + .so set so the
+# raw scripts (run_cpu_smoke.sh, run_litertlm_benchmark.sh) still work outside
+# the app. The Android app itself does NOT need them; it pulls the runtime via
+# `com.google.ai.edge.litertlm:litertlm-android` at build time.
 MODEL="$FETCH_MODEL" bash "$PROJECT_ROOT/scripts/fetch_artifacts.sh"
 
-# ---- 4. sync into Android jniLibs ----
-say "staging binary + .so into android/app/src/main/jniLibs/arm64-v8a/"
+# ---- 4. ensure jniLibs is clean (no leftover hand-bundled binary from older builds) ----
 JNI_DIR="$PROJECT_ROOT/android/app/src/main/jniLibs/arm64-v8a"
-mkdir -p "$JNI_DIR"
-rm -f "$JNI_DIR"/*
-cp "$PROJECT_ROOT/bin/litert_lm_main" "$JNI_DIR/liblitert_lm_main.so"
-cp "$PROJECT_ROOT/bin/android_arm64/"*.so "$JNI_DIR/"
-ls -la "$JNI_DIR" | tail -n +2
+if [[ -d "$JNI_DIR" ]] && compgen -G "$JNI_DIR/*" > /dev/null; then
+  say "removing leftover hand-bundled libs from jniLibs/ (Maven SDK handles its own)"
+  rm -f "$JNI_DIR"/*
+fi
 
 # ---- 5. build APK ----
 say "building APK via Gradle wrapper (first run takes ~1 min)"
