@@ -88,6 +88,13 @@ Open-source polish + honest device matrix. No new features.
   14/15/16 untrusted_app linker namespaces; this project did not
   introduce it. Workaround: use CPU (which is now the default).
 
+  > **Correction (added in v0.1.2):** the upstream-blame claim above is
+  > **wrong**. The actual root cause was a missing
+  > `<uses-native-library>` declaration in our own `AndroidManifest.xml`,
+  > introduced when we pivoted from the subprocess CLI to the in-process
+  > Maven SDK. See the v0.1.2 entry above for the real fix and hardware
+  > verification.
+
 ## [0.1.0] — 2026-05-01
 
 First open-source-ready release.
