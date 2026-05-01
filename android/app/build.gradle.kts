@@ -1,3 +1,5 @@
+import org.jetbrains.kotlin.gradle.dsl.JvmTarget
+
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
@@ -23,10 +25,6 @@ android {
         targetCompatibility = JavaVersion.VERSION_17
     }
 
-    kotlinOptions {
-        jvmTarget = "17"
-    }
-
     buildTypes {
         release {
             isMinifyEnabled = false
@@ -39,6 +37,13 @@ android {
             // into the APK normally. We no longer ship a CLI binary here.
             useLegacyPackaging = true
         }
+    }
+}
+
+// Kotlin 2.x: use compilerOptions DSL instead of the deprecated kotlinOptions block.
+kotlin {
+    compilerOptions {
+        jvmTarget.set(JvmTarget.JVM_17)
     }
 }
 
