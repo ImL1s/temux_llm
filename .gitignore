@@ -15,3 +15,5 @@ android/build/
 android/app/src/main/jniLibs/
 .claude/
 .omc/
+android/.kotlin/
+android/.idea/

@@ -3,9 +3,15 @@ package dev.temuxllm
 import android.content.Context
 import android.util.Log
 import fi.iki.elonen.NanoHTTPD
+import kotlinx.coroutines.flow.collect
+import kotlinx.coroutines.runBlocking
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
+import java.io.PipedInputStream
+import java.io.PipedOutputStream
+import java.io.PrintWriter
+import kotlin.concurrent.thread
 
 /**
  * Localhost-only HTTP server. MUST bind to 127.0.0.1 (brief constraint #1).
@@ -14,11 +20,11 @@ import java.io.File
  *   GET  /healthz       -> 200 "ok"
  *   GET  /api/version   -> JSON describing the service
  *   GET  /api/tags      -> JSON listing models known to be on disk
- *   POST /api/generate  -> spawn litert_lm_main, return one JSON document with text + metrics
- *
- * /api/generate is non-streaming: the v0.9.0 binary buffers stdout until completion.
+ *   POST /api/generate  -> NDJSON stream of {response: "..."} chunks + final
+ *                          {done:true,...metrics} (or single document if stream=false)
  */
-class HttpServer(private val context: Context) : NanoHTTPD(BIND, PORT) {
+class HttpServer(private val context: Context, private val engine: LlmEngine) :
+    NanoHTTPD(BIND, PORT) {
 
     companion object {
         const val BIND = "127.0.0.1"
@@ -26,49 +32,42 @@ class HttpServer(private val context: Context) : NanoHTTPD(BIND, PORT) {
         private const val TAG = "HttpServer"
     }
 
-    private val runner = LiteRtLmRunner(context)
+    override fun serve(session: IHTTPSession): Response = try {
+        when {
+            session.uri == "/healthz" && session.method == Method.GET ->
+                text(Response.Status.OK, "ok\n")
 
-    override fun serve(session: IHTTPSession): Response {
-        return try {
-            when {
-                session.uri == "/healthz" && session.method == Method.GET ->
-                    text(Response.Status.OK, "ok\n")
+            session.uri == "/api/version" && session.method == Method.GET ->
+                json(Response.Status.OK, JSONObject().apply {
+                    put("service", "temuxllm")
+                    put("phase", "2c")
+                    put("runtime", "litertlm-android 0.11.0-rc1 (in-process Engine)")
+                    put("default_backend", "gpu")
+                    put("model_path", engine.activeModelPath().absolutePath)
+                    put("source_model_path", LlmEngine.SOURCE_MODEL_PATH)
+                    put("engine_loaded", engine.isLoaded())
+                })
 
-                session.uri == "/api/version" && session.method == Method.GET ->
-                    json(Response.Status.OK, JSONObject().apply {
-                        put("service", "temuxllm")
-                        put("phase", "2b")
-                        put("binary", "litert_lm_main v0.11.0-rc.1 (android arm64)")
-                        put("default_backend", "gpu")
-                        put("model_path", runner.activeModelPath().absolutePath)
-                        put("source_model_path", LiteRtLmRunner.SOURCE_MODEL_PATH)
-                    })
+            session.uri == "/api/tags" && session.method == Method.GET ->
+                json(Response.Status.OK, listModels())
 
-                session.uri == "/api/tags" && session.method == Method.GET ->
-                    json(Response.Status.OK, listModels())
+            session.uri == "/api/generate" && session.method == Method.POST ->
+                handleGenerate(session)
 
-                session.uri == "/api/generate" && session.method == Method.POST ->
-                    handleGenerate(session)
-
-                else -> text(Response.Status.NOT_FOUND, "404 ${session.method} ${session.uri}\n")
-            }
-        } catch (t: Throwable) {
-            Log.e(TAG, "serve failed", t)
-            json(
-                Response.Status.INTERNAL_ERROR,
-                JSONObject().apply {
-                    put("error", t.javaClass.simpleName)
-                    put("message", t.message ?: "")
-                }
-            )
+            else -> text(Response.Status.NOT_FOUND, "404 ${session.method} ${session.uri}\n")
         }
+    } catch (t: Throwable) {
+        Log.e(TAG, "serve failed", t)
+        json(
+            Response.Status.INTERNAL_ERROR,
+            JSONObject().apply {
+                put("error", t.javaClass.simpleName)
+                put("message", t.message ?: "")
+            }
+        )
     }
 
     private fun handleGenerate(session: IHTTPSession): Response {
-        // NanoHTTPD 2.3.1 parseBody decodes the raw POST bytes via the request's
-        // Content-Type charset, defaulting to ISO-8859-1 — which silently mangles
-        // any UTF-8 multi-byte sequence (e.g. CJK prompts). Bypass it: read the
-        // raw stream ourselves and decode as UTF-8.
         val raw = readPostBodyAsUtf8(session)
         val body = if (raw.isBlank()) JSONObject() else JSONObject(raw)
         val prompt = body.optString("prompt").also {
@@ -78,39 +77,79 @@ class HttpServer(private val context: Context) : NanoHTTPD(BIND, PORT) {
         if (backend != "cpu" && backend != "gpu") {
             return errorJson(Response.Status.BAD_REQUEST, "backend must be cpu|gpu (got $backend)")
         }
-        val modelPath = body.optString("model_path", "").ifBlank { runner.ensureModelStaged() }
-        val timeoutMs = body.optLong("timeout_ms", LiteRtLmRunner.DEFAULT_TIMEOUT_MS)
+        val stream = body.optBoolean("stream", true)
 
-        Log.i(TAG, "generate backend=$backend prompt=${prompt.take(80)}…")
-        val result = runner.generate(prompt, backend = backend, modelPath = modelPath, timeoutMs = timeoutMs)
-        Log.i(TAG, "generate done exit=${result.exitCode} dur=${result.totalDurationMs}ms text-len=${result.text.length}")
+        return if (stream) streamGenerate(prompt, backend) else blockingGenerate(prompt, backend)
+    }
 
-        val obj = JSONObject().apply {
-            put("model", File(modelPath).nameWithoutExtension)
-            put("backend", result.backend)
-            put("response", result.text)
-            put("done", true)
-            put("exit_code", result.exitCode)
-            put("total_duration_ms", result.totalDurationMs)
-            result.initTotalMs?.let { put("init_total_ms", it) }
-            result.ttftSeconds?.let { put("ttft_seconds", it) }
-            result.prefillTokensPerSec?.let { put("prefill_tokens_per_sec", it) }
-            result.decodeTokensPerSec?.let { put("decode_tokens_per_sec", it) }
-            result.prefillTokens?.let { put("prefill_tokens", it) }
-            result.decodeTokens?.let { put("decode_tokens", it) }
-            put("raw_stdout_lines", result.rawStdoutLines)
+    /** Streaming response: NDJSON, one JSON object per line. */
+    private fun streamGenerate(prompt: String, backend: String): Response {
+        val pipeIn = PipedInputStream(64 * 1024)
+        val pipeOut = PipedOutputStream(pipeIn)
+        thread(start = true, name = "litertlm-stream") {
+            val writer = PrintWriter(pipeOut.writer(Charsets.UTF_8), false)
+            try {
+                runBlocking {
+                    engine.generate(prompt, backend).collect { ev ->
+                        val line = when (ev) {
+                            is LlmEngine.GenerateEvent.Token -> JSONObject().apply {
+                                put("response", ev.text)
+                                put("done", false)
+                            }
+                            is LlmEngine.GenerateEvent.Done -> JSONObject().apply {
+                                put("response", "")
+                                put("done", true)
+                                put("backend", ev.backend)
+                                put("total_duration_ms", ev.totalDurationMs)
+                                put("output_tokens", ev.outputTokens)
+                                put("output_chars", ev.outputChars)
+                            }
+                            is LlmEngine.GenerateEvent.Error -> JSONObject().apply {
+                                put("error", ev.message)
+                                put("done", true)
+                            }
+                        }
+                        writer.println(line.toString())
+                        writer.flush()
+                    }
+                }
+            } catch (t: Throwable) {
+                Log.e(TAG, "stream worker failed", t)
+                writer.println(JSONObject().apply { put("error", t.message ?: ""); put("done", true) })
+                writer.flush()
+            } finally {
+                writer.close()
+            }
         }
-        val statusCode = if (result.exitCode == 0) Response.Status.OK else Response.Status.INTERNAL_ERROR
-        return json(statusCode, obj)
+        return newChunkedResponse(Response.Status.OK, "application/x-ndjson; charset=utf-8", pipeIn)
+    }
+
+    /** Non-streaming convenience: block for the full response, return one JSON. */
+    private fun blockingGenerate(prompt: String, backend: String): Response {
+        Log.i(TAG, "generate blocking backend=$backend prompt=${prompt.take(80)}…")
+        val r = engine.generateBlocking(prompt, backend)
+        if (r.error != null) {
+            return json(
+                Response.Status.INTERNAL_ERROR,
+                JSONObject().apply { put("error", r.error); put("done", true) }
+            )
+        }
+        val obj = JSONObject().apply {
+            put("model", File(engine.activeModelPath().absolutePath).nameWithoutExtension)
+            put("backend", r.backend)
+            put("response", r.text)
+            put("done", true)
+            put("total_duration_ms", r.totalDurationMs)
+            put("output_tokens", r.outputTokens)
+        }
+        return json(Response.Status.OK, obj)
     }
 
     private fun listModels(): JSONObject {
         val tags = JSONObject()
         val arr = JSONArray()
-        // Active model lives in our app's filesDir; we also list any host-pushed
-        // copy in /data/local/tmp/ for transparency.
         val candidates = listOf(
-            runner.modelDir(),
+            engine.modelDir(),
             File("/data/local/tmp/litertlm"),
             File(context.filesDir, "models")
         )
@@ -119,11 +158,11 @@ class HttpServer(private val context: Context) : NanoHTTPD(BIND, PORT) {
             val files = dir.listFiles { f -> f.isFile && f.name.endsWith(".litertlm") } ?: continue
             for (f in files) {
                 if (!seen.add(f.absolutePath)) continue
-                val item = JSONObject()
-                item.put("name", f.nameWithoutExtension)
-                item.put("path", f.absolutePath)
-                item.put("size_bytes", f.length())
-                arr.put(item)
+                arr.put(JSONObject().apply {
+                    put("name", f.nameWithoutExtension)
+                    put("path", f.absolutePath)
+                    put("size_bytes", f.length())
+                })
             }
         }
         tags.put("models", arr)
@@ -131,14 +170,8 @@ class HttpServer(private val context: Context) : NanoHTTPD(BIND, PORT) {
     }
 
     /**
-     * Read POST body bytes from the session input stream and decode as UTF-8 —
-     * regardless of whether the client supplied "; charset=utf-8" on Content-Type.
-     * NanoHTTPD's own `parseBody` defaults to ISO-8859-1 which corrupts CJK input.
-     *
-     * Behavior:
-     *   - Content-Length == 0 (or absent) → return "" immediately. Reading the
-     *     stream would block forever waiting for bytes that never come.
-     *   - Content-Length > 0 → read exactly that many bytes (capped at 4 MiB).
+     * Read POST body as UTF-8. Short-circuits on Content-Length: 0 (otherwise the
+     * blocking read would wait forever). Caps at 4 MiB.
      */
     private fun readPostBodyAsUtf8(session: IHTTPSession): String {
         val cap = 4 * 1024 * 1024

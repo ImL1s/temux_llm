@@ -35,10 +35,8 @@ android {
 
     packaging {
         jniLibs {
-            // We ship the litert_lm_main CLI as liblitert_lm_main.so under
-            // src/main/jniLibs/arm64-v8a/ so Android extracts it to nativeLibraryDir
-            // (which permits execve from the app sandbox; filesDir does NOT under
-            // Android 10+ W^X). useLegacyPackaging extracts on install.
+            // The Maven SDK ships its own native libs as JNI; let AGP merge them
+            // into the APK normally. We no longer ship a CLI binary here.
             useLegacyPackaging = true
         }
     }
@@ -47,4 +45,11 @@ android {
 dependencies {
     implementation("androidx.core:core-ktx:1.13.1")
     implementation("org.nanohttpd:nanohttpd:2.3.1")
+    // Coroutines for the Engine.sendMessageAsync() Flow consumer.
+    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.9.0")
+    // In-process LiteRT-LM Android SDK (replaces the subprocess wrapper around
+    // the v0.11.0-rc.1 CLI binary). Bumps the heavy lifting off ProcessBuilder
+    // and into a shared engine that loads the model once and serves multiple
+    // /api/generate calls. Also unlocks streaming via Kotlin Flow.
+    implementation("com.google.ai.edge.litertlm:litertlm-android:0.11.0-rc1")
 }

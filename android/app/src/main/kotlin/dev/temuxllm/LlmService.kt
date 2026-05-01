@@ -9,23 +9,24 @@ import android.content.pm.ServiceInfo
 import android.os.Build
 import android.os.IBinder
 import android.util.Log
+import kotlin.concurrent.thread
 
 /**
- * Foreground service that owns the localhost HTTP server.
- *
- * Phase 2a: just /healthz and /api/version. No LiteRT-LM yet.
+ * Foreground service that owns the localhost HTTP server and the in-process
+ * LiteRT-LM Engine.
  */
 class LlmService : Service() {
     private val tag = "LlmService"
     private val notifId = 11434
     private val channelId = "temuxllm"
 
+    private var engine: LlmEngine? = null
     private var server: HttpServer? = null
 
     override fun onCreate() {
         super.onCreate()
         startInForeground()
-        startHttpServer()
+        startEngineAndServer()
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -34,12 +35,10 @@ class LlmService : Service() {
     }
 
     override fun onDestroy() {
-        try {
-            server?.stop()
-        } catch (t: Throwable) {
-            Log.w(tag, "stopping server", t)
-        }
+        try { server?.stop() } catch (t: Throwable) { Log.w(tag, "stop server", t) }
+        try { engine?.close() } catch (t: Throwable) { Log.w(tag, "close engine", t) }
         server = null
+        engine = null
         super.onDestroy()
     }
 
@@ -66,19 +65,24 @@ class LlmService : Service() {
         Log.i(tag, "service in foreground")
     }
 
-    private fun startHttpServer() {
-        try {
-            // jniLibs are extracted by Android at install time; just verify the
-            // binary is reachable and executable.
-            val ready = LiteRtLmRunner(applicationContext).checkReady()
-            Log.i(tag, "litert_lm_main ready = $ready")
+    private fun startEngineAndServer() {
+        val e = LlmEngine(applicationContext).also { engine = it }
 
-            val s = HttpServer(applicationContext)
-            s.start(fi.iki.elonen.NanoHTTPD.SOCKET_READ_TIMEOUT, false)
-            server = s
-            Log.i(tag, "http server started on 127.0.0.1:${HttpServer.PORT}")
-        } catch (t: Throwable) {
-            Log.e(tag, "failed to start http server", t)
+        // Start HTTP first so /healthz responds quickly. Engine init is heavy
+        // (model staging copy + first inference still cold) — defer to a worker
+        // so the service doesn't ANR if the staging copy of a 2-3 GB model
+        // takes 10-30 s on first launch.
+        val s = HttpServer(applicationContext, e).also { server = it }
+        s.start(fi.iki.elonen.NanoHTTPD.SOCKET_READ_TIMEOUT, false)
+        Log.i(tag, "http server started on 127.0.0.1:${HttpServer.PORT}")
+
+        thread(start = true, name = "litertlm-warmup") {
+            try {
+                e.ensureModelStaged()
+                Log.i(tag, "model staged; first /api/generate will lazily initialize the Engine")
+            } catch (t: Throwable) {
+                Log.w(tag, "model not yet staged; push it from host first", t)
+            }
         }
     }
 }
