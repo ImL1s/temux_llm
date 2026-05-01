@@ -76,16 +76,26 @@ PAYLOAD='{"prompt":"'"$ESC_PROMPT"'","backend":"'"$BACKEND"'","stream":'"$STREAM
 # Streaming branch: server returns NDJSON, we read line by line as it arrives.
 if [ "$STREAM" = "1" ]; then
   if [ "$JSON_OUT" = "1" ]; then
-    # Raw NDJSON pass-through.
+    # Raw NDJSON pass-through. Caller owns error detection — the curl exit
+    # is just the HTTP transport, not the engine result. Engine failures
+    # arrive as a `{"error":"...","done":true}` line in the stream.
     curl -Nsm 300 -X POST "http://$HOST/api/generate" \
       -H 'Content-Type: application/json' \
       --data-binary "$PAYLOAD"
     exit $?
   fi
   # Pretty: print the response field of each chunk to stdout, then a metrics line on done.
-  TOTAL_MS="?"; TOKENS="?"; CHARS="?"
+  # If the engine fails (e.g. GPU init on a non-Adreno SoC), the server emits
+  # {"error":"...","done":true} as a single NDJSON line — surface that to stderr
+  # and exit nonzero instead of silently printing blank metrics.
+  TOTAL_MS="?"; TOKENS="?"; CHARS="?"; ERR=""
   while IFS= read -r line; do
     [ -z "$line" ] && continue
+    case "$line" in
+      *'"error"'*)
+        ERR=$(printf '%s' "$line" | sed -n 's/.*"error":"\(\([^"\\]\|\\.\)*\)".*/\1/p' | head -1)
+        ;;
+    esac
     # token chunk: {"response":"piece","done":false}
     chunk=$(printf '%s' "$line" | sed -n 's/.*"response":"\(\([^"\\]\|\\.\)*\)".*/\1/p' | head -1)
     if [ -n "$chunk" ]; then
@@ -102,6 +112,13 @@ if [ "$STREAM" = "1" ]; then
   done < <(curl -Nsm 300 -X POST "http://$HOST/api/generate" \
               -H 'Content-Type: application/json' \
               --data-binary "$PAYLOAD")
+  if [ -n "$ERR" ]; then
+    printf '\nerror (%s backend): %s\n' "$BACKEND" "$ERR" >&2
+    if [ "$BACKEND" = "gpu" ]; then
+      printf 'hint: retry with --backend cpu (this device may not have working OpenCL)\n' >&2
+    fi
+    exit 1
+  fi
   printf '\n\n[%s  total=%sms  tokens=%s  chars=%s]\n' \
     "$BACKEND" "${TOTAL_MS:-?}" "${TOKENS:-?}" "${CHARS:-?}"
   exit 0
@@ -123,6 +140,16 @@ if [ "$JSON_OUT" = "1" ]; then
 fi
 
 # Pretty mode for non-stream JSON.
+# Engine failures land here as {"error":"...","done":true} — surface to stderr
+# and exit nonzero so callers (scripts, smoke tests) can detect them.
+ERR=$(printf '%s' "$RESP" | sed -n 's/.*"error":"\(\([^"\\]\|\\.\)*\)".*/\1/p' | head -1)
+if [ -n "$ERR" ]; then
+  printf 'error (%s backend): %s\n' "$BACKEND" "$ERR" >&2
+  if [ "$BACKEND" = "gpu" ]; then
+    printf 'hint: retry with --backend cpu (this device may not have working OpenCL)\n' >&2
+  fi
+  exit 1
+fi
 TEXT=$(printf '%s' "$RESP" | sed -n 's/.*"response":"\(\([^"\\]\|\\.\)*\)".*/\1/p' | head -1)
 TEXT=$(printf '%b' "$(printf '%s' "$TEXT" \
   | sed -e 's/\\\"/\"/g' -e 's/\\\\/\\/g' -e 's/\\n/\n/g' -e 's/\\t/\t/g')")

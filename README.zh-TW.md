@@ -119,7 +119,10 @@ litertlm-native --help
 | 適合場景 | 互動聊天、腳本 | 偶爾 / 批次使用 |
 
 Native 路徑用「每次 call 多花一點 load 時間」換「完全不依賴 APK」。
-兩條路用同一個 v0.11.0-rc.1 binary、同一批模型。
+兩條路都用 LiteRT-LM 0.11.0-rc.1（APK 走 Maven artifact
+`com.google.ai.edge.litertlm:litertlm-android:0.11.0-rc1`，Termux-native
+走 GitHub release `v0.11.0-rc.1` 的 `litert_lm_main` CLI binary），
+模型也是同一批。
 
 ---
 

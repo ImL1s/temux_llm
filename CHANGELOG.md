@@ -9,6 +9,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 (no unreleased changes)
 
+## [0.1.3] — 2026-05-01
+
+Fixes a broken installer smoke test and a silent-failure path in the
+Termux wrapper, both surfaced by an independent Codex CLI review pass
+that previous reviewers missed because they shared in-context with the
+maintainer.
+
+### Fixed
+- **`scripts/install.sh` smoke test** parsed an `exit_code` field that
+  the in-process Engine never emits (it was a holdover from the old
+  subprocess CLI shape). Any clean `bash scripts/install.sh` run after
+  the SDK pivot would have failed even on successful inference. Now
+  sends `"stream":false` and parses `error` / `response` /
+  `output_tokens` / `total_duration_ms`.
+- **`scripts/litertlm-termux-wrapper.sh`** silently swallowed
+  `{"error":"...","done":true}` events in NDJSON streaming mode and
+  exited 0 with blank metrics. The wrapper now detects the `error`
+  field, prints it to stderr, suggests `--backend cpu` if the failure
+  was on GPU, and exits nonzero. Same fix applied to the
+  non-streaming branch.
+
+### Docs
+- README: clarified that "the same v0.11.0-rc.1" between APK and
+  Termux-native paths actually means the Maven artifact
+  `0.11.0-rc1` for the APK and the GitHub release `v0.11.0-rc.1` CLI
+  binary for the native path — they are the same upstream version
+  but distinct artifacts.
+- CHANGELOG: added a Correction note under the v0.1.0 entry's
+  "Adreno 660 GPU refuses to initialise" claim, which was the same
+  manifest-declaration bug as v0.1.1, not a hardware limit. With the
+  v0.1.2 manifest fix, Adreno 660 (S21+) GPU works at 10.5 t/s.
+- v0.1.2 GitHub release retroactively gets a pointer to v0.1.3 in
+  its body so anyone landing on the page sees the recommended upgrade.
+
 ## [0.1.2] — 2026-05-01
 
 GPU works again. v0.1.1 misdiagnosed the cause — apologies for the noise.
@@ -137,7 +171,15 @@ First open-source-ready release.
 - Gemma-4-E4B works on CPU only on S21+ (decode 0.5 t/s — too slow to
   be interactive). Use Gemma-4-E2B on phones with ≤8 GB RAM.
 
-[Unreleased]: https://github.com/ImL1s/temux_llm/compare/v0.1.2...HEAD
+  > **Correction (added in v0.1.2):** the "Adreno 660 GPU refuses to
+  > initialise" bullet is **wrong** — same root cause as the v0.1.1
+  > entry (missing manifest declaration), not a hardware limit.
+  > Adreno 660 GPU on S21+ works at 10.5 t/s with the v0.1.2 fix.
+  > E4B on S21+ likewise runs faster than 0.5 t/s under the corrected
+  > setup (E4B CPU on S21+ measured at 4.1 t/s in v0.1.2's matrix).
+
+[Unreleased]: https://github.com/ImL1s/temux_llm/compare/v0.1.3...HEAD
+[0.1.3]: https://github.com/ImL1s/temux_llm/compare/v0.1.2...v0.1.3
 [0.1.2]: https://github.com/ImL1s/temux_llm/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/ImL1s/temux_llm/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/ImL1s/temux_llm/releases/tag/v0.1.0

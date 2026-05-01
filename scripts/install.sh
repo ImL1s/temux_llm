@@ -136,13 +136,19 @@ for i in $(seq 1 60); do
 done
 
 say "first inference (this primes the kernel cache; warm runs are much faster)"
+# stream=false so we get one final JSON document, not an NDJSON stream — much
+# easier to grep with sed. The in-process Engine emits {model,backend,response,
+# done,total_duration_ms,output_tokens} on success or {error,done} on failure.
 RESP=$(adb -s "$DEVICE_SERIAL" shell \
-  "curl -sm 240 -X POST http://127.0.0.1:11434/api/generate -H 'Content-Type: application/json' --data-binary '{\"prompt\":\"Reply with just: hi.\",\"backend\":\"gpu\"}'")
+  "curl -sm 240 -X POST http://127.0.0.1:11434/api/generate -H 'Content-Type: application/json' --data-binary '{\"prompt\":\"Reply with just: hi.\",\"backend\":\"gpu\",\"stream\":false}'")
 [[ -n "$RESP" ]] || die "empty response from /api/generate"
-EXIT=$(printf '%s' "$RESP" | sed -n 's/.*"exit_code":\([0-9-]*\).*/\1/p')
+ERR=$(printf '%s' "$RESP" | sed -n 's/.*"error":"\([^"]*\)".*/\1/p')
+[[ -z "$ERR" ]] || die "/api/generate returned error: $ERR"
 TEXT=$(printf '%s' "$RESP" | sed -n 's/.*"response":"\([^"]*\)".*/\1/p')
-echo "  exit_code=$EXIT  response=$TEXT"
-[[ "$EXIT" == "0" ]] || die "/api/generate returned non-zero exit_code"
+TOK=$(printf '%s' "$RESP" | sed -n 's/.*"output_tokens":\([0-9]*\).*/\1/p')
+TOTAL=$(printf '%s' "$RESP" | sed -n 's/.*"total_duration_ms":\([0-9]*\).*/\1/p')
+echo "  response=$TEXT  tokens=$TOK  total_ms=$TOTAL"
+[[ -n "$TEXT" ]] || die "/api/generate returned no response field (raw: $RESP)"
 
 # ---- done ----
 say "✓ install complete on $MODEL_NAME ($DEVICE_SERIAL)"

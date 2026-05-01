@@ -122,7 +122,10 @@ litertlm-native --help
 | Best for | interactive chat, scripts | occasional / batch use |
 
 The native path trades per-call load time for zero APK dependency.
-Both paths use the same v0.11.0-rc.1 binary and the same models.
+Both paths use LiteRT-LM 0.11.0-rc.1 (the APK depends on the Maven
+artifact `com.google.ai.edge.litertlm:litertlm-android:0.11.0-rc1`,
+the Termux-native path uses the matching `litert_lm_main` CLI binary
+from the `v0.11.0-rc.1` GitHub release) and the same models.
 
 ---
 
