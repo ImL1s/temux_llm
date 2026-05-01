@@ -85,6 +85,43 @@ litertlm --help
 
 ---
 
+## 跟 CLI coding agent 一起用（v0.3.0+）
+
+`temux_llm` 對外協定模仿 Ollama 0.13+，所以常見 coding agent CLI 可以直接接，
+不需要 proxy。手機上 service 起來後，host 端先 forward 11434：
+
+```sh
+adb forward tcp:11434 tcp:11434
+```
+
+接下來自己設 env vars，或直接用內建 launcher：
+
+```sh
+scripts/temuxllm launch claude        # Claude Code → /v1/messages
+scripts/temuxllm launch codex         # Codex CLI → /v1/responses (--oss)
+scripts/temuxllm launch opencode      # sst/opencode → /v1/chat/completions
+scripts/temuxllm launch openclaw      # openclaw.ai → /api/chat (Ollama 原生)
+scripts/temuxllm launch gemini        # 印出 LiteLLM bridge 用法
+scripts/temuxllm launch claude --config-only   # 只印 env block，不執行
+scripts/temuxllm launch codex --model gemma-4-E2B-it
+```
+
+行為對標 Ollama 0.15+ 的 `ollama launch <cli>`：probe 服務、選 model、
+設 env vars / config、`exec` 目標 CLI。host 模式自動 `adb forward`。
+
+完整 endpoint 對照與 wire format 細節：
+[`docs/ollama-compat.md`](docs/ollama-compat.md)。
+
+### Tool calling — 此版本尚未支援
+
+`/api/show` 回傳 `capabilities: ["completion"]`，不廣告 `tools`。需要
+tool calling 的 CLI 會降級成純 chat。Gemma 4 有原生
+`<|tool_call>...<tool_call|>` token，LiteRT-LM 0.11 也有 parser，但
+四種 wire format 的 end-to-end translation 在 v0.3.0 還沒接通；要等
+有實機 probe 驗過 round-trip 才會 ship。
+
+---
+
 ## Termux-native（不用 APK）
 
 不想 sideload APK？那就直接在 Termux 裡跑 LiteRT-LM binary — 不用 USB、

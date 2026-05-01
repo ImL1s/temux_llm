@@ -11,65 +11,136 @@ import java.io.File
 import java.io.PipedInputStream
 import java.io.PipedOutputStream
 import java.io.PrintWriter
+import java.util.UUID
 import kotlin.concurrent.thread
 
 /**
- * Localhost-only HTTP server. MUST bind to 127.0.0.1 (brief constraint #1).
+ * Localhost-only HTTP server. MUST bind to 127.0.0.1 (project constraint #1).
+ *
+ * As of v0.3.0 this server impersonates an Ollama server closely enough for
+ * Claude Code, OpenCode, and OpenClaw to connect with no proxy. The four
+ * envelope shapes (Ollama-native NDJSON, OpenAI SSE, Anthropic SSE, plus the
+ * legacy temuxllm /api/generate JSON) all consume the same LlmEngine token
+ * stream — only the framing and event vocabulary differ. See
+ * [StreamEncoder] for the wire-byte tables.
  *
  * Endpoints:
- *   GET  /healthz       -> 200 "ok"
- *   GET  /api/version   -> JSON describing the service
- *   GET  /api/tags      -> JSON listing models known to be on disk
- *   POST /api/generate  -> NDJSON stream of {response: "..."} chunks + final
- *                          {done:true,...metrics} (or single document if stream=false)
+ *   GET  /                         -> "Ollama is running"  (probe)
+ *   GET  /healthz                  -> "ok"
+ *   GET  /api/version              -> service metadata + Ollama-shaped version
+ *   GET  /api/tags                 -> Ollama-shaped model list
+ *   POST /api/show                 -> Ollama-shaped per-model metadata
+ *   GET  /api/ps                   -> currently loaded model
+ *   POST /api/generate             -> NDJSON stream (legacy + Ollama compat)
+ *   POST /api/chat                 -> NDJSON stream (Ollama native)
+ *   POST /api/pull                 -> stub OK (Codex --oss compat)
+ *   GET  /v1/models                -> OpenAI list
+ *   POST /v1/chat/completions      -> OpenAI SSE
+ *   POST /v1/messages              -> Anthropic SSE
  */
-class HttpServer(private val context: Context, private val engine: LlmEngine) :
-    NanoHTTPD(BIND, PORT) {
+class HttpServer(
+    private val context: Context,
+    private val engine: LlmEngine,
+    private val registry: ModelRegistry,
+) : NanoHTTPD(BIND, PORT) {
 
     companion object {
         const val BIND = "127.0.0.1"
         const val PORT = 11434
+        const val VERSION = "0.13.0-temuxllm"
         private const val TAG = "HttpServer"
+        private const val MAX_BODY = 4 * 1024 * 1024
     }
 
     override fun serve(session: IHTTPSession): Response = try {
         when {
+            session.uri == "/" && session.method == Method.GET ->
+                text(Response.Status.OK, "Ollama is running")
+
             session.uri == "/healthz" && session.method == Method.GET ->
                 text(Response.Status.OK, "ok\n")
 
             session.uri == "/api/version" && session.method == Method.GET ->
-                json(Response.Status.OK, JSONObject().apply {
-                    put("service", "temuxllm")
-                    put("phase", "2c")
-                    put("runtime", "litertlm-android 0.11.0-rc1 (in-process Engine)")
-                    put("default_backend", "gpu")
-                    put("model_path", engine.activeModelPath().absolutePath)
-                    put("source_model_path", LlmEngine.SOURCE_MODEL_PATH)
-                    put("engine_loaded", engine.isLoaded())
-                })
+                json(Response.Status.OK, versionPayload())
 
             session.uri == "/api/tags" && session.method == Method.GET ->
-                json(Response.Status.OK, listModels())
+                json(Response.Status.OK, registry.ollamaTags())
+
+            session.uri == "/api/ps" && session.method == Method.GET ->
+                json(Response.Status.OK, registry.ollamaPs())
+
+            session.uri == "/api/show" && session.method == Method.POST ->
+                handleShow(session)
+
+            session.uri == "/api/pull" && session.method == Method.POST ->
+                json(Response.Status.OK, JSONObject().apply { put("status", "success") })
 
             session.uri == "/api/generate" && session.method == Method.POST ->
                 handleGenerate(session)
 
+            session.uri == "/api/chat" && session.method == Method.POST ->
+                handleOllamaChat(session)
+
+            session.uri == "/v1/models" && session.method == Method.GET ->
+                json(Response.Status.OK, registry.openAiModels())
+
+            session.uri == "/v1/chat/completions" && session.method == Method.POST ->
+                handleOpenAiChat(session)
+
+            session.uri == "/v1/messages" && session.method == Method.POST ->
+                handleAnthropicMessages(session)
+
+            session.uri == "/v1/responses" && session.method == Method.POST ->
+                handleOpenAiResponses(session)
+
             else -> text(Response.Status.NOT_FOUND, "404 ${session.method} ${session.uri}\n")
         }
+    } catch (_: BodyTooLarge) {
+        // Spec'd: 413 with explicit error JSON so clients distinguish oversize
+        // from "missing required field" 400s.
+        json(
+            Response.Status.lookup(413) ?: Response.Status.BAD_REQUEST,
+            JSONObject().apply {
+                put("error", "request_entity_too_large")
+                put("message", "request body exceeds 4 MiB limit")
+            },
+        )
     } catch (t: Throwable) {
+        // Keep the full exception in logcat; do NOT leak class names or stack
+        // strings on the wire — any process on-device can read this response.
         Log.e(TAG, "serve failed", t)
         json(
             Response.Status.INTERNAL_ERROR,
             JSONObject().apply {
-                put("error", t.javaClass.simpleName)
-                put("message", t.message ?: "")
-            }
+                put("error", "internal_error")
+                put("message", "An internal error occurred. Check device logs.")
+            },
         )
     }
 
+    /* --------------------------------- Routes --------------------------------- */
+
+    private fun versionPayload(): JSONObject = JSONObject().apply {
+        put("version", VERSION)
+        put("service", "temuxllm")
+        put("phase", "3a")
+        put("runtime", "litertlm-android 0.11.0-rc1 (in-process Engine)")
+        put("default_backend", "gpu")
+        put("model_path", engine.activeModelPath().absolutePath)
+        put("source_model_path", LlmEngine.SOURCE_MODEL_PATH)
+        put("engine_loaded", engine.isLoaded())
+    }
+
+    private fun handleShow(session: IHTTPSession): Response {
+        val body = readJsonBody(session) ?: return errorJson(Response.Status.BAD_REQUEST, "invalid JSON body")
+        val name = body.optString("model").ifBlank { body.optString("name") }
+        val entry = registry.resolve(name)
+            ?: return errorJson(Response.Status.NOT_FOUND, "model '${name}' not found")
+        return json(Response.Status.OK, registry.ollamaShow(entry))
+    }
+
     private fun handleGenerate(session: IHTTPSession): Response {
-        val raw = readPostBodyAsUtf8(session)
-        val body = if (raw.isBlank()) JSONObject() else JSONObject(raw)
+        val body = readJsonBody(session) ?: return errorJson(Response.Status.BAD_REQUEST, "invalid JSON body")
         val prompt = body.optString("prompt").also {
             if (it.isBlank()) return errorJson(Response.Status.BAD_REQUEST, "prompt is required")
         }
@@ -77,107 +148,404 @@ class HttpServer(private val context: Context, private val engine: LlmEngine) :
         if (backend != "cpu" && backend != "gpu") {
             return errorJson(Response.Status.BAD_REQUEST, "backend must be cpu|gpu (got $backend)")
         }
+        val requestedModel = body.optString("model").ifBlank { null }
+        val resolved = if (requestedModel == null) {
+            registry.active() ?: return errorJson(Response.Status.NOT_FOUND, "no model staged")
+        } else {
+            registry.resolve(requestedModel)
+                ?: return errorJson(Response.Status.NOT_FOUND, "model '$requestedModel' not found")
+        }
         val stream = body.optBoolean("stream", true)
-
-        return if (stream) streamGenerate(prompt, backend) else blockingGenerate(prompt, backend)
+        return if (stream) {
+            runStream(prompt, backend, NdjsonGenerateEncoder(resolved.name))
+        } else {
+            blockingGenerate(prompt, backend, resolved.name, ResponseShape.LegacyGenerate)
+        }
     }
 
-    /** Streaming response: NDJSON, one JSON object per line. */
-    private fun streamGenerate(prompt: String, backend: String): Response {
+    private fun handleOllamaChat(session: IHTTPSession): Response {
+        val body = readJsonBody(session) ?: return errorJson(Response.Status.BAD_REQUEST, "invalid JSON body")
+        val requestedModel = body.optString("model").ifBlank { null }
+        val resolved = if (requestedModel == null) {
+            registry.active() ?: return errorJson(Response.Status.NOT_FOUND, "no model staged")
+        } else {
+            registry.resolve(requestedModel)
+                ?: return errorJson(Response.Status.NOT_FOUND, "model '$requestedModel' not found")
+        }
+        val messages = body.optJSONArray("messages")
+        val prompt = when (val r = ChatFormat.flatten(messages)) {
+            is ChatFormat.Result.Ok -> r.prompt
+            is ChatFormat.Result.Bad -> return errorJson(Response.Status.BAD_REQUEST, r.message)
+        }
+        val backend = body.optString("backend", "gpu").lowercase()
+        if (backend != "cpu" && backend != "gpu") {
+            return errorJson(Response.Status.BAD_REQUEST, "backend must be cpu|gpu (got $backend)")
+        }
+        val stream = body.optBoolean("stream", true)
+        return if (stream) {
+            runStream(prompt, backend, NdjsonChatEncoder(resolved.name))
+        } else {
+            blockingGenerate(prompt, backend, resolved.name, ResponseShape.OllamaChat)
+        }
+    }
+
+    private fun handleOpenAiChat(session: IHTTPSession): Response {
+        val body = readJsonBody(session) ?: return errorJson(Response.Status.BAD_REQUEST, "invalid JSON body")
+        val requestedModel = body.optString("model").ifBlank { null }
+        val resolved = if (requestedModel == null) {
+            registry.active() ?: return errorJson(Response.Status.NOT_FOUND, "no model staged")
+        } else {
+            registry.resolve(requestedModel)
+                ?: return errorJson(Response.Status.NOT_FOUND, "model '$requestedModel' not found")
+        }
+        val messages = body.optJSONArray("messages")
+        val prompt = when (val r = ChatFormat.flatten(messages)) {
+            is ChatFormat.Result.Ok -> r.prompt
+            is ChatFormat.Result.Bad -> return errorJson(Response.Status.BAD_REQUEST, r.message)
+        }
+        val backend = body.optString("backend", "gpu").lowercase()
+        if (backend != "cpu" && backend != "gpu") {
+            return errorJson(Response.Status.BAD_REQUEST, "backend must be cpu|gpu (got $backend)")
+        }
+        val stream = body.optBoolean("stream", true)
+        return if (stream) {
+            runStream(prompt, backend, OpenAiSseEncoder(resolved.name))
+        } else {
+            blockingGenerate(prompt, backend, resolved.name, ResponseShape.OpenAiChat)
+        }
+    }
+
+    private fun handleAnthropicMessages(session: IHTTPSession): Response {
+        val body = readJsonBody(session) ?: return errorJson(Response.Status.BAD_REQUEST, "invalid JSON body")
+        val requestedModel = body.optString("model").ifBlank { null }
+        val resolved = if (requestedModel == null) {
+            registry.active() ?: return errorJson(Response.Status.NOT_FOUND, "no model staged")
+        } else {
+            registry.resolve(requestedModel)
+                ?: return errorJson(Response.Status.NOT_FOUND, "model '$requestedModel' not found")
+        }
+        val messages = body.optJSONArray("messages")
+        val systemRaw = body.opt("system")
+        val systemText: String? = when (systemRaw) {
+            null, JSONObject.NULL -> null
+            is String -> systemRaw.takeIf { it.isNotBlank() }
+            is JSONArray -> {
+                val sb = StringBuilder()
+                for (i in 0 until systemRaw.length()) {
+                    val b = systemRaw.optJSONObject(i) ?: continue
+                    if (b.optString("type") == "text") sb.append(b.optString("text"))
+                }
+                sb.toString().takeIf { it.isNotBlank() }
+            }
+            else -> systemRaw.toString().takeIf { it.isNotBlank() }
+        }
+        val prompt = when (val r = ChatFormat.flatten(messages, systemText)) {
+            is ChatFormat.Result.Ok -> r.prompt
+            is ChatFormat.Result.Bad -> return errorJson(Response.Status.BAD_REQUEST, r.message)
+        }
+        val backend = body.optString("backend", "gpu").lowercase()
+        if (backend != "cpu" && backend != "gpu") {
+            return errorJson(Response.Status.BAD_REQUEST, "backend must be cpu|gpu (got $backend)")
+        }
+        val stream = body.optBoolean("stream", true)
+        return if (stream) {
+            runStream(prompt, backend, AnthropicSseEncoder(resolved.name))
+        } else {
+            blockingGenerate(prompt, backend, resolved.name, ResponseShape.AnthropicMessages)
+        }
+    }
+
+    private fun handleOpenAiResponses(session: IHTTPSession): Response {
+        val body = readJsonBody(session) ?: return errorJson(Response.Status.BAD_REQUEST, "invalid JSON body")
+        val requestedModel = body.optString("model").ifBlank { null }
+        val resolved = if (requestedModel == null) {
+            registry.active() ?: return errorJson(Response.Status.NOT_FOUND, "no model staged")
+        } else {
+            registry.resolve(requestedModel)
+                ?: return errorJson(Response.Status.NOT_FOUND, "model '$requestedModel' not found")
+        }
+        // Responses API accepts either a string `input` or a messages-shaped array.
+        val input = body.opt("input")
+        val instructions = body.optString("instructions").ifBlank { null }
+        val prompt: String = when {
+            input == null || input == JSONObject.NULL ->
+                return errorJson(Response.Status.BAD_REQUEST, "input is required")
+            input is String -> {
+                val sb = StringBuilder()
+                if (!instructions.isNullOrBlank()) sb.append("System: ").append(instructions).append("\n\n")
+                sb.append("User: ").append(input).append('\n').append("Assistant: ")
+                sb.toString()
+            }
+            input is JSONArray -> {
+                when (val r = ChatFormat.flatten(input, instructions)) {
+                    is ChatFormat.Result.Ok -> r.prompt
+                    is ChatFormat.Result.Bad -> return errorJson(Response.Status.BAD_REQUEST, r.message)
+                }
+            }
+            else -> input.toString()
+        }
+        val backend = body.optString("backend", "gpu").lowercase()
+        if (backend != "cpu" && backend != "gpu") {
+            return errorJson(Response.Status.BAD_REQUEST, "backend must be cpu|gpu (got $backend)")
+        }
+        val stream = body.optBoolean("stream", true)
+        return if (stream) {
+            runStream(prompt, backend, ResponsesSseEncoder(resolved.name))
+        } else {
+            blockingResponses(prompt, backend, resolved.name)
+        }
+    }
+
+    private fun blockingResponses(prompt: String, backend: String, model: String): Response {
+        val r = engine.generateBlocking(prompt, backend)
+        if (r.error != null) {
+            return json(Response.Status.INTERNAL_ERROR, JSONObject().apply {
+                put("type", "error")
+                put("error", JSONObject().apply { put("code", "server_error"); put("message", r.error) })
+            })
+        }
+        val itemId = "msg_" + UUID.randomUUID().toString().replace("-", "").take(24)
+        return json(
+            Response.Status.OK,
+            JSONObject().apply {
+                put("id", "resp_" + UUID.randomUUID().toString().replace("-", "").take(24))
+                put("object", "response")
+                put("status", "completed")
+                put("model", model)
+                put("created_at", System.currentTimeMillis() / 1000)
+                put(
+                    "output",
+                    JSONArray().put(
+                        JSONObject().apply {
+                            put("id", itemId)
+                            put("type", "message")
+                            put("role", "assistant")
+                            put("status", "completed")
+                            put(
+                                "content",
+                                JSONArray().put(
+                                    JSONObject().apply {
+                                        put("type", "output_text")
+                                        put("text", r.text)
+                                        put("annotations", JSONArray())
+                                    },
+                                ),
+                            )
+                        },
+                    ),
+                )
+                put(
+                    "usage",
+                    JSONObject().apply {
+                        put("input_tokens", 0)
+                        put("output_tokens", r.outputTokens)
+                        put("total_tokens", r.outputTokens)
+                    },
+                )
+            },
+        )
+    }
+
+    /* --------------------------- Shared streaming core --------------------------- */
+
+    /**
+     * Drive one inference and frame each token through [encoder]. Pattern:
+     *   - Spawn a worker thread that calls engine.generate().collect{ ... }.
+     *   - Pipe its writes into a PipedInputStream returned to NanoHTTPD as a
+     *     chunked response. NanoHTTPD pulls bytes off the pipe back to the
+     *     client as the worker produces them.
+     *   - Errors emitted by LlmEngine become an envelope-specific error frame
+     *     followed by clean stream close.
+     */
+    private fun runStream(prompt: String, backend: String, encoder: StreamEncoder): Response {
         val pipeIn = PipedInputStream(64 * 1024)
         val pipeOut = PipedOutputStream(pipeIn)
         thread(start = true, name = "litertlm-stream") {
             val writer = PrintWriter(pipeOut.writer(Charsets.UTF_8), false)
+            // Track whether Done or Error has been emitted so we don't double-frame
+            // an envelope: an empty/cancelled stream synthesizes one Done; an Error
+            // followed by no Done must not also synthesize one.
+            var terminated = false
             try {
+                encoder.emitStart(writer)
+                val started = System.currentTimeMillis()
                 runBlocking {
                     engine.generate(prompt, backend).collect { ev ->
-                        val line = when (ev) {
-                            is LlmEngine.GenerateEvent.Token -> JSONObject().apply {
-                                put("response", ev.text)
-                                put("done", false)
+                        when (ev) {
+                            is LlmEngine.GenerateEvent.Token ->
+                                encoder.emitToken(writer, ev.text)
+                            is LlmEngine.GenerateEvent.Done -> {
+                                encoder.emitDone(writer, ev.totalDurationMs, ev.outputTokens, ev.outputChars, ev.backend)
+                                terminated = true
                             }
-                            is LlmEngine.GenerateEvent.Done -> JSONObject().apply {
-                                put("response", "")
-                                put("done", true)
-                                put("backend", ev.backend)
-                                put("total_duration_ms", ev.totalDurationMs)
-                                put("output_tokens", ev.outputTokens)
-                                put("output_chars", ev.outputChars)
-                            }
-                            is LlmEngine.GenerateEvent.Error -> JSONObject().apply {
-                                put("error", ev.message)
-                                put("done", true)
+                            is LlmEngine.GenerateEvent.Error -> {
+                                encoder.emitError(writer, ev.message)
+                                terminated = true
                             }
                         }
-                        writer.println(line.toString())
-                        writer.flush()
                     }
+                }
+                if (!terminated) {
+                    // Engine ended without Done or Error (cancellation, empty stream).
+                    // Emit one synthetic Done so the framing closes cleanly.
+                    encoder.emitDone(writer, System.currentTimeMillis() - started, 0, 0, backend)
                 }
             } catch (t: Throwable) {
                 Log.e(TAG, "stream worker failed", t)
-                writer.println(JSONObject().apply { put("error", t.message ?: ""); put("done", true) })
-                writer.flush()
+                if (!terminated) {
+                    try { encoder.emitError(writer, t.message ?: t.javaClass.simpleName) } catch (_: Throwable) {}
+                }
             } finally {
-                writer.close()
+                try { writer.flush() } catch (_: Throwable) {}
+                try { writer.close() } catch (_: Throwable) {}
             }
         }
-        return newChunkedResponse(Response.Status.OK, "application/x-ndjson; charset=utf-8", pipeIn)
+        return newChunkedResponse(Response.Status.OK, encoder.contentType, pipeIn)
     }
 
-    /** Non-streaming convenience: block for the full response, return one JSON. */
-    private fun blockingGenerate(prompt: String, backend: String): Response {
-        Log.i(TAG, "generate blocking backend=$backend prompt=${prompt.take(80)}…")
+    /* --------------------------- Non-streaming responses --------------------------- */
+
+    private enum class ResponseShape { LegacyGenerate, OllamaChat, OpenAiChat, AnthropicMessages }
+
+    private fun blockingGenerate(prompt: String, backend: String, model: String, shape: ResponseShape): Response {
+        Log.i(TAG, "generate blocking shape=$shape backend=$backend model=$model prompt=${prompt.take(80)}…")
         val r = engine.generateBlocking(prompt, backend)
         if (r.error != null) {
-            return json(
-                Response.Status.INTERNAL_ERROR,
-                JSONObject().apply { put("error", r.error); put("done", true) }
-            )
-        }
-        val obj = JSONObject().apply {
-            put("model", File(engine.activeModelPath().absolutePath).nameWithoutExtension)
-            put("backend", r.backend)
-            put("response", r.text)
-            put("done", true)
-            put("total_duration_ms", r.totalDurationMs)
-            put("output_tokens", r.outputTokens)
-        }
-        return json(Response.Status.OK, obj)
-    }
-
-    private fun listModels(): JSONObject {
-        val tags = JSONObject()
-        val arr = JSONArray()
-        val candidates = listOf(
-            engine.modelDir(),
-            File("/data/local/tmp/litertlm"),
-            File(context.filesDir, "models")
-        )
-        val seen = mutableSetOf<String>()
-        for (dir in candidates) {
-            val files = dir.listFiles { f -> f.isFile && f.name.endsWith(".litertlm") } ?: continue
-            for (f in files) {
-                if (!seen.add(f.absolutePath)) continue
-                arr.put(JSONObject().apply {
-                    put("name", f.nameWithoutExtension)
-                    put("path", f.absolutePath)
-                    put("size_bytes", f.length())
-                })
+            return when (shape) {
+                ResponseShape.OpenAiChat ->
+                    json(Response.Status.INTERNAL_ERROR, JSONObject().apply {
+                        put("error", JSONObject().apply { put("message", r.error); put("type", "server_error") })
+                    })
+                ResponseShape.AnthropicMessages ->
+                    json(Response.Status.INTERNAL_ERROR, JSONObject().apply {
+                        put("type", "error")
+                        put("error", JSONObject().apply {
+                            put("type", "server_error"); put("message", r.error)
+                        })
+                    })
+                else ->
+                    json(Response.Status.INTERNAL_ERROR, JSONObject().apply {
+                        put("error", r.error); put("done", true)
+                    })
             }
         }
-        tags.put("models", arr)
-        return tags
+        val durationNs = r.totalDurationMs * 1_000_000L
+        return when (shape) {
+            ResponseShape.LegacyGenerate -> json(
+                Response.Status.OK,
+                JSONObject().apply {
+                    put("model", model)
+                    put("created_at", ModelRegistry.iso8601(System.currentTimeMillis()))
+                    put("response", r.text)
+                    put("done", true)
+                    put("done_reason", "stop")
+                    put("total_duration", durationNs)
+                    put("eval_count", r.outputTokens)
+                    // legacy fields:
+                    put("backend", r.backend)
+                    put("total_duration_ms", r.totalDurationMs)
+                    put("output_tokens", r.outputTokens)
+                },
+            )
+            ResponseShape.OllamaChat -> json(
+                Response.Status.OK,
+                JSONObject().apply {
+                    put("model", model)
+                    put("created_at", ModelRegistry.iso8601(System.currentTimeMillis()))
+                    put(
+                        "message",
+                        JSONObject().apply { put("role", "assistant"); put("content", r.text) },
+                    )
+                    put("done", true)
+                    put("done_reason", "stop")
+                    put("total_duration", durationNs)
+                    put("eval_count", r.outputTokens)
+                    put("backend", r.backend)
+                },
+            )
+            ResponseShape.OpenAiChat -> json(
+                Response.Status.OK,
+                JSONObject().apply {
+                    put("id", "chatcmpl-" + UUID.randomUUID().toString().replace("-", "").take(24))
+                    put("object", "chat.completion")
+                    put("created", System.currentTimeMillis() / 1000)
+                    put("model", model)
+                    put(
+                        "choices",
+                        JSONArray().put(
+                            JSONObject().apply {
+                                put("index", 0)
+                                put(
+                                    "message",
+                                    JSONObject().apply {
+                                        put("role", "assistant")
+                                        put("content", r.text)
+                                    },
+                                )
+                                put("finish_reason", "stop")
+                            },
+                        ),
+                    )
+                    put(
+                        "usage",
+                        JSONObject().apply {
+                            put("prompt_tokens", 0)
+                            put("completion_tokens", r.outputTokens)
+                            put("total_tokens", r.outputTokens)
+                        },
+                    )
+                },
+            )
+            ResponseShape.AnthropicMessages -> json(
+                Response.Status.OK,
+                JSONObject().apply {
+                    put("id", "msg_" + UUID.randomUUID().toString().replace("-", "").take(24))
+                    put("type", "message")
+                    put("role", "assistant")
+                    put(
+                        "content",
+                        JSONArray().put(
+                            JSONObject().apply {
+                                put("type", "text")
+                                put("text", r.text)
+                            },
+                        ),
+                    )
+                    put("model", model)
+                    put("stop_reason", "end_turn")
+                    put("stop_sequence", JSONObject.NULL)
+                    put(
+                        "usage",
+                        JSONObject().apply {
+                            put("input_tokens", 0)
+                            put("output_tokens", r.outputTokens)
+                        },
+                    )
+                },
+            )
+        }
     }
 
-    /**
-     * Read POST body as UTF-8. Short-circuits on Content-Length: 0 (otherwise the
-     * blocking read would wait forever). Caps at 4 MiB.
-     */
+    /* ---------------------------------- Helpers --------------------------------- */
+
+    /** Sentinel returned by [readPostBodyAsUtf8] when Content-Length exceeds [MAX_BODY]. */
+    private class BodyTooLarge : RuntimeException()
+
+    private fun readJsonBody(session: IHTTPSession): JSONObject? {
+        val raw = try {
+            readPostBodyAsUtf8(session)
+        } catch (_: BodyTooLarge) {
+            return null
+        }
+        if (raw.isBlank()) return JSONObject()
+        return try { JSONObject(raw) } catch (_: Throwable) { null }
+    }
+
     private fun readPostBodyAsUtf8(session: IHTTPSession): String {
-        val cap = 4 * 1024 * 1024
-        val cl = session.headers["content-length"]?.toIntOrNull() ?: 0
-        if (cl <= 0) return ""
-        val limit = cl.coerceAtMost(cap)
+        val cl = session.headers["content-length"]?.toLongOrNull() ?: 0L
+        if (cl <= 0L) return ""
+        if (cl > MAX_BODY) throw BodyTooLarge()
+        val limit = cl.toInt()
         val buf = ByteArray(limit)
         var pos = 0
         val ins = session.inputStream

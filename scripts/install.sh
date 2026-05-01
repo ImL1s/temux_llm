@@ -150,6 +150,60 @@ TOTAL=$(printf '%s' "$RESP" | sed -n 's/.*"total_duration_ms":\([0-9]*\).*/\1/p'
 echo "  response=$TEXT  tokens=$TOK  total_ms=$TOTAL"
 [[ -n "$TEXT" ]] || die "/api/generate returned no response field (raw: $RESP)"
 
+# ---- 9b. smoke the Ollama-compat surface ----
+say "smoke-testing Ollama-compat endpoints"
+PROBE=$(adb -s "$DEVICE_SERIAL" shell "curl -sm 3 http://127.0.0.1:11434/" | tr -d '\r')
+[[ "$PROBE" == "Ollama is running" ]] || die "GET / did not return 'Ollama is running' (got: $PROBE)"
+echo "  GET /                    -> $PROBE"
+
+VER=$(adb -s "$DEVICE_SERIAL" shell "curl -sm 3 http://127.0.0.1:11434/api/version")
+echo "  GET /api/version         -> $(printf '%s' "$VER" | sed -n 's/.*"version":"\([^"]*\)".*/\1/p')"
+
+TAGS_HAS_DIGEST=$(adb -s "$DEVICE_SERIAL" shell "curl -sm 3 http://127.0.0.1:11434/api/tags" | grep -c '"digest"' || true)
+[[ "$TAGS_HAS_DIGEST" -ge 1 ]] || die "/api/tags missing 'digest' field (Ollama-shape upgrade lost)"
+echo "  GET /api/tags            -> includes Ollama-shaped digest"
+
+# v1/models is a list endpoint — just confirm it returns object:list.
+MODELS=$(adb -s "$DEVICE_SERIAL" shell "curl -sm 3 http://127.0.0.1:11434/v1/models")
+echo "$MODELS" | grep -q '"object":"list"' || die "/v1/models did not return object:list (got: $MODELS)"
+echo "  GET /v1/models           -> object:list"
+
+# Anthropic non-streaming with explicit auth + version headers.
+ANT=$(adb -s "$DEVICE_SERIAL" shell \
+  "curl -sm 60 -X POST http://127.0.0.1:11434/v1/messages \
+    -H 'Content-Type: application/json' \
+    -H 'x-api-key: ollama' \
+    -H 'anthropic-version: 2023-06-01' \
+    --data-binary '{\"model\":\"local\",\"max_tokens\":32,\"messages\":[{\"role\":\"user\",\"content\":\"Reply OK in 1 word.\"}],\"stream\":false}'")
+echo "$ANT" | grep -q '"end_turn"' || die "/v1/messages non-streaming did not return end_turn (got: $ANT)"
+echo "  POST /v1/messages        -> non-streaming OK"
+
+# OpenAI Chat non-streaming.
+OAI=$(adb -s "$DEVICE_SERIAL" shell \
+  "curl -sm 60 -X POST http://127.0.0.1:11434/v1/chat/completions \
+    -H 'Content-Type: application/json' \
+    -H 'Authorization: Bearer ollama' \
+    --data-binary '{\"model\":\"local\",\"messages\":[{\"role\":\"user\",\"content\":\"Reply OK in 1 word.\"}],\"stream\":false}'")
+echo "$OAI" | grep -q '"chat.completion"' || die "/v1/chat/completions did not return chat.completion (got: $OAI)"
+echo "  POST /v1/chat/completions -> chat.completion OK"
+
+# Ollama-native chat.
+OCHAT=$(adb -s "$DEVICE_SERIAL" shell \
+  "curl -sm 60 -X POST http://127.0.0.1:11434/api/chat \
+    -H 'Content-Type: application/json' \
+    --data-binary '{\"model\":\"local\",\"messages\":[{\"role\":\"user\",\"content\":\"Reply OK in 1 word.\"}],\"stream\":false}'")
+echo "$OCHAT" | grep -q '"done_reason"' || die "/api/chat did not return done_reason (got: $OCHAT)"
+echo "  POST /api/chat           -> done_reason OK"
+
+# /v1/responses (Codex CLI). Streaming probe — first event must be response.created.
+FIRST_EVT=$(adb -s "$DEVICE_SERIAL" shell \
+  "curl -sNm 60 -X POST http://127.0.0.1:11434/v1/responses \
+    -H 'Content-Type: application/json' \
+    --data-binary '{\"model\":\"local\",\"input\":\"Reply OK in 1 word.\",\"stream\":true}'" \
+  | head -n 1 | tr -d '\r')
+[[ "$FIRST_EVT" == "event: response.created" ]] || die "/v1/responses first SSE event was not response.created (got: $FIRST_EVT)"
+echo "  POST /v1/responses       -> response.created OK"
+
 # ---- done ----
 say "✓ install complete on $MODEL_NAME ($DEVICE_SERIAL)"
 cat <<EOF

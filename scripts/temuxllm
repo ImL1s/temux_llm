@@ -1,0 +1,316 @@
+#!/usr/bin/env bash
+# temuxllm — launch a CLI coding agent against the on-device LiteRT-LM service.
+#
+# This is the temux_llm equivalent of `ollama launch <cli>`. It probes the
+# service on 127.0.0.1:11434 (forwarding from a connected device when run on
+# a host), picks the active model, sets the env vars / flags the target CLI
+# expects, and exec's it.
+#
+# Usage:
+#   temuxllm launch <claude|codex|opencode|openclaw|gemini> [-- <cli args>]
+#   temuxllm launch <cli> --config-only    # print env block; do not exec
+#   temuxllm launch <cli> --model <name>   # override model selection
+#   temuxllm --help
+#
+# Environment overrides:
+#   DEVICE_SERIAL  pin to a specific adb device
+#   TEMUXLLM_HOST  override service URL (default http://127.0.0.1:11434)
+set -euo pipefail
+
+PROG=$(basename "$0")
+SUPPORTED_CLIS=(claude codex opencode openclaw gemini)
+
+usage() {
+  cat <<EOF
+$PROG — launch a CLI coding agent against on-device temux_llm.
+
+USAGE:
+  $PROG launch <cli> [--model NAME] [--config-only] [-- <args passed to cli>]
+  $PROG status
+  $PROG --help
+
+CLIS:
+  claude    Anthropic Claude Code -> /v1/messages
+  codex     OpenAI Codex CLI -> /v1/responses (--oss)
+  opencode  sst/opencode -> /v1/chat/completions
+  openclaw  openclaw.ai -> /api/chat (Ollama-native)
+  gemini    Google Gemini CLI -> requires LiteLLM bridge (printed)
+
+EXAMPLES:
+  $PROG launch claude
+  $PROG launch claude -- --print "summarize this repo"
+  $PROG launch codex --model gemma-4-E2B-it
+  $PROG launch opencode --config-only
+
+ENV:
+  TEMUXLLM_HOST=http://127.0.0.1:11434  service base URL
+  DEVICE_SERIAL=ABC123                  pin to specific adb device
+
+NOTES:
+  - On a host (Mac/Linux): runs 'adb forward tcp:11434 tcp:11434' (idempotent).
+  - In Termux on the device: skips adb, talks to the local service directly.
+EOF
+}
+
+die() { echo "error: $*" >&2; exit 1; }
+log() { echo "$PROG: $*" >&2; }
+
+require() { command -v "$1" >/dev/null 2>&1 || die "missing dependency: $1"; }
+
+# Detect Termux vs host.
+is_termux() { [[ "${PREFIX:-}" == */com.termux/* ]] || [[ -d /data/data/com.termux ]]; }
+
+ensure_forward() {
+  if is_termux; then return 0; fi
+  require adb
+  local serial_arg=()
+  if [[ -n "${DEVICE_SERIAL:-}" ]]; then
+    serial_arg=(-s "$DEVICE_SERIAL")
+  else
+    local count
+    count=$(adb devices | awk 'NR>1 && $2=="device"' | wc -l | tr -d ' ')
+    if [[ "$count" -eq 0 ]]; then
+      die "no adb devices attached. Plug in your phone or set DEVICE_SERIAL."
+    fi
+    if [[ "$count" -gt 1 ]]; then
+      die "multiple adb devices attached. Set DEVICE_SERIAL to pick one (adb devices)."
+    fi
+  fi
+  adb "${serial_arg[@]}" forward tcp:11434 tcp:11434 >/dev/null
+}
+
+probe_service() {
+  local host="${TEMUXLLM_HOST:-http://127.0.0.1:11434}"
+  if ! curl -fsS --max-time 3 "$host/api/version" >/dev/null 2>&1; then
+    die "temux_llm service not reachable at $host. Is the APK foreground service running?"
+  fi
+  echo "$host"
+}
+
+pick_model() {
+  local host="$1"
+  local override="${2:-}"
+  if [[ -n "$override" ]]; then
+    echo "$override"; return
+  fi
+  # Prefer the active model (whatever LlmEngine has staged); fall back to
+  # the first listed in /api/tags.
+  local first
+  first=$(curl -fsS --max-time 3 "$host/api/tags" \
+    | sed -n 's/.*"name"[[:space:]]*:[[:space:]]*"\([^"]\{1,\}\)".*/\1/p' \
+    | head -n 1 || true)
+  if [[ -z "$first" ]]; then
+    die "no models reported by $host/api/tags. Push a .litertlm to the device first."
+  fi
+  echo "$first"
+}
+
+cmd_status() {
+  local host
+  host=$(probe_service)
+  curl -fsS --max-time 3 "$host/api/version"
+  echo
+  curl -fsS --max-time 3 "$host/api/tags"
+  echo
+}
+
+# ---------------------------------- Launchers --------------------------------
+
+launch_claude() {
+  local host="$1"; local model="$2"; local config_only="$3"; shift 3
+  local cli="claude"
+  local env_block
+  env_block=$(cat <<EOF
+ANTHROPIC_BASE_URL=$host
+ANTHROPIC_AUTH_TOKEN=ollama
+ANTHROPIC_API_KEY=
+ANTHROPIC_MODEL=$model
+ANTHROPIC_DEFAULT_OPUS_MODEL=$model
+ANTHROPIC_DEFAULT_SONNET_MODEL=$model
+ANTHROPIC_DEFAULT_HAIKU_MODEL=$model
+EOF
+)
+  if [[ "$config_only" == "1" ]]; then
+    echo "# env block for: claude"
+    echo "$env_block"
+    echo "# then: claude"
+    return 0
+  fi
+  command -v "$cli" >/dev/null 2>&1 || die "install Claude Code first: https://docs.claude.com/claude-code"
+  log "launching claude with model=$model via $host"
+  ANTHROPIC_BASE_URL="$host" \
+  ANTHROPIC_AUTH_TOKEN=ollama \
+  ANTHROPIC_API_KEY= \
+  ANTHROPIC_MODEL="$model" \
+  ANTHROPIC_DEFAULT_OPUS_MODEL="$model" \
+  ANTHROPIC_DEFAULT_SONNET_MODEL="$model" \
+  ANTHROPIC_DEFAULT_HAIKU_MODEL="$model" \
+    exec "$cli" "$@"
+}
+
+launch_codex() {
+  local host="$1"; local model="$2"; local config_only="$3"; shift 3
+  local cli="codex"
+  # Codex CLI's built-in `--oss` provider hardcodes localhost:11434 and
+  # WireApi::Responses (verified against codex-rs source). We pass `-c model=`
+  # so the user's chosen model is honored without rewriting their config.
+  if [[ "$config_only" == "1" ]]; then
+    cat <<EOF
+# command for: codex
+codex --oss -c model="$model"
+# OR with explicit provider override:
+codex \\
+  -c model_provider=ollama \\
+  -c 'model_providers.ollama.name="Ollama"' \\
+  -c 'model_providers.ollama.base_url="$host/v1"' \\
+  -c 'model_providers.ollama.wire_api="responses"' \\
+  -c model="$model"
+EOF
+    return 0
+  fi
+  command -v "$cli" >/dev/null 2>&1 || die "install Codex CLI first: https://github.com/openai/codex"
+  log "launching codex (--oss) with model=$model"
+  exec "$cli" --oss -c model="$model" "$@"
+}
+
+launch_opencode() {
+  local host="$1"; local model="$2"; local config_only="$3"; shift 3
+  local cli="opencode"
+  # OpenCode reads providers from ~/.config/opencode/opencode.json. We do NOT
+  # silently mutate it; we either print the recommended block (config-only) or
+  # write to a temp dir scoped to this invocation via OPENCODE_CONFIG_PATH.
+  local cfg_block
+  cfg_block=$(cat <<EOF
+{
+  "\$schema": "https://opencode.ai/config.json",
+  "provider": {
+    "ollama": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "temux_llm (local)",
+      "options": { "baseURL": "$host/v1" },
+      "models": { "$model": { "name": "$model" } }
+    }
+  }
+}
+EOF
+)
+  if [[ "$config_only" == "1" ]]; then
+    echo "# config snippet for: ~/.config/opencode/opencode.json"
+    echo "$cfg_block"
+    return 0
+  fi
+  command -v "$cli" >/dev/null 2>&1 || die "install OpenCode first: https://opencode.ai"
+  local cfgdir
+  cfgdir=$(mktemp -d -t temuxllm-opencode.XXXXXX)
+  echo "$cfg_block" > "$cfgdir/opencode.json"
+  log "launching opencode with config $cfgdir/opencode.json"
+  # Run as a foreground subprocess (NOT exec) so the trap fires and the temp
+  # dir gets cleaned up. Forward signals so Ctrl-C still works.
+  trap 'rm -rf "$cfgdir"' EXIT INT TERM
+  OPENCODE_CONFIG_PATH="$cfgdir/opencode.json" "$cli" "$@"
+}
+
+launch_openclaw() {
+  local host="$1"; local model="$2"; local config_only="$3"; shift 3
+  local cli="openclaw"
+  # OpenClaw expects native Ollama API (NOT /v1). Its config lives in
+  # ~/.openclaw/ and varies by version; we surface env vars commonly accepted
+  # plus a printable config block.
+  if [[ "$config_only" == "1" ]]; then
+    cat <<EOF
+# env for: openclaw
+OLLAMA_HOST=$host
+OLLAMA_BASE_URL=$host
+OPENCLAW_PROVIDER=ollama
+OPENCLAW_MODEL=$model
+# config block for ~/.openclaw/config.yaml (Ollama provider section):
+provider: ollama
+ollama:
+  baseUrl: "$host"        # NOT http://host:11434/v1 — /v1 breaks tool calling
+  apiKey: "ollama-local"
+  model: "$model"
+EOF
+    return 0
+  fi
+  command -v "$cli" >/dev/null 2>&1 || die "install OpenClaw first: https://openclaw.ai"
+  log "launching openclaw with model=$model via $host (native Ollama API)"
+  OLLAMA_HOST="$host" \
+  OLLAMA_BASE_URL="$host" \
+  OPENCLAW_PROVIDER=ollama \
+  OPENCLAW_MODEL="$model" \
+    exec "$cli" "$@"
+}
+
+launch_gemini() {
+  local host="$1"; local model="$2"; local config_only="$3"; shift 3
+  local cli="gemini"
+  cat >&2 <<EOF
+$PROG: Gemini CLI does not natively talk to Ollama. The recommended bridge is
+LiteLLM in OpenAI-compat mode, which Gemini CLI can reach via GOOGLE_GEMINI_BASE_URL:
+
+  pip install 'litellm[proxy]'
+  litellm --model ollama/$model --api_base $host --port 4000 &
+
+  GOOGLE_GEMINI_BASE_URL=http://127.0.0.1:4000 gemini "\$@"
+
+We don't auto-spawn the bridge — it should be a deliberate choice on your host.
+EOF
+  if [[ "$config_only" == "1" ]]; then
+    return 0
+  fi
+  command -v "$cli" >/dev/null 2>&1 || die "install Gemini CLI first: https://github.com/google-gemini/gemini-cli"
+  GOOGLE_GEMINI_BASE_URL="${GOOGLE_GEMINI_BASE_URL:-http://127.0.0.1:4000}" \
+    exec "$cli" "$@"
+}
+
+# ----------------------------------- Main ------------------------------------
+
+main() {
+  if [[ $# -eq 0 ]]; then usage; exit 0; fi
+  case "$1" in
+    -h|--help|help) usage; exit 0;;
+    status) shift; cmd_status "$@";;
+    launch)
+      shift
+      [[ $# -ge 1 ]] || die "expected: $PROG launch <cli> [...args]"
+      local cli_name="$1"; shift
+      local valid=0
+      for c in "${SUPPORTED_CLIS[@]}"; do [[ "$c" == "$cli_name" ]] && valid=1; done
+      [[ $valid -eq 1 ]] || die "unsupported cli: '$cli_name'. supported: ${SUPPORTED_CLIS[*]}"
+
+      local model_override=""
+      local config_only="0"
+      local cli_args=()
+      while [[ $# -gt 0 ]]; do
+        case "$1" in
+          --model) model_override="${2:-}"; shift 2;;
+          --config-only) config_only="1"; shift;;
+          --) shift; cli_args=("$@"); break;;
+          *) cli_args+=("$1"); shift;;
+        esac
+      done
+
+      local host model
+      if [[ "$config_only" == "1" ]]; then
+        # config-only is a dry run: don't require a device, don't probe.
+        host="${TEMUXLLM_HOST:-http://127.0.0.1:11434}"
+        model="${model_override:-<MODEL>}"
+      else
+        ensure_forward
+        host=$(probe_service)
+        model=$(pick_model "$host" "$model_override")
+      fi
+
+      case "$cli_name" in
+        claude)   launch_claude   "$host" "$model" "$config_only" "${cli_args[@]+"${cli_args[@]}"}";;
+        codex)    launch_codex    "$host" "$model" "$config_only" "${cli_args[@]+"${cli_args[@]}"}";;
+        opencode) launch_opencode "$host" "$model" "$config_only" "${cli_args[@]+"${cli_args[@]}"}";;
+        openclaw) launch_openclaw "$host" "$model" "$config_only" "${cli_args[@]+"${cli_args[@]}"}";;
+        gemini)   launch_gemini   "$host" "$model" "$config_only" "${cli_args[@]+"${cli_args[@]}"}";;
+      esac
+      ;;
+    *) die "unknown command: '$1'. try $PROG --help";;
+  esac
+}
+
+main "$@"

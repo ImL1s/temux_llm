@@ -89,6 +89,67 @@ litertlm --help
 
 ---
 
+## Use with CLI coding agents (v0.3.0+)
+
+`temux_llm` impersonates Ollama closely enough that the popular coding-agent
+CLIs talk to it without a proxy. Once the service is running on the phone,
+forward port 11434 from your host:
+
+```sh
+adb forward tcp:11434 tcp:11434
+```
+
+Then either set the env vars yourself, or use the bundled launcher:
+
+```sh
+scripts/temuxllm launch claude        # Anthropic Claude Code -> /v1/messages
+scripts/temuxllm launch codex         # OpenAI Codex CLI -> /v1/responses (--oss)
+scripts/temuxllm launch opencode      # sst/opencode -> /v1/chat/completions
+scripts/temuxllm launch openclaw      # openclaw.ai -> /api/chat (Ollama-native)
+scripts/temuxllm launch gemini        # prints LiteLLM-bridge instructions
+scripts/temuxllm launch claude --config-only   # see the env block, do not exec
+scripts/temuxllm launch codex --model gemma-4-E2B-it
+```
+
+The launcher does what `ollama launch <cli>` does in Ollama 0.15+: probes the
+service, picks the active model, sets the env vars / config the target CLI
+expects, and `exec`s it. Works on a host (with `adb`) or in Termux on the
+device.
+
+For a plain reference of every endpoint we expose and which CLI each one is
+for, see [`docs/ollama-compat.md`](docs/ollama-compat.md).
+
+### Manual setup (no launcher)
+
+If you'd rather wire the env vars yourself:
+
+```sh
+# Claude Code
+export ANTHROPIC_BASE_URL=http://127.0.0.1:11434
+export ANTHROPIC_AUTH_TOKEN=ollama
+export ANTHROPIC_API_KEY=
+claude
+
+# Codex CLI
+codex --oss -c model="gemma-4-E2B-it"
+
+# OpenCode — provider block in ~/.config/opencode/opencode.json:
+#   "provider": { "ollama": { "npm":"@ai-sdk/openai-compatible",
+#     "options":{"baseURL":"http://127.0.0.1:11434/v1"}, "models":{...} } }
+opencode
+```
+
+### Tool calling — not yet supported
+
+`/api/show` reports `capabilities: ["completion"]` only. CLIs that ask
+for tool calling will fall back to plain chat. Gemma 4 has native
+`<|tool_call>...<tool_call|>` tokens and LiteRT-LM 0.11 has the
+parser, but the end-to-end translation through each envelope is not
+wired in v0.3.0 — that's a follow-up release once we have an on-device
+probe verifying round-trip across all four wire formats.
+
+---
+
 ## Termux-native (no APK)
 
 Don't want to sideload the APK? Run the LiteRT-LM binary directly inside

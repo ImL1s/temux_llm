@@ -7,7 +7,92 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-(no unreleased changes)
+### Added — Ollama-compatible endpoints (Layer A) + launcher CLI (Layer B)
+
+`temux_llm` now impersonates an Ollama 0.13+ server closely enough that
+Claude Code, Codex CLI, OpenCode, and OpenClaw connect to it without a
+proxy. Run the bundled `scripts/temuxllm launch <cli>` to auto-wire
+each one.
+
+#### New endpoints
+
+- `GET /` — returns `Ollama is running` (probe-safe).
+- `POST /v1/messages` — Anthropic Messages with full SSE event
+  vocabulary (`message_start`, `content_block_delta`, `message_stop`).
+  Claude Code uses this when `ANTHROPIC_BASE_URL=http://127.0.0.1:11434`.
+- `POST /v1/chat/completions` — OpenAI Chat Completions SSE
+  (`chat.completion.chunk` + `data: [DONE]`). OpenCode uses this.
+- `POST /v1/responses` — OpenAI Responses API SSE
+  (`response.created` → `response.output_text.delta` →
+  `response.completed`). Codex CLI ≥0.80 uses this exclusively
+  (`wire_api="chat"` was removed upstream; verified against
+  `codex-rs/model-provider-info` source).
+- `POST /api/chat` — Ollama-native NDJSON. OpenClaw uses this and
+  explicitly rejects `/v1` because tool calling unrelizes there.
+- `POST /api/show` — synthesizes Ollama-shaped capabilities/details.
+- `GET /api/ps`, `GET /v1/models` — runtime / catalog probes.
+- `POST /api/pull` — stub returning `{"status":"success"}`
+  (Codex `--oss` calls it before falling through to inference).
+- `GET /api/tags` — upgraded to full Ollama 0.13+ shape with `name`,
+  `model`, `modified_at`, `size`, `digest`, `details`. Legacy fields
+  (`path`, `size_bytes`) preserved.
+- `GET /api/version` — adds top-level `version` field.
+
+#### `POST /api/generate`
+
+Now accepts a `model` field. Backward-compatible: existing v0.2.x
+clients that omit it still work. Streaming response now includes
+`model` and `created_at` per Ollama convention; legacy fields
+(`backend`, `total_duration_ms`, `output_tokens`, `output_chars`)
+preserved.
+
+#### Launcher CLI — `scripts/temuxllm`
+
+Single command per supported CLI:
+
+```sh
+scripts/temuxllm launch claude
+scripts/temuxllm launch codex --model gemma-4-E2B-it
+scripts/temuxllm launch opencode --config-only
+```
+
+Probes the service, picks the active model, sets the env vars / config
+the target CLI expects, and `exec`s it. Works on a host with `adb`
+attached (auto `adb forward tcp:11434 tcp:11434`) and in Termux on the
+device. `--config-only` flag prints the env block without exec'ing.
+
+#### Model resolution
+
+Arbitrary model names are accepted. Wildcards (`local`, `default`,
+`*`), exact filename match, family-prefix (`gemma`, `qwen`), and
+branded names (`claude-*`, `gpt-*`, `o1`, etc.) all route to the
+active model. Optional `<filesDir>/models.json` sidecar for explicit
+aliases.
+
+#### Tool calling — NOT implemented in this release
+
+`/api/show` reports `capabilities: ["completion"]` and never advertises
+`"tools"`. Coding agent CLIs that depend on tool calling will fall back
+to plain chat. The wiring through LiteRT-LM 0.11's
+`ConversationConfig.tools` and the per-envelope encoder translation
+(OpenAI `tool_calls`, Anthropic `tool_use`, Ollama `tool_calls`) is
+spec'd but deferred to a follow-up release once we have an on-device
+probe round-tripping `tools=[{...}]` reliably on Gemma 4 (E2B/E4B). The
+`TEMUXLLM_NO_TOOLS=1` env-var override is wired in `ModelRegistry`
+already so behavior is forward-compatible.
+
+#### Documentation
+
+- New: [`docs/ollama-compat.md`](docs/ollama-compat.md) — endpoint
+  reference, wire format tables, verification curl commands.
+- README adds a "Use with CLI coding agents" section.
+
+#### Constraints unchanged
+
+- HTTP still binds `127.0.0.1` only.
+- arm64-v8a only, `minSdk = 33`.
+- Single staged `.litertlm` model file.
+- No outbound traffic.
 
 ## [0.2.0] — 2026-05-01
 
