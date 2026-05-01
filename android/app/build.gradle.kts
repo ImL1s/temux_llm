@@ -48,7 +48,7 @@ kotlin {
 }
 
 dependencies {
-    implementation("androidx.core:core-ktx:1.13.1")
+    implementation("androidx.core:core-ktx:1.18.0")
     implementation("org.nanohttpd:nanohttpd:2.3.1")
     // Coroutines for the Engine.sendMessageAsync() Flow consumer.
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.9.0")
