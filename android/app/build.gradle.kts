@@ -7,11 +7,13 @@ plugins {
 
 android {
     namespace = "dev.temuxllm"
-    compileSdk = 35
+    compileSdk = 36
 
     defaultConfig {
         applicationId = "dev.temuxllm.service"
         minSdk = 33
+        // targetSdk lags compileSdk so we don't opt into Android 16 runtime
+        // behaviour changes until we've actually validated them on a device.
         targetSdk = 35
         versionCode = 1
         versionName = "0.1.0"
@@ -48,7 +50,7 @@ kotlin {
 }
 
 dependencies {
-    implementation("androidx.core:core-ktx:1.13.1")
+    implementation("androidx.core:core-ktx:1.18.0")
     implementation("org.nanohttpd:nanohttpd:2.3.1")
     // Coroutines for the Engine.sendMessageAsync() Flow consumer.
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.9.0")
