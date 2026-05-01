@@ -90,18 +90,25 @@ class LlmEngine(private val context: Context) {
         }
         val modelPath = ensureModelStaged()
         val backendInst = if (backend == "gpu") Backend.GPU() else Backend.CPU()
-        // EngineConfig.maxNumTokens caps prefill+decode kv-cache size. The
-        // SDK default is the model's compiled default (4096 for the Gemma 4
-        // .litertlm bundles), which can't fit Claude Code's ~16k built-in
-        // agent system prompt or Codex CLI's ~8k. KV-cache grows with this
-        // value; Adreno 830 + 32k cache + Gemma 4 E4B exceeds a 12 GB device
-        // and triggers Android's lowmemorykiller. 16384 is the sweet spot:
-        // exactly Claude Code's prompt size (no headroom — `--print` just
-        // fits), comfortable for Codex (~8k). Override via
-        // TEMUXLLM_MAX_TOKENS at service start for ≥16 GB devices (Fold7,
-        // Tab S10 Ultra) that can hold a bigger window.
-        val ctxOverride = System.getenv("TEMUXLLM_MAX_TOKENS")?.toIntOrNull()
-        val maxTokens = ctxOverride ?: 16384
+        // EngineConfig.maxNumTokens caps the prefill+decode KV-cache size.
+        // The SDK default is the model's compiled default (4096 for Gemma 4
+        // .litertlm bundles) — too tight for Claude Code's ~16 k built-in
+        // agent system prompt or Codex CLI's ~8 k. KV-cache scales linearly
+        // with this value; on 12 GB devices (S25 / Adreno 830) 32 k OOMs
+        // the foreground service via lowmemorykiller, while 16 k fits.
+        //
+        // Resolution order (highest priority first):
+        //   1. Per-install override file: <filesDir>/temuxllm.conf
+        //      with a line `max_tokens=<int>`. Lets power users (Fold7 /
+        //      Tab S10 Ultra owners) bump to 24 576 / 32 768 without
+        //      rebuilding the APK; engineers tuning a device push the
+        //      file via `adb push` into /data/local/tmp and we copy it
+        //      into filesDir on first staging.
+        //   2. TEMUXLLM_MAX_TOKENS env var (only honored if Android
+        //      somehow inherits it; foreground services usually don't).
+        //   3. Auto-detect from /proc/meminfo MemTotal — the device tier
+        //      table below is conservative and verified on real hardware.
+        val maxTokens = computeMaxNumTokens()
         val cfg = EngineConfig(
             modelPath = modelPath,
             backend = backendInst,
@@ -207,5 +214,82 @@ class LlmEngine(private val context: Context) {
             engine = null
             activeBackend = ""
         }
+    }
+
+    /**
+     * Pick a KV-cache size based on (in priority order) a config sidecar,
+     * an inheritable env var, or auto-detection from /proc/meminfo.
+     *
+     * Tiers (verified or conservatively projected):
+     *   ≤ 6 GB  → 4096   (E2B-only territory; Gemma 4 default)
+     *   ≤ 9 GB  → 8192   (8 GB phones; safe headroom for E2B)
+     *   ≤ 13 GB → 16384  (S25 / 12 GB / Adreno 830 — verified works)
+     *   ≤ 18 GB → 24576  (Fold7 / 16 GB — projected ceiling)
+     *   else    → 32768  (Tab S10 Ultra and similar 24+ GB devices)
+     */
+    private fun computeMaxNumTokens(): Int {
+        // 1) <filesDir>/temuxllm.conf, line `max_tokens=<int>`.
+        try {
+            val cfg = File(context.filesDir, "temuxllm.conf")
+            if (cfg.exists()) {
+                val line = cfg.readText(Charsets.UTF_8).lineSequence()
+                    .map { it.trim() }
+                    .firstOrNull { it.startsWith("max_tokens=") }
+                if (line != null) {
+                    val v = line.removePrefix("max_tokens=").trim().toIntOrNull()
+                    if (v != null && v > 0) {
+                        Log.i(TAG, "computeMaxNumTokens: $v from $cfg override")
+                        return v
+                    }
+                }
+            }
+        } catch (t: Throwable) {
+            Log.w(TAG, "computeMaxNumTokens: temuxllm.conf read failed", t)
+        }
+        // 1b) Mirror in /data/local/tmp so users pushing config without app
+        // running can take effect on next service start.
+        try {
+            val tmpCfg = File("/data/local/tmp/litertlm/temuxllm.conf")
+            if (tmpCfg.exists()) {
+                val line = tmpCfg.readText(Charsets.UTF_8).lineSequence()
+                    .map { it.trim() }
+                    .firstOrNull { it.startsWith("max_tokens=") }
+                if (line != null) {
+                    val v = line.removePrefix("max_tokens=").trim().toIntOrNull()
+                    if (v != null && v > 0) {
+                        Log.i(TAG, "computeMaxNumTokens: $v from $tmpCfg override")
+                        return v
+                    }
+                }
+            }
+        } catch (t: Throwable) {
+            Log.w(TAG, "computeMaxNumTokens: /data/local/tmp/.../temuxllm.conf read failed", t)
+        }
+        // 2) Env var (rarely honored by Android service inheritance).
+        val ctxEnv = System.getenv("TEMUXLLM_MAX_TOKENS")?.toIntOrNull()
+        if (ctxEnv != null && ctxEnv > 0) {
+            Log.i(TAG, "computeMaxNumTokens: $ctxEnv from TEMUXLLM_MAX_TOKENS env")
+            return ctxEnv
+        }
+        // 3) Auto-detect from /proc/meminfo MemTotal.
+        val memKb = try {
+            File("/proc/meminfo").readLines()
+                .firstOrNull { it.startsWith("MemTotal:") }
+                ?.trim()
+                ?.split(Regex("\\s+"))
+                ?.getOrNull(1)
+                ?.toLongOrNull() ?: 0L
+        } catch (_: Throwable) { 0L }
+        val memGb = (memKb + 524288L) / 1024L / 1024L  // round up to nearest GB
+        val auto = when {
+            memGb <= 0L -> 4096
+            memGb <= 6L -> 4096
+            memGb <= 9L -> 8192
+            memGb <= 13L -> 16384
+            memGb <= 18L -> 24576
+            else -> 32768
+        }
+        Log.i(TAG, "computeMaxNumTokens: $auto auto-selected (MemTotal≈${memGb} GB)")
+        return auto
     }
 }

@@ -189,10 +189,8 @@ object ChatFormat {
     data class ToolCall(val id: String, val name: String, val arguments: JSONObject)
     data class ParsedOutput(val text: String, val toolCalls: List<ToolCall>)
 
-    fun parseToolCalls(raw: String): ParsedOutput {
+    fun parseToolCalls(raw: String, allowedNames: Set<String>? = null): ParsedOutput {
         if (raw.isBlank()) return ParsedOutput(raw, emptyList())
-        // Look for { ... "tool_calls" ... } anywhere in the buffer. Use a
-        // brace-balance walker (regex won't reliably balance nested braces).
         val idx = findToolCallsObjectStart(raw)
         if (idx < 0) return ParsedOutput(raw.trim(), emptyList())
         val end = findMatchingBrace(raw, idx)
@@ -205,6 +203,13 @@ object ChatFormat {
             val o = arr.optJSONObject(i) ?: continue
             val n = o.optString("name").ifBlank { o.optJSONObject("function")?.optString("name") ?: "" }
             if (n.isBlank()) continue
+            // Defense-in-depth: cross-check the model's emitted name against
+            // what the request actually advertised. Without this filter,
+            // a prompt-injected user message could trick the model into
+            // emitting a fake tool name (`exec`, `delete_repo`, ...) that
+            // we would relay verbatim to the agent client. Same hardening
+            // pattern Ollama's tools/tools.go uses (findTool()).
+            if (allowedNames != null && n !in allowedNames) continue
             val a = when {
                 o.opt("arguments") is JSONObject -> o.optJSONObject("arguments")!!
                 o.opt("arguments") is String -> try { JSONObject(o.optString("arguments")) } catch (_: Throwable) { JSONObject() }
@@ -218,6 +223,23 @@ object ChatFormat {
         }
         val text = (raw.substring(0, idx) + raw.substring(end + 1)).trim()
         return ParsedOutput(text, calls)
+    }
+
+    /**
+     * Extract the set of declared tool names from a request's tools array.
+     * Accepts the same shapes [renderToolBlock] does (Anthropic, OpenAI,
+     * Ollama). Returns an empty set when [tools] is null/empty so callers
+     * can use `setOf().takeIf { it.isNotEmpty() }` to gate enforcement.
+     */
+    fun toolNamesFromRequest(tools: JSONArray?): Set<String> {
+        if (tools == null) return emptySet()
+        val s = mutableSetOf<String>()
+        for (i in 0 until tools.length()) {
+            val t = tools.optJSONObject(i) ?: continue
+            val n = t.optJSONObject("function")?.optString("name").orEmpty().ifBlank { t.optString("name") }
+            if (n.isNotBlank()) s += n
+        }
+        return s
     }
 
     private fun findToolCallsObjectStart(s: String): Int {

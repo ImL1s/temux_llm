@@ -9,6 +9,81 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 (no unreleased changes)
 
+## [0.3.3] — 2026-05-02
+
+### Tool name validation (codex outside-review blocker)
+
+`ChatFormat.parseToolCalls` now cross-checks every parsed tool name
+against the request's declared `tools` array, dropping any call whose
+name was NOT advertised by the client. Same hardening pattern as
+Ollama's `tools/tools.go` `findTool()`. Verified on Galaxy S25 with a
+prompt-injection probe (user message asking the model to emit a fake
+`shell_exec` tool call): the model produced the JSON, our parser
+matched the structure, but the name filter rejected it and the
+response came back with empty content + `stop_reason="end_turn"`.
+
+Without this filter, a malicious user message could trick a small
+model into emitting a tool call for any name it likes — `shell_exec`,
+`delete_repo`, `pay_money_to(...)` — and we would relay it to the
+agent client which might execute it.
+
+### Auto-detect KV-cache context size from device RAM
+
+`LlmEngine.computeMaxNumTokens()` picks `EngineConfig.maxNumTokens`
+based on a tier table:
+
+  ≤ 6 GB   → 4096   (Gemma 4 default; E2B-only territory)
+  ≤ 9 GB   → 8192   (8 GB phones; safe headroom for E2B)
+  ≤ 13 GB  → 16384  (S25 / Adreno 830 — verified ceiling)
+  ≤ 18 GB  → 24576  (Fold7 / 16 GB — projected; user-verifiable)
+  else     → 32768  (Tab S10 Ultra / 24 GB+)
+
+Empirical: 32 k context on Adreno 830 + 12 GB triggers Android's
+lowmemorykiller (foreground service `prcp FGS` exit). 20 k also
+killed. 16 k holds. Codex CLI's independent research agreed with
+this ceiling.
+
+Override via `<filesDir>/temuxllm.conf` or
+`/data/local/tmp/litertlm/temuxllm.conf` (a single line
+`max_tokens=N`). Lets power users on Fold7 / Tab S10 Ultra push
+higher without rebuilding the APK:
+
+  adb shell 'echo "max_tokens=24576" > /data/local/tmp/litertlm/temuxllm.conf'
+  adb shell am force-stop dev.temuxllm.service
+  adb shell am start-foreground-service \
+    -n dev.temuxllm.service/dev.temuxllm.LlmService
+
+`TEMUXLLM_MAX_TOKENS` env var still honored as a third-tier fallback
+(rarely inheritable by Android foreground services).
+
+### Launcher CLI (`scripts/temuxllm`) small-model squeeze
+
+Both launchers now default to small-model-friendly invocations:
+
+- `temuxllm launch claude` adds `--bare` (Claude Code's minimal mode:
+  no hooks/LSP/plugins/auto-memory/CLAUDE.md auto-discovery — system
+  prompt drops from ~16 k tokens to a few hundred). Set
+  `TEMUXLLM_CLAUDE_FULL_AGENT=1` to drop `--bare` on a 16 GB+ device
+  with `TEMUXLLM_MAX_TOKENS=24576+`.
+- `temuxllm launch codex` adds `-c project_doc_max_bytes=0` (per
+  OpenAI Codex config reference; suppresses `AGENTS.md` injection).
+  `TEMUXLLM_CODEX_INSTRUCTIONS_FILE=<path>` env var adds
+  `-c model_instructions_file="..."` to swap Codex's bundled ~8 k
+  agent base instructions for whatever tiny instructions file the
+  user provides (per OpenAI's "Unrolling the Codex agent loop" post).
+
+`temuxllm launch ... --config-only` reflects the new defaults so
+power users can copy them into their own scripts.
+
+### Known limitations (not yet shipped)
+
+- `scripts/install-termux-native.sh`'s embedded wrapper heredoc is
+  still v0.3.1-era — the new `--tools` flag from v0.3.2 isn't there.
+  Sync is queued for v0.3.4.
+- Per-character streaming of tool-call JSON args (right now the
+  buffered path emits the full args in one `partial_json` /
+  `function_call_arguments.delta` chunk).
+
 ## [0.3.2] — 2026-05-02
 
 ### Tool calling — actually shipping this time

@@ -205,10 +205,11 @@ class HttpServer(
         }
         val stream = body.optBoolean("stream", true)
         val hasTools = toolBlock != null
+        val allowedToolNames = ChatFormat.toolNamesFromRequest(tools)
         return when {
-            stream && hasTools -> runStreamBuffered(prompt, backend, NdjsonChatEncoder(resolved.name))
+            stream && hasTools -> runStreamBuffered(prompt, backend, NdjsonChatEncoder(resolved.name), allowedToolNames)
             stream -> runStream(prompt, backend, NdjsonChatEncoder(resolved.name))
-            else -> blockingGenerate(prompt, backend, resolved.name, ResponseShape.OllamaChat, parseTools = hasTools)
+            else -> blockingGenerate(prompt, backend, resolved.name, ResponseShape.OllamaChat, parseTools = hasTools, allowedToolNames = allowedToolNames)
         }
     }
 
@@ -234,10 +235,11 @@ class HttpServer(
         }
         val stream = body.optBoolean("stream", false)
         val hasTools = toolBlock != null
+        val allowedToolNames = ChatFormat.toolNamesFromRequest(tools)
         return when {
-            stream && hasTools -> runStreamBuffered(prompt, backend, OpenAiSseEncoder(resolved.name))
+            stream && hasTools -> runStreamBuffered(prompt, backend, OpenAiSseEncoder(resolved.name), allowedToolNames)
             stream -> runStream(prompt, backend, OpenAiSseEncoder(resolved.name))
-            else -> blockingGenerate(prompt, backend, resolved.name, ResponseShape.OpenAiChat, parseTools = hasTools)
+            else -> blockingGenerate(prompt, backend, resolved.name, ResponseShape.OpenAiChat, parseTools = hasTools, allowedToolNames = allowedToolNames)
         }
     }
 
@@ -283,10 +285,11 @@ class HttpServer(
         }
         val stream = body.optBoolean("stream", false)
         val hasTools = toolBlock != null
+        val allowedToolNames = ChatFormat.toolNamesFromRequest(tools)
         return when {
-            stream && hasTools -> runStreamBuffered(prompt, backend, AnthropicSseEncoder(resolved.name))
+            stream && hasTools -> runStreamBuffered(prompt, backend, AnthropicSseEncoder(resolved.name), allowedToolNames)
             stream -> runStream(prompt, backend, AnthropicSseEncoder(resolved.name))
-            else -> blockingGenerate(prompt, backend, resolved.name, ResponseShape.AnthropicMessages, parseTools = hasTools)
+            else -> blockingGenerate(prompt, backend, resolved.name, ResponseShape.AnthropicMessages, parseTools = hasTools, allowedToolNames = allowedToolNames)
         }
     }
 
@@ -320,10 +323,11 @@ class HttpServer(
         }
         val stream = body.optBoolean("stream", false)
         val hasTools = toolBlock != null
+        val allowedToolNames = ChatFormat.toolNamesFromRequest(tools)
         return when {
-            stream && hasTools -> runStreamBuffered(prompt, backend, ResponsesSseEncoder(resolved.name))
+            stream && hasTools -> runStreamBuffered(prompt, backend, ResponsesSseEncoder(resolved.name), allowedToolNames)
             stream -> runStream(prompt, backend, ResponsesSseEncoder(resolved.name))
-            hasTools -> blockingResponsesWithTools(prompt, backend, resolved.name)
+            hasTools -> blockingResponsesWithTools(prompt, backend, resolved.name, allowedToolNames)
             else -> blockingResponses(prompt, backend, resolved.name)
         }
     }
@@ -333,7 +337,12 @@ class HttpServer(
      * Codex expects: an `output` array containing either a `message` item
      * (text) or `function_call` items (tool calls), or both.
      */
-    private fun blockingResponsesWithTools(prompt: String, backend: String, model: String): Response {
+    private fun blockingResponsesWithTools(
+        prompt: String,
+        backend: String,
+        model: String,
+        allowedToolNames: Set<String>,
+    ): Response {
         val r = engine.generateBlocking(prompt, backend)
         if (r.error != null) {
             return json(Response.Status.INTERNAL_ERROR, JSONObject().apply {
@@ -341,7 +350,7 @@ class HttpServer(
                 put("error", JSONObject().apply { put("code", "server_error"); put("message", r.error) })
             })
         }
-        val parsed = ChatFormat.parseToolCalls(r.text)
+        val parsed = ChatFormat.parseToolCalls(r.text, allowedToolNames.takeIf { it.isNotEmpty() })
         val outputItems = JSONArray()
         if (parsed.text.isNotEmpty()) {
             val msgId = "msg_" + UUID.randomUUID().toString().replace("-", "").take(20)
@@ -462,7 +471,12 @@ class HttpServer(
      * generation. For tool-driven turns this is fine — the agent is waiting
      * for the tool selection, not displaying partial thoughts.
      */
-    private fun runStreamBuffered(prompt: String, backend: String, encoder: StreamEncoder): Response {
+    private fun runStreamBuffered(
+        prompt: String,
+        backend: String,
+        encoder: StreamEncoder,
+        allowedToolNames: Set<String>,
+    ): Response {
         val pipeIn = PipedInputStream(64 * 1024)
         val pipeOut = PipedOutputStream(pipeIn)
         thread(start = true, name = "litertlm-buffered") {
@@ -472,7 +486,10 @@ class HttpServer(
                 if (r.error != null) {
                     encoder.emitError(writer, r.error!!)
                 } else {
-                    val parsed = ChatFormat.parseToolCalls(r.text)
+                    // Cross-check parsed tool names against the request's
+                    // declared tools. Drops hallucinated / prompt-injected
+                    // names before they reach the agent client.
+                    val parsed = ChatFormat.parseToolCalls(r.text, allowedToolNames)
                     encoder.emitBuffered(
                         writer,
                         BufferedResult(
@@ -575,6 +592,7 @@ class HttpServer(
         model: String,
         shape: ResponseShape,
         parseTools: Boolean = false,
+        allowedToolNames: Set<String> = emptySet(),
     ): Response {
         Log.i(TAG, "generate blocking shape=$shape backend=$backend model=$model tools=$parseTools prompt=${prompt.take(80)}…")
         val r = engine.generateBlocking(prompt, backend)
@@ -602,7 +620,11 @@ class HttpServer(
         // `{"tool_calls":[...]}` JSON object and split it out from any
         // surrounding chatter. parsed.text is the prose remnant; parsed.toolCalls
         // are the structured calls (may be empty if the model just chatted).
-        val parsed = if (parseTools) ChatFormat.parseToolCalls(r.text) else ChatFormat.ParsedOutput(r.text, emptyList())
+        // The tool name cross-check (allowedToolNames) drops any call whose
+        // name wasn't in the request's tools array — defense against prompt
+        // injection that fakes a tool invocation.
+        val parsed = if (parseTools) ChatFormat.parseToolCalls(r.text, allowedToolNames.takeIf { it.isNotEmpty() })
+        else ChatFormat.ParsedOutput(r.text, emptyList())
         val text = parsed.text
         val toolCalls = parsed.toolCalls
         val hasTools = toolCalls.isNotEmpty()

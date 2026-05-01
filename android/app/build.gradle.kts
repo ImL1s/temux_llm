@@ -15,8 +15,8 @@ android {
         // targetSdk lags compileSdk so we don't opt into Android 16 runtime
         // behaviour changes until we've actually validated them on a device.
         targetSdk = 35
-        versionCode = 8
-        versionName = "0.3.2"
+        versionCode = 9
+        versionName = "0.3.3"
         ndk {
             abiFilters += "arm64-v8a"
         }

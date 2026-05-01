@@ -132,16 +132,32 @@ ANTHROPIC_MODEL=$model
 ANTHROPIC_DEFAULT_OPUS_MODEL=$model
 ANTHROPIC_DEFAULT_SONNET_MODEL=$model
 ANTHROPIC_DEFAULT_HAIKU_MODEL=$model
+# small-model defaults below — Claude Code's full agent system prompt is
+# ~16k tokens, which JUST fits temux_llm's 16k context (S25 12 GB) leaving
+# zero headroom for output. --bare strips hooks/LSP/plugins/auto-memory/
+# CLAUDE.md auto-discovery so the prompt drops to a few hundred tokens
+# and the model has room to actually answer. Drop --bare if you have a
+# device with ≥16 GB and TEMUXLLM_MAX_TOKENS=24576+ set.
 EOF
 )
   if [[ "$config_only" == "1" ]]; then
     echo "# env block for: claude"
     echo "$env_block"
-    echo "# then: claude"
+    echo "# recommended invocation for small-model on-device:"
+    echo "claude --bare \"\$@\""
     return 0
   fi
   command -v "$cli" >/dev/null 2>&1 || die "install Claude Code first: https://docs.claude.com/claude-code"
-  log "launching claude with model=$model via $host"
+  # User opt-out of --bare via TEMUXLLM_CLAUDE_FULL_AGENT=1 (16 GB+ devices
+  # with ≥24k context can probably afford the full Claude Code system prompt).
+  local bare_flag=()
+  if [[ -z "${TEMUXLLM_CLAUDE_FULL_AGENT:-}" ]]; then
+    bare_flag=(--bare)
+    log "launching claude --bare (minimal system prompt) with model=$model via $host"
+    log "  set TEMUXLLM_CLAUDE_FULL_AGENT=1 to drop --bare on a 16 GB+ device"
+  else
+    log "launching claude (full agent prompt) with model=$model via $host"
+  fi
   ANTHROPIC_BASE_URL="$host" \
   ANTHROPIC_AUTH_TOKEN=ollama \
   ANTHROPIC_API_KEY= \
@@ -149,7 +165,7 @@ EOF
   ANTHROPIC_DEFAULT_OPUS_MODEL="$model" \
   ANTHROPIC_DEFAULT_SONNET_MODEL="$model" \
   ANTHROPIC_DEFAULT_HAIKU_MODEL="$model" \
-    exec "$cli" "$@"
+    exec "$cli" "${bare_flag[@]+"${bare_flag[@]}"}" "$@"
 }
 
 launch_codex() {
@@ -158,23 +174,44 @@ launch_codex() {
   # Codex CLI's built-in `--oss` provider hardcodes localhost:11434 and
   # WireApi::Responses (verified against codex-rs source). We pass `-c model=`
   # so the user's chosen model is honored without rewriting their config.
+  #
+  # Small-model squeeze (16 k context on S25, 24 k on Fold7-class):
+  #   - project_doc_max_bytes=0 suppresses AGENTS.md injection (per OpenAI
+  #     Codex config reference) — keeps prefill from blowing past the
+  #     context window when the user is in a repo with a big AGENTS.md.
+  #   - profile.<name>.model_instructions_file overrides the bundled base
+  #     instructions (per OpenAI's "Unrolling the Codex agent loop" post).
+  #     Set TEMUXLLM_CODEX_INSTRUCTIONS_FILE=<path> to a tiny instructions
+  #     file (e.g. one-paragraph "you are a helpful coding assistant") to
+  #     drop the ~8 k system prompt down to a few hundred tokens.
+  local extra_cfg=(-c project_doc_max_bytes=0)
+  if [[ -n "${TEMUXLLM_CODEX_INSTRUCTIONS_FILE:-}" ]]; then
+    extra_cfg+=(-c "model_instructions_file=\"$TEMUXLLM_CODEX_INSTRUCTIONS_FILE\"")
+  fi
   if [[ "$config_only" == "1" ]]; then
     cat <<EOF
-# command for: codex
-codex --oss -c model="$model"
-# OR with explicit provider override:
+# command for: codex (small-model defaults)
+codex --oss \\
+  -c project_doc_max_bytes=0 \\
+  -c model="$model"
+# add: -c model_instructions_file="</path/to/tiny-instructions.txt>" to drop
+# the ~8 k built-in system prompt — useful on 12 GB / 16 k context devices.
+# Or set TEMUXLLM_CODEX_INSTRUCTIONS_FILE in the env before \`temuxllm launch codex\`.
+#
+# Full provider override (replaces the --oss shorthand):
 codex \\
   -c model_provider=ollama \\
   -c 'model_providers.ollama.name="Ollama"' \\
   -c 'model_providers.ollama.base_url="$host/v1"' \\
   -c 'model_providers.ollama.wire_api="responses"' \\
+  -c project_doc_max_bytes=0 \\
   -c model="$model"
 EOF
     return 0
   fi
   command -v "$cli" >/dev/null 2>&1 || die "install Codex CLI first: https://github.com/openai/codex"
-  log "launching codex (--oss) with model=$model"
-  exec "$cli" --oss -c model="$model" "$@"
+  log "launching codex (--oss, project_doc_max_bytes=0) with model=$model"
+  exec "$cli" --oss "${extra_cfg[@]}" -c model="$model" "$@"
 }
 
 launch_opencode() {
