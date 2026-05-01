@@ -100,22 +100,34 @@ for so in "${SO_FILES[@]}"; do
     || { echo "FATAL: $so is not aarch64 ELF" >&2; exit 1; }
 done
 
-# 3. Model — default Qwen3-0.6B (smallest). MODEL=gemma to use Gemma-4 instead.
-# Both work with v0.11.0-rc.1 binary.
-MODEL="${MODEL:-qwen3}"
+# 3. Model — choose with MODEL env var. All three work with v0.11.0-rc.1 binary.
+GEMMA4_E4B_URL="https://huggingface.co/litert-community/gemma-4-E4B-it-litert-lm/resolve/main/gemma-4-E4B-it.litertlm"
+MODEL="${MODEL:-gemma}"
 case "$MODEL" in
   qwen3)
     fetch_with_verify "$QWEN3_URL" "$MODEL_DIR/Qwen3-0.6B.litertlm" "models/Qwen3-0.6B.litertlm"
     ;;
-  gemma)
+  gemma|gemma_e2b)
     fetch_with_verify "$GEMMA4_URL" "$MODEL_DIR/gemma-4-E2B-it.litertlm" "models/gemma-4-E2B-it.litertlm"
+    ;;
+  gemma_e4b)
+    # E4B has no manifest entry yet (varies; large model, dev preview).
+    DST="$MODEL_DIR/gemma-4-E4B-it.litertlm"
+    EXPECTED_SIZE=3654467584
+    if [[ -f "$DST" ]]; then
+      got=$(stat -f%z "$DST" 2>/dev/null || stat -c%s "$DST")
+      [[ "$got" == "$EXPECTED_SIZE" ]] && { echo "[skip] $DST already $EXPECTED_SIZE B"; }
+    fi
+    if [[ ! -f "$DST" ]] || [[ "$(stat -f%z "$DST" 2>/dev/null || stat -c%s "$DST")" != "$EXPECTED_SIZE" ]]; then
+      curl -fL --retry 3 --retry-delay 2 -o "$DST" "$GEMMA4_E4B_URL"
+    fi
     ;;
   both)
     fetch_with_verify "$QWEN3_URL" "$MODEL_DIR/Qwen3-0.6B.litertlm" "models/Qwen3-0.6B.litertlm"
     fetch_with_verify "$GEMMA4_URL" "$MODEL_DIR/gemma-4-E2B-it.litertlm" "models/gemma-4-E2B-it.litertlm"
     ;;
   *)
-    echo "FATAL: unknown MODEL='$MODEL' (use qwen3, gemma, or both)" >&2
+    echo "FATAL: unknown MODEL='$MODEL' (use qwen3, gemma, gemma_e4b, or both)" >&2
     exit 1
     ;;
 esac
