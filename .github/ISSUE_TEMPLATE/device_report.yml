@@ -1,0 +1,86 @@
+name: Device support report
+description: I tried it on a phone we haven't documented. Here's what happened.
+labels: ["device-report"]
+body:
+  - type: input
+    id: device
+    attributes:
+      label: Device model
+      placeholder: Galaxy Z Fold7
+    validations:
+      required: true
+
+  - type: input
+    id: soc
+    attributes:
+      label: SoC (and `getprop ro.soc.model`)
+      placeholder: Snapdragon 8 Elite for Galaxy / SM8750
+    validations:
+      required: true
+
+  - type: input
+    id: gpu
+    attributes:
+      label: GPU
+      placeholder: Adreno 830
+    validations:
+      required: true
+
+  - type: input
+    id: ram
+    attributes:
+      label: Total RAM
+      placeholder: 12 GB
+    validations:
+      required: true
+
+  - type: input
+    id: android
+    attributes:
+      label: Android version
+      placeholder: Android 16
+    validations:
+      required: true
+
+  - type: input
+    id: model
+    attributes:
+      label: Model used
+      placeholder: gemma-4-E4B-it.litertlm
+    validations:
+      required: true
+
+  - type: textarea
+    id: numbers
+    attributes:
+      label: Numbers
+      description: |
+        Paste the JSON or wrapper output. Example:
+        ```
+        $ litertlm "Reply with just: hi."
+        hi.
+        [gpu  total=820ms  tokens=3  chars=3]
+        ```
+      render: text
+    validations:
+      required: true
+
+  - type: dropdown
+    id: backends
+    attributes:
+      label: Which backends worked?
+      multiple: true
+      options:
+        - cpu
+        - gpu
+    validations:
+      required: true
+
+  - type: textarea
+    id: notes
+    attributes:
+      label: Anything weird
+      description: Errors, surprises, performance gotchas — anything.
+      placeholder: GPU init takes 28 s on first run; subsequent runs are 4 s.
+    validations:
+      required: false

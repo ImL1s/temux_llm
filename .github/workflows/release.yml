@@ -1,0 +1,86 @@
+name: release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'tag to release (e.g. v0.1.0)'
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  apk:
+    name: Build + attach APK to Release
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Validate Gradle wrapper
+        uses: gradle/actions/wrapper-validation@v4
+
+      - name: Cache Gradle
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: gradle-${{ runner.os }}-${{ hashFiles('android/**/*.gradle*', 'android/**/gradle-wrapper.properties') }}
+
+      - name: Resolve version
+        id: ver
+        run: |
+          REF="${{ github.event.inputs.tag || github.ref_name }}"
+          echo "tag=${REF}" >> "$GITHUB_OUTPUT"
+          echo "version=${REF#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Build debug APK (sideloadable)
+        working-directory: android
+        run: ./gradlew :app:assembleDebug --no-daemon --stacktrace
+
+      - name: Rename APK with version
+        run: |
+          mkdir -p dist
+          cp android/app/build/outputs/apk/debug/app-debug.apk \
+             dist/temuxllm-${{ steps.ver.outputs.tag }}.apk
+          ls -la dist/
+
+      - name: Generate release notes (changelog excerpt)
+        id: notes
+        run: |
+          {
+            echo 'BODY<<EOF'
+            awk -v v="${{ steps.ver.outputs.version }}" '
+              /^## \[/ { if (printing) exit; if ($0 ~ "\\["v"\\]") { printing=1; next } }
+              printing
+            ' CHANGELOG.md
+            echo
+            echo "---"
+            echo "Install: \`adb install temuxllm-${{ steps.ver.outputs.tag }}.apk\`"
+            echo "Then push a model: \`bash scripts/install.sh\` (see README)."
+            echo 'EOF'
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.ver.outputs.tag }}
+          name: temux_llm ${{ steps.ver.outputs.tag }}
+          body: ${{ steps.notes.outputs.BODY }}
+          draft: false
+          prerelease: ${{ contains(steps.ver.outputs.tag, '-') }}
+          files: |
+            dist/temuxllm-${{ steps.ver.outputs.tag }}.apk

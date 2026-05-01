@@ -1,5 +1,11 @@
 # temux_llm — local LLM on Android, ollama-style
 
+[![build](https://github.com/iml1s/temux_llm/actions/workflows/build.yml/badge.svg)](https://github.com/iml1s/temux_llm/actions/workflows/build.yml)
+[![release](https://img.shields.io/github/v/release/iml1s/temux_llm?include_prereleases)](https://github.com/iml1s/temux_llm/releases)
+[![license](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
+[![android](https://img.shields.io/badge/android-13%2B-3DDC84?logo=android&logoColor=white)](https://developer.android.com/about/versions/13)
+[![runtime](https://img.shields.io/badge/runtime-LiteRT--LM%200.11.0--rc1-yellow)](https://github.com/google-ai-edge/LiteRT-LM)
+
 A self-contained Android app + Termux client that runs Google's **Gemma 4** (or
 Qwen3) on your phone's GPU and exposes it as `http://127.0.0.1:11434/api/generate`.
 No network. No cloud. No data leaves the device.

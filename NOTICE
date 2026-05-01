@@ -1,0 +1,43 @@
+temux_llm
+Copyright 2026 iml1s and the temux_llm contributors
+
+This product includes software developed by third parties.
+The following third-party components are bundled or used at runtime:
+
+────────────────────────────────────────────────────────────────────────
+LiteRT-LM (com.google.ai.edge.litertlm:litertlm-android)
+  https://github.com/google-ai-edge/LiteRT-LM
+  Copyright Google LLC
+  Licensed under the Apache License, Version 2.0
+  Includes the on-device LLM inference runtime, GPU/NPU accelerators,
+  and supporting native libraries shipped in the Maven artifact.
+────────────────────────────────────────────────────────────────────────
+NanoHTTPD (org.nanohttpd:nanohttpd 2.3.1)
+  https://github.com/NanoHttpd/nanohttpd
+  Copyright (c) 2012-2014 Paul S. Hawke, 2012-2013 Micah Hainline,
+  2012-2014 Chris von der Werth, 2014 Lukas Kallien, et al.
+  Licensed under the BSD 3-Clause License.
+  Used as the embedded HTTP server bound to 127.0.0.1.
+────────────────────────────────────────────────────────────────────────
+Kotlin Coroutines (org.jetbrains.kotlinx:kotlinx-coroutines-android)
+  https://github.com/Kotlin/kotlinx.coroutines
+  Copyright JetBrains s.r.o.
+  Licensed under the Apache License, Version 2.0
+────────────────────────────────────────────────────────────────────────
+AndroidX Core-KTX (androidx.core:core-ktx)
+  https://developer.android.com/jetpack/androidx/releases/core
+  Copyright The Android Open Source Project
+  Licensed under the Apache License, Version 2.0
+────────────────────────────────────────────────────────────────────────
+
+Models referenced (downloaded by scripts/fetch_artifacts.sh, not redistributed
+by this project):
+
+  litert-community/gemma-4-E2B-it-litert-lm  (Hugging Face)
+  litert-community/gemma-4-E4B-it-litert-lm  (Hugging Face)
+  litert-community/Qwen3-0.6B                (Hugging Face)
+
+Each upstream model is governed by its own license (Gemma Terms of Use,
+Qwen license). Downloading a model implies acceptance of that model's
+license. This project does not bundle, mirror, or redistribute any model
+weights.
