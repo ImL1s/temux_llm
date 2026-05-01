@@ -34,10 +34,11 @@ TAG="v0.11.0-rc.1"
 BINARY_URL="https://github.com/google-ai-edge/LiteRT-LM/releases/download/${TAG}/litert_lm_main.android_arm64"
 LFS_BASE="https://media.githubusercontent.com/media/google-ai-edge/LiteRT-LM/${TAG}/prebuilt/android_arm64"
 QWEN3_COMMIT="49837332af6863b008a73a5394ed60789504069d"
-GEMMA4_COMMIT="7fa1d78473894f7e736a21d920c3aa80f950c0db"
+GEMMA4_E2B_COMMIT="7fa1d78473894f7e736a21d920c3aa80f950c0db"
+GEMMA4_E4B_COMMIT="55b6eef9e490da991fe6bc5fec1834106927b727"
 QWEN3_URL="https://huggingface.co/litert-community/Qwen3-0.6B/resolve/${QWEN3_COMMIT}/Qwen3-0.6B.litertlm"
-GEMMA4_E2B_URL="https://huggingface.co/litert-community/gemma-4-E2B-it-litert-lm/resolve/${GEMMA4_COMMIT}/gemma-4-E2B-it.litertlm"
-GEMMA4_E4B_URL="https://huggingface.co/litert-community/gemma-4-E4B-it-litert-lm/resolve/main/gemma-4-E4B-it.litertlm"
+GEMMA4_E2B_URL="https://huggingface.co/litert-community/gemma-4-E2B-it-litert-lm/resolve/${GEMMA4_E2B_COMMIT}/gemma-4-E2B-it.litertlm"
+GEMMA4_E4B_URL="https://huggingface.co/litert-community/gemma-4-E4B-it-litert-lm/resolve/${GEMMA4_E4B_COMMIT}/gemma-4-E4B-it.litertlm"
 
 MODEL="${MODEL:-e2b}"
 
@@ -169,7 +170,7 @@ case "$MODEL" in
         ;;
     e4b)
         MODEL_FILE="gemma-4-E4B-it.litertlm"
-        MODEL_SHA=""
+        MODEL_SHA="f335f2bfd1b758dc6476db16c0f41854bd6237e2658d604cbe566bcefd00a7bc"
         MODEL_URL="$GEMMA4_E4B_URL"
         say "downloading gemma-4-E4B-it.litertlm (3.4 GB) — needs high-end SoC + RAM"
         ;;
@@ -178,31 +179,7 @@ case "$MODEL" in
         ;;
 esac
 
-if [ "$MODEL" = "e4b" ]; then
-    # E4B has no pinned sha256 yet (dev preview, large file).
-    # Verify by expected byte size instead.
-    EXPECTED_SIZE=3654467584
-    DEST="$INSTALL_DIR/$MODEL_FILE"
-    if [ -f "$DEST" ]; then
-        actual=$(wc -c < "$DEST")
-        if [ "$actual" = "$EXPECTED_SIZE" ]; then
-            info "[skip] $MODEL_FILE — size ${EXPECTED_SIZE} B already correct"
-        else
-            info "[redownload] $MODEL_FILE — size mismatch (got $actual B)"
-            rm -f "$DEST"
-            info "[fetch] $MODEL_FILE"
-            info "        $MODEL_URL"
-            curl -fL --retry 3 --retry-delay 2 --progress-bar -o "$DEST" "$MODEL_URL"
-        fi
-    else
-        info "[fetch] $MODEL_FILE"
-        info "        $MODEL_URL"
-        curl -fL --retry 3 --retry-delay 2 --progress-bar -o "$DEST" "$MODEL_URL"
-    fi
-    info "[ok] $MODEL_FILE (size not sha256-verified — dev preview)"
-else
-    fetch_verify "$MODEL_URL" "$INSTALL_DIR/$MODEL_FILE" "$MODEL_SHA" "$MODEL_FILE"
-fi
+fetch_verify "$MODEL_URL" "$INSTALL_DIR/$MODEL_FILE" "$MODEL_SHA" "$MODEL_FILE"
 
 # ---------------------------------------------------------------------------
 # 6. install the wrapper script
@@ -357,10 +334,13 @@ TOTAL_MS=""
 TOKENS=""
 DECODE_TPS=""
 
+# Pipe rather than heredoc: a heredoc with `<< RAWEOF / $RAW / RAWEOF` would
+# silently truncate output if the model's reply ever contained a line that read
+# exactly RAWEOF on its own. Piping is immune to that and also avoids the
+# unquoted-expansion subtleties of `done << RAWEOF`.
 while IFS= read -r line; do
     case "$line" in
         BenchmarkInfo:*)
-            # extract fields
             t=$(printf '%s' "$line" | sed -n 's/.*total_duration_ms=\([0-9]*\).*/\1/p')
             tk=$(printf '%s' "$line" | sed -n 's/.*output_tokens=\([0-9]*\).*/\1/p')
             d=$(printf '%s' "$line" | sed -n 's/.*decode_tokens_per_sec=\([0-9.]*\).*/\1/p')
@@ -377,9 +357,9 @@ ${line}"
             fi
             ;;
     esac
-done << RAWEOF
-$RAW
-RAWEOF
+done <<EOF
+$(printf '%s\n' "$RAW")
+EOF
 
 # Trim leading/trailing blank lines from the response.
 RESPONSE=$(printf '%s' "$RESPONSE" | sed -e '/./,$!d' -e 's/[[:space:]]*$//')

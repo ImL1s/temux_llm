@@ -42,7 +42,7 @@ class HttpServer(private val context: Context, private val engine: LlmEngine) :
                     put("service", "temuxllm")
                     put("phase", "2c")
                     put("runtime", "litertlm-android 0.11.0-rc1 (in-process Engine)")
-                    put("default_backend", "gpu")
+                    put("default_backend", "cpu")
                     put("model_path", engine.activeModelPath().absolutePath)
                     put("source_model_path", LlmEngine.SOURCE_MODEL_PATH)
                     put("engine_loaded", engine.isLoaded())
@@ -73,7 +73,7 @@ class HttpServer(private val context: Context, private val engine: LlmEngine) :
         val prompt = body.optString("prompt").also {
             if (it.isBlank()) return errorJson(Response.Status.BAD_REQUEST, "prompt is required")
         }
-        val backend = body.optString("backend", "gpu").lowercase()
+        val backend = body.optString("backend", "cpu").lowercase()
         if (backend != "cpu" && backend != "gpu") {
             return errorJson(Response.Status.BAD_REQUEST, "backend must be cpu|gpu (got $backend)")
         }

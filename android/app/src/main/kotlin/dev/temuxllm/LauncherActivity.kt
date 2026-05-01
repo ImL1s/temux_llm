@@ -18,6 +18,9 @@ class LauncherActivity : Activity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        // Theme.NoDisplay activities MUST call finish() before onResume runs,
+        // or Android 12+ throws BadTokenException. Keep all work in onCreate
+        // synchronous (no async start, no awaits) and finish() at the very end.
         try {
             val svc = Intent(this, LlmService::class.java)
             if (Build.VERSION.SDK_INT >= 26) {

@@ -126,6 +126,10 @@ TOTAL_MS=""
 TOKENS=""
 DECODE_TPS=""
 
+# Pipe rather than heredoc: a heredoc with `<< RAWEOF / $RAW / RAWEOF` would
+# silently truncate output if the model's reply ever contained a line that read
+# exactly RAWEOF on its own. Piping is immune to that and also avoids the
+# unquoted-expansion subtleties of `done << RAWEOF`.
 while IFS= read -r line; do
     case "$line" in
         BenchmarkInfo:*)
@@ -145,9 +149,9 @@ ${line}"
             fi
             ;;
     esac
-done << RAWEOF
-$RAW
-RAWEOF
+done <<EOF
+$(printf '%s\n' "$RAW")
+EOF
 
 RESPONSE=$(printf '%s' "$RESPONSE" | sed -e '/./,$!d' -e 's/[[:space:]]*$//')
 

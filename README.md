@@ -1,25 +1,32 @@
 # temux_llm — local LLM on Android, ollama-style
 
-[![build](https://github.com/iml1s/temux_llm/actions/workflows/build.yml/badge.svg)](https://github.com/iml1s/temux_llm/actions/workflows/build.yml)
-[![release](https://img.shields.io/github/v/release/iml1s/temux_llm?include_prereleases)](https://github.com/iml1s/temux_llm/releases)
+[![build](https://github.com/ImL1s/temux_llm/actions/workflows/build.yml/badge.svg)](https://github.com/ImL1s/temux_llm/actions/workflows/build.yml)
+[![release](https://img.shields.io/github/v/release/ImL1s/temux_llm?include_prereleases)](https://github.com/ImL1s/temux_llm/releases)
 [![license](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
 [![android](https://img.shields.io/badge/android-13%2B-3DDC84?logo=android&logoColor=white)](https://developer.android.com/about/versions/13)
 [![runtime](https://img.shields.io/badge/runtime-LiteRT--LM%200.11.0--rc1-yellow)](https://github.com/google-ai-edge/LiteRT-LM)
 
 A self-contained Android app + Termux client that runs Google's **Gemma 4** (or
-Qwen3) on your phone's GPU and exposes it as `http://127.0.0.1:11434/api/generate`.
+Qwen3) on your phone and exposes it as `http://127.0.0.1:11434/api/generate`.
 No network. No cloud. No data leaves the device.
 
 ```
-$ litertlm "用一句繁體中文介紹自己。"
-我是一個由 Google DeepMind 開發的開放權重大型語言模型，名叫 Gemma 4。
+$ litertlm "Reply with just: hi."
+hi.
 
-[gpu  ttft=0.5s  prefill=40.3t/s  decode=19.2t/s]
+[cpu  total=4918ms  tokens=61  decode=12.4 t/s]
 ```
 
-Tested on **Galaxy S21+** (SD 888 / Adreno 660 / Android 15) and **Galaxy S25**
-(SD 8 Elite / Adreno 830 / Android 16). Should work on any arm64-v8a Android 13+
-flagship, including **Galaxy Z Fold7**.
+Tested on **Galaxy S21+** (SD 888, Android 15), **Galaxy S24 Ultra** (SD 8 Gen 3,
+Android 16), and **Galaxy S25** (SD 8 Elite, Android 16). Should work on any
+arm64-v8a Android 13+ device. See [device matrix](#device-matrix) for measured
+decode rates.
+
+> **Known issue (v0.1.x):** GPU acceleration is currently regressed on all
+> tested devices — LiteRT-LM 0.11.0-rc1 fails to load OpenCL via
+> `libvndksupport.so` and the OpenGL fallback returns
+> `UNIMPLEMENTED: CreateSharedMemoryManager`. The service therefore
+> defaults to **CPU**. See [Known issues](#known-issues) for details.
 
 ---
 
@@ -95,7 +102,7 @@ litertlm-native --help
 | | APK path (`install.sh`) | Native path (`install-termux-native.sh`) |
 |---|---|---|
 | Latency per call | sub-second (model resident) | 1-7 s warm / 12-60 s cold |
-| Requires USB + host | yes (one-time) | no |
+| Requires USB cable + host | yes (one-time, for sideload) | no |
 | Requires sideloading APK | yes | no |
 | Best for | interactive chat, scripts | occasional / batch use |
 
@@ -107,27 +114,30 @@ Both paths use the same v0.11.0-rc.1 binary and the same models.
 ## What it ships
 
 ```
-scripts/install.sh                one-shot installer (above)
-scripts/fetch_artifacts.sh        sha256-verified host downloader
-scripts/litertlm-termux-wrapper.sh  the Termux client (deployed to /data/local/tmp/bin/litertlm)
-scripts/preflight.sh              host + device readiness probe
-scripts/setup_litertlm_android.sh manual push (used by install.sh)
-scripts/run_{cpu,gpu}_smoke.sh    raw adb-shell smokes (skip APK)
-scripts/run_litertlm_benchmark.sh long-prompt benchmark
-scripts/parse_litertlm_logs.sh    extract BenchmarkInfo to logs/summary.txt
-scripts/sha256_manifest.txt       7 pinned hashes for binary + .so + model
+scripts/install.sh                  one-shot installer (above)
+scripts/install-termux-native.sh    Termux-only installer (no APK)
+scripts/litertlm-native-wrapper.sh  source for the Termux-native CLI wrapper
+scripts/fetch_artifacts.sh          sha256-verified host downloader
+scripts/litertlm-termux-wrapper.sh  Termux client for the APK service
+scripts/preflight.sh                host + device readiness probe
+scripts/setup_litertlm_android.sh   manual push (used by install.sh)
+scripts/run_{cpu,gpu}_smoke.sh      raw adb-shell smokes (skip APK)
+scripts/run_litertlm_benchmark.sh   long-prompt benchmark
+scripts/parse_litertlm_logs.sh      extract BenchmarkInfo to logs/summary.txt
+scripts/sha256_manifest.txt         pinned hashes for binary + .so + models
 
-android/                          Android Studio project (Kotlin)
+android/                            Android Studio project (Kotlin)
   app/src/main/kotlin/dev/temuxllm/
-    LlmService.kt                 foreground service
-    HttpServer.kt                 NanoHTTPD on 127.0.0.1:11434
-    LiteRtLmRunner.kt             ProcessBuilder wrapper around the CLI binary
-    _lib.sh                       shared shell validation helpers
+    LlmService.kt                   foreground service holding the engine
+    LlmEngine.kt                    in-process Engine + Conversation wrapper
+    HttpServer.kt                   NanoHTTPD on 127.0.0.1:11434
+    LauncherActivity.kt             tappable icon → starts service, finishes
+    BootReceiver.kt                 auto-start on BOOT_COMPLETED
 
-docs/specs/                       phase-2 architecture spec
-docs/plans/                       phase-1 + phase-2a implementation plans
-docs/findings-*.md                test results with real numbers per device
-docs/screenshots/                 phone-screen captures of Termux running it
+docs/specs/                         phase-2 architecture spec
+docs/plans/                         implementation plans (phase-1 / phase-2a)
+docs/findings-*.md                  test results with real numbers per device
+docs/screenshots/                   phone-screen captures of Termux running it
 ```
 
 ---
@@ -136,22 +146,32 @@ docs/screenshots/                 phone-screen captures of Termux running it
 
 ```
 GET  /healthz       -> "ok"
-GET  /api/version   -> {service, phase, binary, default_backend, model_path, ...}
+GET  /api/version   -> {service, phase, runtime, default_backend,
+                        model_path, source_model_path, engine_loaded}
 GET  /api/tags      -> {models: [{name, path, size_bytes}, ...]}
-POST /api/generate  -> {response, exit_code, ttft_seconds, prefill_tokens_per_sec,
-                        decode_tokens_per_sec, total_duration_ms, ...}
+POST /api/generate  -> NDJSON stream of {response, done} (or one JSON if stream=false)
 ```
 
-`/api/generate` body:
+`/api/generate` request body:
 
 ```json
 {
-  "prompt":   "Hi",
-  "backend":  "cpu" | "gpu",
-  "model_path": "/optional/override.litertlm",
-  "timeout_ms": 120000
+  "prompt":  "Hi",
+  "backend": "cpu" | "gpu",   // default: "cpu"
+  "stream":  true             // default: true (NDJSON one-line-per-token)
 }
 ```
+
+Streaming response: one JSON object per line (`application/x-ndjson`):
+
+```
+{"response":"Hi","done":false}
+{"response":"!","done":false}
+{"response":"","done":true,"backend":"cpu","total_duration_ms":820,"output_tokens":2,"output_chars":3}
+```
+
+Non-streaming (`stream=false`) returns one document with `model`, `backend`,
+`response`, `done`, `total_duration_ms`, `output_tokens`.
 
 The service binds only to `127.0.0.1`. Verified after every restart with
 `ss -tnlp | grep 11434` showing `[::ffff:127.0.0.1]:11434` (never `0.0.0.0`).
@@ -167,25 +187,66 @@ The service binds only to `127.0.0.1`. Verified after every restart with
 
 ---
 
-## Performance reference (Qwen3-0.6B, 16-token prompt)
+## Device matrix
 
-| | TTFT | Prefill | Decode | Init Total |
-|---|---|---|---|---|
-| S21+ CPU (cold) | 0.68 s | 25.6 t/s | 17.9 t/s | 1.78 s |
-| S21+ GPU (cold) | 0.24 s | 79.2 t/s | 26.0 t/s | 10.7 s |
-| S25 CPU (warm) | 0.62 s | 27.8 t/s | 18.2 t/s | 0.55 s |
-| S25 GPU (warm) | 0.21 s | 86.4 t/s | 27.1 t/s | 9.4 s |
+CPU decode rates measured with `gemma-4-E2B-it` and `gemma-4-E4B-it`,
+50-word output prompt, warm engine (cold init dropped), in-process Engine
+via the APK service.
 
-Performance reference (gemma-4-E2B, "Reply with just: hi."):
+| Device | SoC | Android | RAM | E2B CPU | E4B CPU |
+|---|---|---|---|---|---|
+| Galaxy S21+ | SD 888 (SM8350) | 15 | 8 GB | 8.0 t/s | 4.1 t/s |
+| Galaxy S24 Ultra | SD 8 Gen 3 (SM8650) | 16 | 12 GB | 10.3 t/s | 5.7 t/s |
+| Galaxy S25 | SD 8 Elite (SM8750) | 16 | 12 GB | 12.4 t/s | 7.8 t/s |
+| Galaxy Note 9 | Exynos 9810 | 10 | 6 GB | unsupported (minSdk=33 / Android 13+) | — |
 
-| | TTFT | Prefill | Decode |
-|---|---|---|---|
-| S21+ CPU | 1.45 s | 11.1 t/s | 10.2 t/s |
-| S21+ GPU | 0.42 s | 39.7 t/s | 24.7 t/s |
-
-GPU init pays a ~10-15 s OpenCL kernel-compile cost on first run; subsequent runs
-reuse the cache (it persists in the app's filesDir). CPU first-run init pays
+`decode = output_tokens / (total_duration_ms / 1000)` end-to-end (includes
+prefill within the warm window). First call after service start pays
 ~3-7 s rebuilding the XNNPack weight cache; warm init drops to ~0.5-0.8 s.
+
+GPU rows are intentionally omitted — see Known issues below.
+
+---
+
+## Known issues
+
+### GPU acceleration regressed in LiteRT-LM 0.11.0-rc1 (v0.1.x)
+
+On every device tested (S21+ Android 15, S24 Ultra Android 16, S25 Android 16),
+selecting `backend: "gpu"` fails with:
+
+```
+INTERNAL: ERROR: [.../llm_litert_compiled_model_executor.cc:1928]
+└ ERROR: [./third_party/odml/litert/litert/cc/litert_compiled_model.h:1780]
+```
+
+Logcat shows the SDK trying to load OpenCL via `libvndksupport.so`:
+
+```
+ml_drift_cl_gl_accelerator.cc:126  OpenCL not supported on this platform. Using OpenGL instead.
+tflite                              Failed to load OpenCL library with dlopen:
+                                    dlopen failed: library "libvndksupport.so" not found.
+delegate_opengl.cc:218              UNIMPLEMENTED: CreateSharedMemoryManager is not implemented.
+```
+
+The OpenCL → OpenGL fallback path in 0.11.0-rc1 is incomplete on Android
+14/15/16 untrusted_app linker namespaces. This is upstream — not something
+this project introduced — and will be fixed when LiteRT-LM picks up the
+shared-memory implementation.
+
+**Workaround:** run on CPU (which is the default since v0.1.1):
+
+```bash
+curl -s http://127.0.0.1:11434/api/generate \
+  -H 'Content-Type: application/json' \
+  -d '{"prompt":"hi","backend":"cpu","stream":false}'
+```
+
+### Note 9 / Android < 13
+
+`minSdk=33` (Android 13). Older devices like Galaxy Note 9 (Android 10) reject
+the APK install with `INSTALL_FAILED_OLDER_SDK`. There is no plan to lower the
+floor — the LiteRT-LM SDK targets API 33+.
 
 ---
 

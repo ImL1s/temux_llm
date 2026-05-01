@@ -63,7 +63,7 @@ Free-space gate: `MIN_TMP_FREE_MB=3000` (~456 MiB safety vs 2,544 MiB artifact f
 **Step 0.1: Init repo**
 
 ```bash
-cd /Users/setsuna-new/Documents/temux_llm
+cd <repo>
 git init -b main
 ```
 

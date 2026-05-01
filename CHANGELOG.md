@@ -9,6 +9,49 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 (no unreleased changes)
 
+## [0.1.1] — 2026-05-01
+
+Open-source polish + honest device matrix. No new features.
+
+### Added
+- `BootReceiver` auto-starts the foreground service on `BOOT_COMPLETED`
+  (post-first-launch only, per Android delivery rules).
+- `LauncherActivity` (Theme.NoDisplay) — tappable temuxllm icon starts the
+  service and finishes immediately, with a confirmation toast.
+- Termux-native install path (`scripts/install-termux-native.sh` +
+  `scripts/litertlm-native-wrapper.sh`): no APK, no USB, no host machine —
+  the LiteRT-LM CLI binary runs directly inside Termux. Trades per-call
+  load time for zero APK dependency.
+- Device matrix in README covering S21+, S24 Ultra, S25, and Note 9 with
+  measured CPU decode rates for both `gemma-4-E2B` and `gemma-4-E4B`.
+
+### Changed
+- Default backend is now **`cpu`** (was `gpu`) — see Known issues below.
+  Per-request `backend` override still works.
+- README rewritten for accuracy: removed stale GPU performance reference,
+  fixed source file list (`LlmEngine.kt` / `HttpServer.kt` / `LauncherActivity.kt`
+  / `BootReceiver.kt`), and corrected `/api/generate` body schema (only
+  `prompt`, `backend`, `stream` are accepted; `model_path` and `timeout_ms`
+  were never wired through).
+- `install-termux-native.sh` `e4b` model path is now sha256-pinned at HF
+  commit `55b6eef9e490da991fe6bc5fec1834106927b727` (was `/resolve/main/`
+  + size-only check).
+- `install-termux-native.sh` embedded wrapper output parser switched from
+  the `<< RAWEOF` heredoc to a piped `printf` to make output-line collisions
+  with the heredoc terminator impossible.
+
+### Known issues
+- **GPU acceleration is regressed** on every device tested
+  (S21+ Android 15, S24 Ultra Android 16, S25 Android 16). Logcat shows
+  `ml_drift_cl_gl_accelerator: OpenCL not supported` →
+  `dlopen libvndksupport.so failed` → OpenGL fallback returns
+  `UNIMPLEMENTED: CreateSharedMemoryManager`. The break is upstream in
+  LiteRT-LM 0.11.0-rc1's OpenCL → OpenGL fallback path under Android
+  14/15/16 untrusted_app linker namespaces; this project did not
+  introduce it. Workaround: use CPU (which is now the default).
+
+## [0.1.0] — 2026-05-01
+
 ## [0.1.0] — 2026-05-01
 
 First open-source-ready release.
@@ -51,5 +94,6 @@ First open-source-ready release.
 - Gemma-4-E4B works on CPU only on S21+ (decode 0.5 t/s — too slow to
   be interactive). Use Gemma-4-E2B on phones with ≤8 GB RAM.
 
-[Unreleased]: https://github.com/iml1s/temux_llm/compare/v0.1.0...HEAD
-[0.1.0]: https://github.com/iml1s/temux_llm/releases/tag/v0.1.0
+[Unreleased]: https://github.com/ImL1s/temux_llm/compare/v0.1.1...HEAD
+[0.1.1]: https://github.com/ImL1s/temux_llm/compare/v0.1.0...v0.1.1
+[0.1.0]: https://github.com/ImL1s/temux_llm/releases/tag/v0.1.0

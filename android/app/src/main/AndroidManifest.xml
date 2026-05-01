@@ -22,18 +22,17 @@
             </intent-filter>
         </service>
 
-        <!-- Auto-start the LLM service after device reboot. We register both
-             the locked- and unlocked-boot intents because we run as a Direct
-             Boot-aware service is *not* needed (we use the user's data dir),
-             so we wait for BOOT_COMPLETED. exported=true is required for the
-             system to deliver the broadcast. -->
+        <!-- Auto-start the LLM service after device reboot. The service does
+             not need Direct Boot awareness (it uses the user's CE data dir),
+             so we register only ACTION_BOOT_COMPLETED, which is delivered after
+             the user unlocks the device for the first time post-reboot.
+             exported=true is required for the system to deliver the broadcast. -->
         <receiver
             android:name=".BootReceiver"
             android:exported="true"
             android:enabled="true">
             <intent-filter>
                 <action android:name="android.intent.action.BOOT_COMPLETED" />
-                <action android:name="android.intent.action.QUICKBOOT_POWERON" />
             </intent-filter>
         </receiver>
 

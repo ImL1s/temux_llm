@@ -12,9 +12,9 @@
 
 ## Confirmed Constraints
 
-- Project root: `/Users/setsuna-new/Documents/temux_llm`
+- Project root: `<repo>` (the cloned repository root)
 - New subdirectory: `android/`
-- ANDROID_HOME: `/Users/setsuna-new/development/android-sdk` (already set up)
+- ANDROID_HOME: `<your-android-sdk-path>` (already set up)
 - Test device for install: S25 (`RFCY71LAFYE`, Android 16)
 - Bind: **must** be `127.0.0.1`, never `0.0.0.0`. Verified via NanoHTTPD constructor (`new NanoHTTPD("127.0.0.1", 11434)`).
 - Port: 11434 (matches Ollama default for client compat).
@@ -40,7 +40,7 @@
 
 **Step 1.1: Settings and root build files** — declare AGP, Kotlin, repos. Define `:app` subproject.
 
-**Step 1.2: `local.properties` with `sdk.dir` pointing to `/Users/setsuna-new/development/android-sdk`.** Append `android/local.properties` to `.gitignore`.
+**Step 1.2: `local.properties` with `sdk.dir` pointing to `<your-android-sdk-path>`.** Append `android/local.properties` to `.gitignore`.
 
 **Step 1.3: Run `gradle wrapper --gradle-version 8.10` to bootstrap `gradlew`.** (Or write the wrapper files manually with curl from `https://services.gradle.org/distributions/gradle-8.10-bin.zip` resolution.) If host has no `gradle` binary, use the manual wrapper init: download `gradle-wrapper.jar` from a known version source.
 
