@@ -98,30 +98,44 @@ already so behavior is forward-compatible.
 - Single staged `.litertlm` model file.
 - No outbound traffic.
 
-#### Real-CLI compat: model context size matters
+#### Real-CLI compat: text-only inference, model-context bounded
 
-The protocol layer is fully verified by direct curl against every
-endpoint. End-to-end real-CLI use is bounded by the underlying
-model's context window, not by the HTTP layer:
+What works end-to-end (verified by direct curl on Galaxy S21+ / SD888 /
+Android 15):
 
-- Real **Claude Code** sends a ~16k-token built-in agent system prompt
-  on every request. Models with ≥17k context are needed for usable
-  sessions; the bundled Gemma 4 E2B/E4B (4096-token context) returns
-  `Input token ids are too long: 16xxx >= 4096` from LiteRT-LM and the
-  CLI surfaces this as "API returned an empty or malformed response".
-- Real **Codex CLI** (--oss + ollama provider) sends a ~8k-token
-  agent prompt — also above 4k. Same overflow behavior.
-- **OpenCode / OpenClaw** typically have smaller defaults; mileage
-  varies per agent config.
-- **Direct curl / programmatic clients** with short prompts work
-  end-to-end against all four envelopes (verified on Galaxy S21+ /
-  SD888 / Android 15).
+- All four envelope **text streams** (Anthropic SSE, OpenAI Chat SSE,
+  OpenAI Responses SSE, Ollama NDJSON) emit well-formed bytes under
+  success and error paths. SSE event names, `data: [DONE]` terminators,
+  `sequence_number` fields, and clean error-only frames are correct.
+- Probes (`/api/version`, `/api/tags`, `/v1/models`, `/api/show`,
+  `/api/ps`, `/api/pull` stub, `GET /`) match what Claude Code 2.1 and
+  Codex CLI 0.125 require — both pass discovery and reach inference.
+- Model resolution accepts wildcard / branded / family-prefix names.
+- Backward compat: existing v0.2.x `/api/generate` clients keep working.
 
-If you need real-CLI agent loops on-device, plan for a model with
-larger context. Streaming framing, error-event recovery, model-name
-aliasing, and `/api/version` / `/api/pull` / `/v1/models` probes that
-the CLIs run before chat all pass on the bundled models — only the
-final inference call is gated by context capacity.
+What does NOT work end-to-end in v0.3.0:
+
+- **Tool calling.** No tool_use / tool_call / function_call streaming
+  translation between LiteRT-LM and any envelope. CLIs that run agent
+  loops (Claude Code, Codex, OpenCode in agent mode) advertise tools
+  but the model never emits parseable tool calls back to them. Plain
+  chat round-trips work; tool calls do not. Deferred to a follow-up.
+- **Multi-turn agent loops with model-context overflow.** Real
+  **Claude Code** sends a ~16k-token built-in agent system prompt;
+  real **Codex CLI** (`--oss`) sends ~8k. The bundled Gemma 4 E2B/E4B
+  models have 4096-token context, so both CLIs fail at the inference
+  call with `Input token ids are too long: NNNN >= 4096` from
+  LiteRT-LM. Use a larger-context model on disk if you need real
+  agent-loop sessions on-device.
+- **Image inputs.** `image_url` and base64 image content blocks return
+  HTTP 400 "image content is not supported on this model".
+
+The bottom line: this release ships a working Ollama-compatible
+**text-streaming** server. Direct curl, scripts, and small-prompt
+programmatic clients work today. Real-CLI agent loops need both a
+larger-context model AND a follow-up release that wires LiteRT-LM
+0.11's `ConversationConfig.tools` parser into the per-envelope
+encoders.
 
 ## [0.2.0] — 2026-05-01
 

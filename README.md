@@ -139,14 +139,24 @@ codex --oss -c model="gemma-4-E2B-it"
 opencode
 ```
 
-### Tool calling — not yet supported
+### What works in v0.3.0 vs what doesn't
 
-`/api/show` reports `capabilities: ["completion"]` only. CLIs that ask
-for tool calling will fall back to plain chat. Gemma 4 has native
-`<|tool_call>...<tool_call|>` tokens and LiteRT-LM 0.11 has the
-parser, but the end-to-end translation through each envelope is not
-wired in v0.3.0 — that's a follow-up release once we have an on-device
-probe verifying round-trip across all four wire formats.
+**Works:** plain text streaming round-trips on all four envelopes,
+backward-compat with v0.2.x `/api/generate`, the launcher CLI, every
+probe each target CLI runs before chat.
+
+**Does NOT work:**
+
+- **Agent loops.** Real Claude Code (~16k system prompt) and real
+  Codex CLI (~8k) both exceed Gemma 4 E2B/E4B's 4096-token context.
+  Use a larger-context model if you need agent sessions on-device.
+- **Tool calling.** `/api/show` advertises `capabilities:["completion"]`
+  only; we don't translate tool / function-call streaming events
+  through any envelope yet. Plain chat works; agent tool calls don't.
+- **Image inputs.** Image / image_url / input_image content blocks
+  return HTTP 400.
+
+Direct curl with short prompts works perfectly today.
 
 ---
 

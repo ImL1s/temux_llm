@@ -113,13 +113,21 @@ not honored (matches Ollama's stateless Responses behavior).
 - **No image inputs.** `image_url` and base64 image content blocks return
   HTTP 400 "image content is not supported on this model".
 - **Tool calling is not implemented in v0.3.0.** `/api/show` reports
-  `capabilities: ["completion"]` only. CLIs that depend on tools fall
-  back to plain chat. The runtime substrate (Gemma 4 native
-  `<|tool_call>` tokens + LiteRT-LM 0.11 `ConversationConfig.tools`) is
-  ready, but the per-envelope translator (OpenAI `tool_calls`,
-  Anthropic `tool_use`, Ollama `tool_calls`) is deferred to a follow-up
-  release. The `TEMUXLLM_NO_TOOLS=1` env-var gate is wired so behavior
-  remains forward-compatible.
+  `capabilities: ["completion"]` only. Tool / function-call streaming
+  events are NOT translated into any envelope. CLIs that run agent
+  loops (Claude Code, Codex, OpenCode in agent mode) advertise tools
+  but never receive parseable tool-call frames from us. Plain chat
+  round-trips work; agent loops do not. The runtime substrate (Gemma 4
+  native `<|tool_call>` tokens + LiteRT-LM 0.11
+  `ConversationConfig.tools`) is ready; the per-envelope translator
+  is the deferred work. `TEMUXLLM_NO_TOOLS=1` env var is wired
+  forward-compatibly.
+- **Model context size.** Real Claude Code sends a ~16k-token built-in
+  agent system prompt, real Codex CLI (`--oss`) sends ~8k. The bundled
+  Gemma 4 E2B/E4B models have 4096-token context. Both CLIs fail at
+  the inference call with `Input token ids are too long: NNNN >= 4096`.
+  Use a larger-context model on disk if you need agent-loop sessions
+  on-device. Direct curl with short prompts works fine.
 - **Gemini CLI is not native.** Use LiteLLM as a bridge:
   ```sh
   pip install 'litellm[proxy]'

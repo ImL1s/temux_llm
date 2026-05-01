@@ -112,13 +112,23 @@ scripts/temuxllm launch codex --model gemma-4-E2B-it
 完整 endpoint 對照與 wire format 細節：
 [`docs/ollama-compat.md`](docs/ollama-compat.md)。
 
-### Tool calling — 此版本尚未支援
+### v0.3.0 work / 不 work 範圍
 
-`/api/show` 回傳 `capabilities: ["completion"]`，不廣告 `tools`。需要
-tool calling 的 CLI 會降級成純 chat。Gemma 4 有原生
-`<|tool_call>...<tool_call|>` token，LiteRT-LM 0.11 也有 parser，但
-四種 wire format 的 end-to-end translation 在 v0.3.0 還沒接通；要等
-有實機 probe 驗過 round-trip 才會 ship。
+**會 work**：四種 envelope 的純文字 streaming round-trip、跟 v0.2.x
+`/api/generate` 的相容性、launcher CLI、各 CLI 進 chat 前的所有 probe。
+
+**不 work**：
+
+- **Agent loop**。Claude Code 內建 ~16k token system prompt、Codex CLI
+  ~8k，Gemma 4 E2B/E4B 只 4096 token context — 兩個都會在 inference
+  call 炸 `Input token ids are too long`。要 agent 需要 context 更大
+  的 model。
+- **Tool calling**。`/api/show` 只回 `["completion"]`，envelope 之間的
+  tool / function call 翻譯沒接。純 chat round-trip 沒問題，agent 的
+  tool 呼叫不會 work。
+- **Image input**。`image_url` / image content block 一律回 400。
+
+短 prompt 用 curl 直接打目前完全 OK。
 
 ---
 

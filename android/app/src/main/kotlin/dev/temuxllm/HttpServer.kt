@@ -68,6 +68,9 @@ class HttpServer(
             session.uri == "/api/version" && session.method == Method.GET ->
                 json(Response.Status.OK, versionPayload())
 
+            session.uri == "/api/temuxllm/info" && session.method == Method.GET ->
+                json(Response.Status.OK, debugInfoPayload())
+
             session.uri == "/api/tags" && session.method == Method.GET ->
                 json(Response.Status.OK, registry.ollamaTags())
 
@@ -126,11 +129,22 @@ class HttpServer(
     /* --------------------------------- Routes --------------------------------- */
 
     private fun versionPayload(): JSONObject = JSONObject().apply {
+        // Public probe — keep this lean. Filesystem paths moved to
+        // /api/temuxllm/info to match the no-path-exposure rationale we
+        // applied to /api/tags. Any local process can read this; only
+        // information that would aid privilege escalation got stripped.
         put("version", VERSION)
         put("service", "temuxllm")
         put("phase", "3a")
         put("runtime", "litertlm-android 0.11.0-rc1 (in-process Engine)")
         put("default_backend", "gpu")
+        put("engine_loaded", engine.isLoaded())
+    }
+
+    /** Non-public debug endpoint with paths — for `bash scripts/install.sh`. */
+    private fun debugInfoPayload(): JSONObject = JSONObject().apply {
+        put("version", VERSION)
+        put("service", "temuxllm")
         put("model_path", engine.activeModelPath().absolutePath)
         put("source_model_path", LlmEngine.SOURCE_MODEL_PATH)
         put("engine_loaded", engine.isLoaded())
@@ -269,25 +283,15 @@ class HttpServer(
             registry.resolve(requestedModel)
                 ?: return errorJson(Response.Status.NOT_FOUND, "model '$requestedModel' not found")
         }
-        // Responses API accepts either a string `input` or a messages-shaped array.
+        // /v1/responses `input` is heterogeneous — string, conversation array,
+        // or top-level Responses-item array (function_call, function_call_output,
+        // reasoning, etc.). Delegate to the dedicated Responses-shape flattener
+        // so Codex's agent loop with tool turns is parsed correctly.
         val input = body.opt("input")
         val instructions = body.optString("instructions").ifBlank { null }
-        val prompt: String = when {
-            input == null || input == JSONObject.NULL ->
-                return errorJson(Response.Status.BAD_REQUEST, "input is required")
-            input is String -> {
-                val sb = StringBuilder()
-                if (!instructions.isNullOrBlank()) sb.append("System: ").append(instructions).append("\n\n")
-                sb.append("User: ").append(input).append('\n').append("Assistant: ")
-                sb.toString()
-            }
-            input is JSONArray -> {
-                when (val r = ChatFormat.flatten(input, instructions)) {
-                    is ChatFormat.Result.Ok -> r.prompt
-                    is ChatFormat.Result.Bad -> return errorJson(Response.Status.BAD_REQUEST, r.message)
-                }
-            }
-            else -> input.toString()
+        val prompt: String = when (val r = ChatFormat.flattenResponsesInput(input, instructions)) {
+            is ChatFormat.Result.Ok -> r.prompt
+            is ChatFormat.Result.Bad -> return errorJson(Response.Status.BAD_REQUEST, r.message)
         }
         val backend = body.optString("backend", "gpu").lowercase()
         if (backend != "cpu" && backend != "gpu") {
@@ -550,12 +554,14 @@ class HttpServer(
     /** Sentinel returned by [readPostBodyAsUtf8] when Content-Length exceeds [MAX_BODY]. */
     private class BodyTooLarge : RuntimeException()
 
+    /**
+     * Returns the parsed JSON body, or null on a parse/missing-body failure
+     * (caller handles as 400). Propagates [BodyTooLarge] up to the outer
+     * `serve()` catch so the response can be a real 413, not a confusing
+     * 400 "invalid JSON body".
+     */
     private fun readJsonBody(session: IHTTPSession): JSONObject? {
-        val raw = try {
-            readPostBodyAsUtf8(session)
-        } catch (_: BodyTooLarge) {
-            return null
-        }
+        val raw = readPostBodyAsUtf8(session)
         if (raw.isBlank()) return JSONObject()
         return try { JSONObject(raw) } catch (_: Throwable) { null }
     }
