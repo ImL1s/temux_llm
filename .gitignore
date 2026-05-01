@@ -14,3 +14,4 @@ android/app/src/main/assets/
 android/build/
 android/app/src/main/jniLibs/
 .claude/
+.omc/
