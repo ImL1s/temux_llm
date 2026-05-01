@@ -1,5 +1,7 @@
 # temux_llm — local LLM on Android, ollama-style
 
+[English](README.md) · [繁體中文](README.zh-TW.md)
+
 [![build](https://github.com/ImL1s/temux_llm/actions/workflows/build.yml/badge.svg)](https://github.com/ImL1s/temux_llm/actions/workflows/build.yml)
 [![release](https://img.shields.io/github/v/release/ImL1s/temux_llm?include_prereleases)](https://github.com/ImL1s/temux_llm/releases)
 [![license](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
@@ -170,7 +172,7 @@ POST /api/generate  -> NDJSON stream of {response, done} (or one JSON if stream=
 ```json
 {
   "prompt":  "Hi",
-  "backend": "cpu" | "gpu",   // default: "cpu"
+  "backend": "cpu" | "gpu",   // default: "gpu"
   "stream":  true             // default: true (NDJSON one-line-per-token)
 }
 ```
@@ -180,7 +182,7 @@ Streaming response: one JSON object per line (`application/x-ndjson`):
 ```
 {"response":"Hi","done":false}
 {"response":"!","done":false}
-{"response":"","done":true,"backend":"cpu","total_duration_ms":820,"output_tokens":2,"output_chars":3}
+{"response":"","done":true,"backend":"gpu","total_duration_ms":820,"output_tokens":2,"output_chars":3}
 ```
 
 Non-streaming (`stream=false`) returns one document with `model`, `backend`,
