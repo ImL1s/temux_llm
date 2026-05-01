@@ -52,8 +52,6 @@ Open-source polish + honest device matrix. No new features.
 
 ## [0.1.0] — 2026-05-01
 
-## [0.1.0] — 2026-05-01
-
 First open-source-ready release.
 
 ### Added
