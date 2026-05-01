@@ -30,7 +30,12 @@ EOF
 
 while [ $# -gt 0 ]; do
   case "$1" in
-    --backend) BACKEND="${2-gpu}"; shift 2 ;;
+    --backend)
+      if [ $# -lt 2 ]; then
+        echo "error: --backend requires a value (cpu or gpu)" >&2
+        usage >&2; exit 2
+      fi
+      BACKEND="$2"; shift 2 ;;
     --json) JSON_OUT=1; shift ;;
     --help|-h) usage; exit 0 ;;
     --) shift; PROMPT="$*"; break ;;

@@ -3,20 +3,20 @@ package dev.temuxllm
 import android.content.Context
 import android.util.Log
 import fi.iki.elonen.NanoHTTPD
+import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
 
 /**
  * Localhost-only HTTP server. MUST bind to 127.0.0.1 (brief constraint #1).
  *
- * Phase 2b endpoints:
+ * Endpoints:
  *   GET  /healthz       -> 200 "ok"
  *   GET  /api/version   -> JSON describing the service
  *   GET  /api/tags      -> JSON listing models known to be on disk
  *   POST /api/generate  -> spawn litert_lm_main, return one JSON document with text + metrics
  *
- * /api/generate is non-streaming for the MVP (the v0.9.0 binary buffers output
- * until completion anyway). NDJSON streaming is Phase 2c.
+ * /api/generate is non-streaming: the v0.9.0 binary buffers stdout until completion.
  */
 class HttpServer(private val context: Context) : NanoHTTPD(BIND, PORT) {
 
@@ -106,7 +106,7 @@ class HttpServer(private val context: Context) : NanoHTTPD(BIND, PORT) {
 
     private fun listModels(): JSONObject {
         val tags = JSONObject()
-        val arr = org.json.JSONArray()
+        val arr = JSONArray()
         // Active model lives in our app's filesDir; we also list any host-pushed
         // copy in /data/local/tmp/ for transparency.
         val candidates = listOf(

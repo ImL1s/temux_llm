@@ -7,19 +7,18 @@ import java.io.File
 /**
  * Wraps a subprocess call to the v0.9.0 litert_lm_main binary.
  *
- * The binary is shipped as `liblitert_lm_main.so` under `src/main/jniLibs/arm64-v8a/`,
- * so Android extracts it to `applicationInfo.nativeLibraryDir` at install time. This
+ * The binary ships as `liblitert_lm_main.so` under `src/main/jniLibs/arm64-v8a/`, so
+ * Android extracts it to `applicationInfo.nativeLibraryDir` at install time. That
  * directory has mode 0555 and *permits execve from the app sandbox*, unlike `filesDir`
  * which is rejected with EPERM under Android 10+ W^X. The 6 LiteRT-LM `.so` accelerators
- * live alongside it in the same directory and are reachable via LD_LIBRARY_PATH.
+ * live alongside it and are reachable via LD_LIBRARY_PATH.
  *
- * The model file is read from /data/local/tmp/litertlm/model.litertlm by default
- * (push it from host with scripts/setup_litertlm_android.sh first). Override via
- * the model_path field on each /api/generate request.
+ * The model is staged from `/data/local/tmp/litertlm/model.litertlm` (host-side push)
+ * into our app's filesDir on first use; see [ensureModelStaged]. Callers may override
+ * via the model_path field on each /api/generate request.
  *
- * The v0.9.0 binary auto-prints a "BenchmarkInfo:" block; we parse it from stdout
- * along with the generated text (which sits between "input_prompt:" and
- * "BenchmarkInfo:" in the captured stream).
+ * The binary auto-prints a "BenchmarkInfo:" block; [parseStdout] extracts both the
+ * generated text (between "input_prompt:" and "BenchmarkInfo:") and the numeric metrics.
  */
 class LiteRtLmRunner(private val context: Context) {
 
@@ -29,13 +28,11 @@ class LiteRtLmRunner(private val context: Context) {
         // Source location pushed by host-side scripts/setup_litertlm_android.sh.
         const val SOURCE_MODEL_PATH = "/data/local/tmp/litertlm/model.litertlm"
 
-        // Active model path lives inside our app's filesDir so the binary's
-        // XNNPack weight-cache + OpenCL kernel-cache files (which it writes next
-        // to the model) can actually persist. SELinux denies untrusted_app writes
-        // to /data/local/tmp (shell_data_file), so caching there silently fails
-        // and every /api/generate would pay the full cold-start init cost.
-        // We compute this lazily because we need a Context to resolve filesDir.
-        // See [activeModelPath].
+        // The active model path must live inside our app's filesDir so the binary's
+        // XNNPack weight cache + OpenCL kernel cache (written next to the model) can
+        // persist. SELinux denies untrusted_app writes to /data/local/tmp
+        // (shell_data_file), so caching there silently fails and every /api/generate
+        // would pay full cold-start init. See [activeModelPath].
 
         const val DEFAULT_TIMEOUT_MS = 120_000L
 
@@ -149,8 +146,7 @@ class LiteRtLmRunner(private val context: Context) {
         val stdoutLines = mutableListOf<String>()
         val reader = process.inputStream.bufferedReader()
 
-        // Drain stdout line by line on a worker thread. Streaming on top of this
-        // is Phase 2c.
+        // Drain stdout on a worker thread so waitFor and the reader don't deadlock.
         val drainerThread = Thread({
             try {
                 while (true) {
