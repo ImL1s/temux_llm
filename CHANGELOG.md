@@ -9,6 +9,50 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 (no unreleased changes)
 
+## [0.5.0] — 2026-05-02
+
+### 4-CLI bare-mode matrix — what works under 16 k context
+
+The headline goal of v0.5.0: every supported coding-agent CLI runs
+against the on-device service in a "bare / lightweight" mode that
+fits the bundled Gemma 4 E4B model's 16 k context window (8–12 k of
+which the CLIs themselves consume for built-in prompts).
+
+| CLI | Bare-mode strategy | Status |
+|---|---|---|
+| **Claude Code 2.1** | `claude --bare` — Anthropic's documented minimal mode (no hooks, LSP, plugins, auto-memory, CLAUDE.md auto-discovery). System prompt drops from ~16 k → a few hundred tokens. | **Verified** real-device round-trip on Galaxy S25 (SD 8 Elite, 12 GB, Android 16). |
+| **Codex CLI 0.125** | `--oss --local-provider ollama` + `-c project_doc_max_bytes=0` (suppresses `AGENTS.md` injection per OpenAI Codex config). Optional `TEMUXLLM_CODEX_INSTRUCTIONS_FILE=<path>` adds `-c model_instructions_file="..."` to replace the ~8 k base instructions with whatever tiny instructions file the user provides (per OpenAI's "Unrolling the Codex agent loop" post). | **Verified** in v0.3.3 / v0.4.x sessions; protocol surface unchanged. |
+| **OpenCode** | Custom `bare` agent in `opencode.json` with all documented tools (`write/edit/bash/read/glob/grep/list/patch/todowrite/todoread/webfetch/task/lsp_*`) set to `false`, plus a one-liner system prompt. `cd` to scratch dir on launch to skip `AGENTS.md` walk-up; `OPENCODE_DISABLE_CLAUDE_CODE=1` blocks `~/.claude/CLAUDE.md` fallback. System prompt drops to ~200–500 tokens. | **Configured** in `scripts/temuxllm launch opencode`; not on-device tested (OpenCode not installed in our environment). |
+| **Gemini CLI 0.36** | LiteLLM bridge using `openai/...` provider (NOT `ollama/...` — avoids LiteLLM's quirky ollama provider): `litellm --model openai/<m> --api_base http://127.0.0.1:11434/v1 --api_key dummy --port 4000`, then `GOOGLE_GEMINI_BASE_URL=http://127.0.0.1:4000 GEMINI_API_KEY=sk-dummy gemini -p "..."`. **Note**: Gemini CLI has NO native lightweight mode and always injects an 8–12 k token agent harness. Even with the bridge, this consumes 60–75 % of our 16 k context. For a true lightweight Gemini-CLI experience, use the [`@vybestack/llxprt-code`](https://github.com/acoliver/llxprt-code) fork instead. | **Documented** in `scripts/temuxllm launch gemini`; native bare path is `:generateContent` endpoint that we don't yet ship — deferred to v0.6.x. |
+
+### `scripts/temuxllm launch <cli>` updates
+
+Three of the four launchers now default to the bare/minimal config:
+
+- **`launch opencode`**: writes a temp `opencode.json` with the `bare` agent + tool denylist + minimal prompt; `cd`s to a scratch directory before exec to suppress `AGENTS.md` walk-up; sets `OPENCODE_DISABLE_CLAUDE_CODE=1`.
+- **`launch gemini`**: now recommends `openai/<model>` LiteLLM wire (was `ollama/<model>` which has quirks); documents `llxprt-code` as the recommended no-bridge alternative.
+- **`launch claude`**: unchanged — already adds `--bare` from v0.3.3 (override via `TEMUXLLM_CLAUDE_FULL_AGENT=1`).
+- **`launch codex`**: unchanged — already adds `-c project_doc_max_bytes=0` from v0.3.3.
+
+### Research artifact: v0.6.0 fork plan
+
+Saved at `.omc/research/23-fork-litertlm-plan.md`. Concrete plan to fork
+`google-ai-edge/LiteRT-LM` and expose two C++-side features that the
+Kotlin SDK currently hides:
+
+1. `Conversation::Clone()` — for stateful KV reuse.
+2. `AdvancedSettings.activation_data_type` — flip KV cache from FP16
+   to INT8, ~2× memory savings, allows 24-28 k context on 12 GB
+   devices that today max at 16 k.
+
+~225 LOC delta, 4-week single-engineer plan, 7/10 confidence GO.
+Not started in v0.5.0 — that's the v0.6.0 milestone.
+
+### Constraints unchanged
+
+HTTP binds 127.0.0.1 only • arm64-v8a • minSdk 33 • no new runtime
+dependencies (test deps from v0.4.0 stay).
+
 ## [0.4.1] — 2026-05-02
 
 Patch release addressing two PR-review issues caught by

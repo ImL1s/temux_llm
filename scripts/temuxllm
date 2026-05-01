@@ -217,38 +217,72 @@ EOF
 launch_opencode() {
   local host="$1"; local model="$2"; local config_only="$3"; shift 3
   local cli="opencode"
-  # OpenCode reads providers from ~/.config/opencode/opencode.json. We do NOT
-  # silently mutate it; we either print the recommended block (config-only) or
-  # write to a temp dir scoped to this invocation via OPENCODE_CONFIG_PATH.
+  # OpenCode reads providers from ~/.config/opencode/opencode.json. We write
+  # a temp config scoped to this invocation via OPENCODE_CONFIG, with a
+  # custom "bare" agent that disables every documented tool and replaces
+  # the system prompt with a one-liner. This is the OpenCode equivalent of
+  # `claude --bare`: agent-loop framing + tool descriptions get stripped
+  # so the small on-device model has room for the user's prompt.
+  #
+  # Caveats (documented in `.omc/research/21-opencode-bare.md`):
+  #   - OpenCode walks UP from cwd looking for AGENTS.md / CLAUDE.md and
+  #     prepends those to the system prompt with no off-switch. We `cd`
+  #     to a scratch dir to avoid leaking the user's project context.
+  #   - OPENCODE_DISABLE_CLAUDE_CODE=1 suppresses the `~/.claude/CLAUDE.md`
+  #     fallback specifically.
   local cfg_block
   cfg_block=$(cat <<EOF
 {
   "\$schema": "https://opencode.ai/config.json",
   "provider": {
-    "ollama": {
+    "temuxllm": {
       "npm": "@ai-sdk/openai-compatible",
       "name": "temux_llm (local)",
       "options": { "baseURL": "$host/v1" },
       "models": { "$model": { "name": "$model" } }
+    }
+  },
+  "default_agent": "bare",
+  "agent": {
+    "bare": {
+      "description": "Minimal chat — no tools, terse prompt.",
+      "mode": "primary",
+      "model": "temuxllm/$model",
+      "prompt": "You are a helpful assistant. Reply concisely.",
+      "tools": {
+        "write": false, "edit": false, "bash": false, "read": false,
+        "glob": false, "grep": false, "list": false, "patch": false,
+        "todowrite": false, "todoread": false, "webfetch": false,
+        "task": false, "lsp_diagnostics": false, "lsp_hover": false
+      }
     }
   }
 }
 EOF
 )
   if [[ "$config_only" == "1" ]]; then
-    echo "# config snippet for: ~/.config/opencode/opencode.json"
+    echo "# bare-mode config snippet for: ~/.config/opencode/opencode.json"
     echo "$cfg_block"
+    echo
+    echo "# bare-mode invocation (cd to scratch to suppress AGENTS.md walk-up):"
+    echo "tmpd=\$(mktemp -d) && cd \"\$tmpd\" && \\"
+    echo "  OPENCODE_DISABLE_CLAUDE_CODE=1 OPENCODE_CONFIG=\"<path>\" opencode run \"\$@\""
     return 0
   fi
   command -v "$cli" >/dev/null 2>&1 || die "install OpenCode first: https://opencode.ai"
-  local cfgdir
+  local cfgdir scratch
   cfgdir=$(mktemp -d -t temuxllm-opencode.XXXXXX)
+  scratch=$(mktemp -d -t temuxllm-opencode-cwd.XXXXXX)
   echo "$cfg_block" > "$cfgdir/opencode.json"
-  log "launching opencode with config $cfgdir/opencode.json"
-  # Run as a foreground subprocess (NOT exec) so the trap fires and the temp
-  # dir gets cleaned up. Forward signals so Ctrl-C still works.
-  trap 'rm -rf "$cfgdir"' EXIT INT TERM
-  OPENCODE_CONFIG_PATH="$cfgdir/opencode.json" "$cli" "$@"
+  log "launching opencode (bare agent, tools off) cfg=$cfgdir/opencode.json cwd=$scratch"
+  # Foreground subprocess so trap fires for cleanup. cd to scratch dir to
+  # dodge AGENTS.md / CLAUDE.md walk-up that would otherwise re-bloat the
+  # system prompt.
+  trap 'rm -rf "$cfgdir" "$scratch"' EXIT INT TERM
+  ( cd "$scratch" && \
+    OPENCODE_DISABLE_CLAUDE_CODE=1 \
+    OPENCODE_CONFIG="$cfgdir/opencode.json" \
+    "$cli" "$@" )
 }
 
 launch_openclaw() {
@@ -285,22 +319,38 @@ EOF
 launch_gemini() {
   local host="$1"; local model="$2"; local config_only="$3"; shift 3
   local cli="gemini"
+  # Gemini CLI does NOT have a native bare/lightweight mode. Its agent
+  # harness (~8-12 k tokens) is always-on and there is no off-switch in
+  # stock CLI. The only bridge that works today is LiteLLM in OpenAI-
+  # compat mode, mapped via GOOGLE_GEMINI_BASE_URL. Caveat per
+  # `.omc/research/22-gemini-bare.md`: even with the bridge, Gemini CLI's
+  # built-in prompt eats 60-75 % of our 16 k context — small queries
+  # work, real coding sessions don't.
+  #
+  # Use OpenAI wire (`openai/...`), NOT `ollama/...`, in LiteLLM —
+  # avoids LiteLLM's ollama provider talking to /api/chat with quirks
+  # that don't match our HTTP server.
   cat >&2 <<EOF
-$PROG: Gemini CLI does not natively talk to Ollama. The recommended bridge is
-LiteLLM in OpenAI-compat mode, which Gemini CLI can reach via GOOGLE_GEMINI_BASE_URL:
+$PROG: Gemini CLI has no native bare mode. Only path is the LiteLLM bridge:
 
   pip install 'litellm[proxy]'
-  litellm --model ollama/$model --api_base $host --port 4000 &
+  litellm --model openai/$model --api_base $host/v1 --api_key dummy --port 4000 &
 
-  GOOGLE_GEMINI_BASE_URL=http://127.0.0.1:4000 gemini "\$@"
+  GOOGLE_GEMINI_BASE_URL=http://127.0.0.1:4000 GEMINI_API_KEY=sk-dummy \\
+    gemini -p "your prompt"
 
-We don't auto-spawn the bridge — it should be a deliberate choice on your host.
+Note: even with the bridge, Gemini CLI injects ~8-12 k tokens of agent
+prompt, leaving little context for your input on a 16 k-context model.
+For a true lightweight Gemini-CLI experience, consider the
+\`@vybestack/llxprt-code\` fork instead — it has provider/baseurl
+override commands without requiring LiteLLM.
 EOF
   if [[ "$config_only" == "1" ]]; then
     return 0
   fi
   command -v "$cli" >/dev/null 2>&1 || die "install Gemini CLI first: https://github.com/google-gemini/gemini-cli"
   GOOGLE_GEMINI_BASE_URL="${GOOGLE_GEMINI_BASE_URL:-http://127.0.0.1:4000}" \
+  GEMINI_API_KEY="${GEMINI_API_KEY:-sk-dummy}" \
     exec "$cli" "$@"
 }
 
