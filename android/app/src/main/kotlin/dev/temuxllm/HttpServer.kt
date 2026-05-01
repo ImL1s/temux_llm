@@ -64,9 +64,11 @@ class HttpServer(private val context: Context) : NanoHTTPD(BIND, PORT) {
     }
 
     private fun handleGenerate(session: IHTTPSession): Response {
-        val files = HashMap<String, String>()
-        session.parseBody(files)
-        val raw = files["postData"] ?: ""
+        // NanoHTTPD 2.3.1 parseBody decodes the raw POST bytes via the request's
+        // Content-Type charset, defaulting to ISO-8859-1 — which silently mangles
+        // any UTF-8 multi-byte sequence (e.g. CJK prompts). Bypass it: read the
+        // raw stream ourselves and decode as UTF-8.
+        val raw = readPostBodyAsUtf8(session)
         val body = if (raw.isBlank()) JSONObject() else JSONObject(raw)
         val prompt = body.optString("prompt").also {
             if (it.isBlank()) return errorJson(Response.Status.BAD_REQUEST, "prompt is required")
@@ -121,6 +123,29 @@ class HttpServer(private val context: Context) : NanoHTTPD(BIND, PORT) {
         }
         tags.put("models", arr)
         return tags
+    }
+
+    /**
+     * Read POST body bytes from the session input stream and decode as UTF-8 —
+     * regardless of whether the client supplied "; charset=utf-8" on Content-Type.
+     * NanoHTTPD's own `parseBody` defaults to ISO-8859-1 which corrupts CJK input.
+     *
+     * We honor an optional "Content-Length" to bound the read; if absent we cap at
+     * 4 MiB which is plenty for prompts.
+     */
+    private fun readPostBodyAsUtf8(session: IHTTPSession): String {
+        val cl = session.headers["content-length"]?.toIntOrNull()?.coerceAtLeast(0) ?: 0
+        val cap = 4 * 1024 * 1024
+        val limit = if (cl in 1..cap) cl else cap
+        val buf = ByteArray(limit)
+        var pos = 0
+        val ins = session.inputStream
+        while (pos < limit) {
+            val n = ins.read(buf, pos, limit - pos)
+            if (n <= 0) break
+            pos += n
+        }
+        return String(buf, 0, pos, Charsets.UTF_8)
     }
 
     private fun text(status: Response.Status, body: String): Response =
