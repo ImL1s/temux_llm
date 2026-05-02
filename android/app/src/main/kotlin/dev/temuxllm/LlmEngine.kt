@@ -400,11 +400,21 @@ class LlmEngine(private val context: Context) : LlmEngineApi {
                         }
                         val names = msg.toolCalls.map { it.name }
                         val args = msg.toolCalls.map { it.arguments }
+                        // v0.8.1 codex P1: was `.take(4096)` from when this
+                        // method was a probe-only diagnostic. v0.7.0
+                        // promoted it to the production path for tool-
+                        // enabled `/api/chat`, `/v1/chat/completions`,
+                        // `/v1/messages`, `/v1/responses` — at that point
+                        // the cap silently truncated long assistant
+                        // content (`read_file` results, snake-game-sized
+                        // outputs, etc). Drop the cap; rely on the SDK's
+                        // own KV-cache budget (maxNumTokens) to bound
+                        // size.
                         NativeToolsProbeResult(
                             backend = backend,
                             durationMs = System.currentTimeMillis() - started,
                             role = msg.role.toString(),
-                            rawText = msg.toString().take(4096),
+                            rawText = msg.toString(),
                             toolCallNames = names,
                             toolCallArgs = args,
                             error = null,

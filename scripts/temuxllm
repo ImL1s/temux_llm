@@ -62,6 +62,15 @@ is_termux() { [[ "${PREFIX:-}" == */com.termux/* ]] || [[ -d /data/data/com.term
 
 ensure_forward() {
   if is_termux; then return 0; fi
+  # v0.8.1 codex P2: skip adb-forwarding when the user pointed
+  # TEMUXLLM_HOST at a non-default endpoint (remote URL, ssh
+  # tunnel, alternate localhost port). Forwarding is only
+  # meaningful when we're going to talk to 127.0.0.1:11434 on
+  # this host. With TEMUXLLM_HOST set, the user has already
+  # arranged transport — don't fail their flow on missing adb.
+  if [[ -n "${TEMUXLLM_HOST:-}" && "$TEMUXLLM_HOST" != "http://127.0.0.1:11434" ]]; then
+    return 0
+  fi
   require adb
   local serial_arg=()
   if [[ -n "${DEVICE_SERIAL:-}" ]]; then

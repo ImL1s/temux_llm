@@ -95,10 +95,27 @@ object AutoFallback {
         // `description.contains("9")` produced false positives (any
         // description like "killed at 19:00" matched) and false
         // negatives (null / empty descriptions on stock AOSP).
-        val isLikelyLmk = r.reason == ApplicationExitInfo.REASON_LOW_MEMORY ||
-            (r.reason == ApplicationExitInfo.REASON_SIGNALED && r.status == 9)
-        if (!isLikelyLmk) return null
-        Log.i(TAG, "previous exit was LMK-class: ${r.reason} ${r.description}")
+        //
+        // v0.8.1 codex P2 (post-pass): SIGKILL alone over-matches —
+        // adb kill, ANR watchdog, user task-manager, OEM battery
+        // savers all use SIGKILL too. Persisting a smaller max_tokens
+        // after a non-LMK kill silently degrades model capacity. Add
+        // RSS gate: at LMK time the engine's KV cache + weights are
+        // resident, so RSS is typically 1-3 GB on Gemma 4 E4B. RSS
+        // below 500 MB means the engine wasn't loaded → not LMK
+        // pressure on this process; skip the downshift.
+        // ApplicationExitInfo.getRss() returns kilobytes.
+        val explicitLmk = r.reason == ApplicationExitInfo.REASON_LOW_MEMORY
+        val sigkillWithBigRss = r.reason == ApplicationExitInfo.REASON_SIGNALED &&
+            r.status == 9 &&
+            r.rss > 500_000L  // 500 MB in KB
+        if (!explicitLmk && !sigkillWithBigRss) {
+            if (r.reason == ApplicationExitInfo.REASON_SIGNALED && r.status == 9) {
+                Log.i(TAG, "previous exit was SIGKILL but RSS=${r.rss} KB < 500 MB — not LMK class, skipping downshift")
+            }
+            return null
+        }
+        Log.i(TAG, "previous exit was LMK-class: reason=${r.reason} rss=${r.rss}KB ${r.description}")
         return r.processStateSummary
     }
 

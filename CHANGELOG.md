@@ -9,6 +9,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 (no unreleased changes)
 
+## [0.8.1] — 2026-05-03
+
+Hot-fix release for the Codex GitHub-bot review of v0.8.0
+(`commit 95a2eee2d7`). Two of the bot's five findings were
+false positives (already-defended bug paths the bot didn't
+trace deeply enough); the remaining three are real and addressed
+in-place.
+
+### Codex bot findings + dispositions
+
+| # | Severity | Path | Disposition |
+|---|----------|------|-------------|
+| 1 | P1 | `HttpServer.kt:605` model resolution | **FALSE POSITIVE** — `ModelRegistry.resolve()` already returns `null` for any non-active name (mapped to 404 by the caller), and a defensive `Log.w` warns if a non-active entry sneaks through. Comment in code already references the prior codex review pass that fixed it. |
+| 2 | P1 | `LlmEngine.kt:407` `rawText.take(4096)` | **REAL** — was a debug-time cap on the probe path, silently promoted to production by v0.7.0. Cap removed; rely on `EngineConfig.maxNumTokens` for output sizing. |
+| 3 | P2 | `scripts/temuxllm:524` `status` no `ensure_forward()` | **FALSE POSITIVE** — `cmd_status` already calls `ensure_forward()` at line 143 (with explanatory comment about parity with `launch`). Bot mis-traced the call. |
+| 4 | P2 | `scripts/temuxllm:551` `launch` always forwards | **REAL** — `ensure_forward()` now early-returns when `TEMUXLLM_HOST` is set to a non-default endpoint, so users with remote URL / ssh-tunnel / alternate-port targets aren't blocked on missing `adb`. |
+| 5 | P2 | `AutoFallback.kt:99` SIGKILL=LMK | **REAL** — narrowed: `REASON_SIGNALED + status==9` now ALSO requires `rss > 500 MB` to register as LMK. Below that, the engine wasn't loaded → SIGKILL came from somewhere else (adb kill, ANR watchdog, OEM battery saver) and we skip the auto-downshift instead of recording a stale lower ceiling. |
+
+### Files
+
+- MOD `android/app/src/main/kotlin/dev/temuxllm/LlmEngine.kt` — drop 4 KiB cap on native-tools `rawText`
+- MOD `android/app/src/main/kotlin/dev/temuxllm/AutoFallback.kt` — RSS gate on SIGKILL → LMK heuristic
+- MOD `scripts/temuxllm` — `ensure_forward()` skips when `TEMUXLLM_HOST` is set
+- MOD `android/app/build.gradle.kts` — `versionCode 18→19`, `versionName 0.8.0→0.8.1`
+
+### Acceptance
+
+- Unit tests: 77 / 0 failures (no test changes needed; the cap removal is data-only and the fallback narrowing is gated on hardware-derived `rss`)
+- `:app:lintDebug` clean
+- APK builds
+- Real-device n=30 multi-tool re-spot-check on Galaxy S25: 30/30 PASS (no regression from v0.8.0)
+
+### Known shipping limitation (carried from v0.8.0)
+
+Constrained decoding default-on still halts tools-less code-block
+prose at the opening ` ``` ` fence. Sidecar opt-out via
+`temuxllm.conf` `constrained_decode=0` continues to be the
+documented escape hatch.
+
 ## [0.8.0] — 2026-05-03
 
 Multi-tool reliability stack. Drives Gemma 4 E4B's n=30 multi-tool
