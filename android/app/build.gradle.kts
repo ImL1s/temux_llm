@@ -15,8 +15,8 @@ android {
         // targetSdk lags compileSdk so we don't opt into Android 16 runtime
         // behaviour changes until we've actually validated them on a device.
         targetSdk = 35
-        versionCode = 5
-        versionName = "0.2.0"
+        versionCode = 19
+        versionName = "0.8.1"
         ndk {
             abiFilters += "arm64-v8a"
         }
@@ -59,4 +59,13 @@ dependencies {
     // and into a shared engine that loads the model once and serves multiple
     // /api/generate calls. Also unlocks streaming via Kotlin Flow.
     implementation("com.google.ai.edge.litertlm:litertlm-android:0.11.0-rc1")
+
+    // Local-test deps. JUnit 4 is what AGP 8.x wires zero-config; MockK mocks
+    // Kotlin final classes (the SDK's Engine/Conversation are final);
+    // kotlinx-coroutines-test is needed for runTest{} on Flow<GenerateEvent>;
+    // JSONassert keeps wire-format assertions readable across all 4 envelopes.
+    testImplementation("junit:junit:4.13.2")
+    testImplementation("io.mockk:mockk:1.13.13")
+    testImplementation("org.jetbrains.kotlinx:kotlinx-coroutines-test:1.10.2")
+    testImplementation("org.skyscreamer:jsonassert:1.5.3")
 }

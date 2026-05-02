@@ -1,0 +1,576 @@
+#!/usr/bin/env bash
+# temuxllm — launch a CLI coding agent against the on-device LiteRT-LM service.
+#
+# This is the temux_llm equivalent of `ollama launch <cli>`. It probes the
+# service on 127.0.0.1:11434 (forwarding from a connected device when run on
+# a host), picks the active model, sets the env vars / flags the target CLI
+# expects, and exec's it.
+#
+# Usage:
+#   temuxllm launch <claude|codex|opencode|openclaw|gemini> [-- <cli args>]
+#   temuxllm launch <cli> --config-only    # print env block; do not exec
+#   temuxllm launch <cli> --model <name>   # override model selection
+#   temuxllm --help
+#
+# Environment overrides:
+#   DEVICE_SERIAL  pin to a specific adb device
+#   TEMUXLLM_HOST  override service URL (default http://127.0.0.1:11434)
+set -euo pipefail
+
+PROG=$(basename "$0")
+SUPPORTED_CLIS=(claude codex opencode openclaw gemini)
+
+usage() {
+  cat <<EOF
+$PROG — launch a CLI coding agent against on-device temux_llm.
+
+USAGE:
+  $PROG launch <cli> [--model NAME] [--config-only] [-- <args passed to cli>]
+  $PROG status
+  $PROG --help
+
+CLIS:
+  claude    Anthropic Claude Code -> /v1/messages
+  codex     OpenAI Codex CLI -> /v1/responses (--oss)
+  opencode  sst/opencode -> /v1/chat/completions
+  openclaw  openclaw.ai -> /api/chat (Ollama-native)
+  gemini    Google Gemini CLI -> requires LiteLLM bridge (printed)
+
+EXAMPLES:
+  $PROG launch claude
+  $PROG launch claude -- --print "summarize this repo"
+  $PROG launch codex --model gemma-4-E2B-it
+  $PROG launch opencode --config-only
+
+ENV:
+  TEMUXLLM_HOST=http://127.0.0.1:11434  service base URL
+  DEVICE_SERIAL=ABC123                  pin to specific adb device
+
+NOTES:
+  - On a host (Mac/Linux): runs 'adb forward tcp:11434 tcp:11434' (idempotent).
+  - In Termux on the device: skips adb, talks to the local service directly.
+EOF
+}
+
+die() { echo "error: $*" >&2; exit 1; }
+log() { echo "$PROG: $*" >&2; }
+
+require() { command -v "$1" >/dev/null 2>&1 || die "missing dependency: $1"; }
+
+# Detect Termux vs host.
+is_termux() { [[ "${PREFIX:-}" == */com.termux/* ]] || [[ -d /data/data/com.termux ]]; }
+
+ensure_forward() {
+  if is_termux; then return 0; fi
+  # v0.8.1 codex P2: skip adb-forwarding when the user pointed
+  # TEMUXLLM_HOST at a non-default endpoint (remote URL, ssh
+  # tunnel, alternate localhost port). Forwarding is only
+  # meaningful when we're going to talk to 127.0.0.1:11434 on
+  # this host. With TEMUXLLM_HOST set, the user has already
+  # arranged transport — don't fail their flow on missing adb.
+  if [[ -n "${TEMUXLLM_HOST:-}" && "$TEMUXLLM_HOST" != "http://127.0.0.1:11434" ]]; then
+    return 0
+  fi
+  require adb
+  local serial_arg=()
+  if [[ -n "${DEVICE_SERIAL:-}" ]]; then
+    serial_arg=(-s "$DEVICE_SERIAL")
+  else
+    local count
+    count=$(adb devices | awk 'NR>1 && $2=="device"' | wc -l | tr -d ' ')
+    if [[ "$count" -eq 0 ]]; then
+      die "no adb devices attached. Plug in your phone or set DEVICE_SERIAL."
+    fi
+    if [[ "$count" -gt 1 ]]; then
+      die "multiple adb devices attached. Set DEVICE_SERIAL to pick one (adb devices)."
+    fi
+  fi
+  adb "${serial_arg[@]}" forward tcp:11434 tcp:11434 >/dev/null
+}
+
+probe_service() {
+  local host="${TEMUXLLM_HOST:-http://127.0.0.1:11434}"
+  if ! curl -fsS --max-time 3 "$host/api/version" >/dev/null 2>&1; then
+    die "temux_llm service not reachable at $host. Is the APK foreground service running?"
+  fi
+  echo "$host"
+}
+
+pick_model() {
+  local host="$1"
+  local override="${2:-}"
+  if [[ -n "$override" ]]; then
+    echo "$override"; return
+  fi
+  # Prefer the active model (whatever LlmEngine has staged). /v1/models
+  # only lists the currently staged file; /api/tags lists every file in
+  # /data/local/tmp/litertlm/. We pick from /v1/models so we get the
+  # actual loaded model.
+  #
+  # Parse via python3 when available (handles JSON with commas in values
+  # correctly), otherwise fall back to a non-greedy sed pattern that picks
+  # the FIRST `"id"` key. Greedy sed-on-tags burned us before — qwen3
+  # being picked over the active gemma because `.*` is greedy and matched
+  # to the LAST `"name"` in the array.
+  local body first
+  body=$(curl -fsS --max-time 3 "$host/v1/models" || true)
+  if [[ -z "$body" ]]; then
+    die "no models reported by $host/v1/models. Push a .litertlm to the device first."
+  fi
+  if command -v python3 >/dev/null 2>&1; then
+    first=$(printf '%s' "$body" | python3 -c \
+      'import json,sys; d=json.load(sys.stdin); print(d.get("data",[{}])[0].get("id",""))' \
+      2>/dev/null || true)
+  fi
+  if [[ -z "${first:-}" ]]; then
+    # Non-greedy fallback: grep the FIRST `"id":"..."` occurrence directly.
+    first=$(printf '%s' "$body" \
+      | grep -oE '"id"[[:space:]]*:[[:space:]]*"[^"]+"' \
+      | head -n 1 \
+      | sed -E 's/.*"id"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/' \
+      || true)
+  fi
+  if [[ -z "${first:-}" ]]; then
+    die "no models reported by $host/v1/models. Push a .litertlm to the device first."
+  fi
+  echo "$first"
+}
+
+cmd_status() {
+  # `status` should be a no-friction probe — make sure adb forward is set up
+  # the same way `launch` does, otherwise host-side users see a misleading
+  # "service not reachable" while the device is actually fine.
+  ensure_forward
+  local host
+  host=$(probe_service)
+  curl -fsS --max-time 3 "$host/api/version"
+  echo
+  curl -fsS --max-time 3 "$host/api/tags"
+  echo
+}
+
+# ---------------------------------- Launchers --------------------------------
+
+launch_claude() {
+  local host="$1"; local model="$2"; local config_only="$3"; shift 3
+  local cli="claude"
+  local env_block
+  env_block=$(cat <<EOF
+ANTHROPIC_BASE_URL=$host
+ANTHROPIC_AUTH_TOKEN=ollama
+ANTHROPIC_API_KEY=
+ANTHROPIC_MODEL=$model
+ANTHROPIC_DEFAULT_OPUS_MODEL=$model
+ANTHROPIC_DEFAULT_SONNET_MODEL=$model
+ANTHROPIC_DEFAULT_HAIKU_MODEL=$model
+# small-model defaults below — Claude Code's full agent system prompt is
+# ~16k tokens, which JUST fits temux_llm's 16k context (S25 12 GB) leaving
+# zero headroom for output. --bare strips hooks/LSP/plugins/auto-memory/
+# CLAUDE.md auto-discovery so the prompt drops to a few hundred tokens
+# and the model has room to actually answer. Drop --bare if you have a
+# device with ≥16 GB and TEMUXLLM_MAX_TOKENS=24576+ set.
+EOF
+)
+  if [[ "$config_only" == "1" ]]; then
+    echo "# env block for: claude"
+    echo "$env_block"
+    echo "# recommended invocation for small-model on-device:"
+    echo "claude --bare \"\$@\""
+    return 0
+  fi
+  command -v "$cli" >/dev/null 2>&1 || die "install Claude Code first: https://docs.claude.com/claude-code"
+  # User opt-out of --bare via TEMUXLLM_CLAUDE_FULL_AGENT=1 (16 GB+ devices
+  # with ≥24k context can probably afford the full Claude Code system prompt).
+  local bare_flag=()
+  if [[ -z "${TEMUXLLM_CLAUDE_FULL_AGENT:-}" ]]; then
+    bare_flag=(--bare)
+    log "launching claude --bare (minimal system prompt) with model=$model via $host"
+    log "  set TEMUXLLM_CLAUDE_FULL_AGENT=1 to drop --bare on a 16 GB+ device"
+  else
+    log "launching claude (full agent prompt) with model=$model via $host"
+  fi
+  ANTHROPIC_BASE_URL="$host" \
+  ANTHROPIC_AUTH_TOKEN=ollama \
+  ANTHROPIC_API_KEY= \
+  ANTHROPIC_MODEL="$model" \
+  ANTHROPIC_DEFAULT_OPUS_MODEL="$model" \
+  ANTHROPIC_DEFAULT_SONNET_MODEL="$model" \
+  ANTHROPIC_DEFAULT_HAIKU_MODEL="$model" \
+    exec "$cli" "${bare_flag[@]+"${bare_flag[@]}"}" "$@"
+}
+
+launch_codex() {
+  local host="$1"; local model="$2"; local config_only="$3"; shift 3
+  local cli="codex"
+  # Codex 0.125+ broke the simple `--oss` path for non-stock models:
+  #   1. `wire_api="chat"` was removed; only `wire_api="responses"` is accepted now.
+  #   2. `--oss --local-provider ollama` overrides `-c model=` and forces
+  #      gpt-oss:20b (verified on 0.125.0). Useless for our local model.
+  #   3. `model_providers.ollama.*` cannot be overridden — `ollama` is a
+  #      reserved built-in name. We use `temuxllm` as the provider id instead.
+  #
+  # Small-model squeeze (16 k context on S25, 24 k on Fold7-class):
+  #   - project_doc_max_bytes=0 suppresses AGENTS.md injection (per OpenAI
+  #     Codex config reference) — keeps prefill from blowing past the
+  #     context window when the user is in a repo with a big AGENTS.md.
+  #   - model_instructions_file overrides the bundled base instructions
+  #     (per OpenAI's "Unrolling the Codex agent loop" post). Set
+  #     TEMUXLLM_CODEX_INSTRUCTIONS_FILE=<path> to a tiny instructions
+  #     file (e.g. one-paragraph "you are a helpful coding assistant") to
+  #     drop the ~8 k system prompt down to a few hundred tokens.
+  # Default to reasoning_effort=minimal — codex 0.125's default `xhigh`
+  # adds ~5 k tokens of <think> trace per turn, blowing past 12 GB / 16 k
+  # device budgets. Override with TEMUXLLM_CODEX_REASONING=high|low.
+  local reasoning="${TEMUXLLM_CODEX_REASONING:-minimal}"
+  local extra_cfg=(
+    -c project_doc_max_bytes=0
+    -c "model_reasoning_effort=\"$reasoning\""
+    -c "model_provider=\"temuxllm\""
+    -c "model_providers.temuxllm.name=\"temuxllm\""
+    -c "model_providers.temuxllm.base_url=\"$host/v1\""
+    -c "model_providers.temuxllm.wire_api=\"responses\""
+  )
+  # If the user hasn't pointed at a custom instructions file, ship a tiny
+  # default to drop the bundled ~8 k codex agent harness. We write it to
+  # the per-host TMPDIR so it persists across launches but doesn't pollute
+  # the project tree. Codex needs a concrete file path — env-var-only
+  # path doesn't work.
+  local default_instr="${TMPDIR:-/tmp}/temuxllm-codex-instructions.md"
+  if [[ ! -f "$default_instr" ]]; then
+    cat > "$default_instr" <<'INS'
+You are a helpful coding assistant running locally on the user's phone.
+Reply concisely. Default to direct answers; ask before running shell or
+edit tools.
+INS
+  fi
+  local instr_file="${TEMUXLLM_CODEX_INSTRUCTIONS_FILE:-$default_instr}"
+  extra_cfg+=(-c "model_instructions_file=\"$instr_file\"")
+  if [[ "$config_only" == "1" ]]; then
+    cat <<EOF
+# command for: codex (custom temuxllm provider, wire_api=responses)
+# NOTE: codex 0.125+ rejects the old --oss shorthand for non-stock models:
+#   wire_api="chat" is dropped; --oss forces gpt-oss:20b; model_providers.ollama.*
+#   is a reserved built-in name. We use a custom 'temuxllm' provider and
+#   reasoning_effort=minimal because the default xhigh adds ~5 k tokens of
+#   <think> trace per turn — too much for 12 GB / 16 k devices.
+codex exec \\
+  -c project_doc_max_bytes=0 \\
+  -c 'model_reasoning_effort="$reasoning"' \\
+  -c 'model_instructions_file="$instr_file"' \\
+  -c 'model_provider="temuxllm"' \\
+  -c 'model_providers.temuxllm.name="temuxllm"' \\
+  -c 'model_providers.temuxllm.base_url="$host/v1"' \\
+  -c 'model_providers.temuxllm.wire_api="responses"' \\
+  -c 'model="$model"'
+
+# Memory hint: 12 GB devices need max_tokens=12288 in temuxllm.conf (16384
+# OOMs under codex's prefill + GPU init). Push with:
+#   adb shell 'echo max_tokens=12288 > /data/local/tmp/litertlm/temuxllm.conf'
+EOF
+    return 0
+  fi
+  command -v "$cli" >/dev/null 2>&1 || die "install Codex CLI first: https://github.com/openai/codex"
+  log "launching codex (custom 'temuxllm' provider, responses wire, reasoning=$reasoning) with model=$model via $host"
+  log "  using model_instructions_file=$instr_file"
+  exec "$cli" "${extra_cfg[@]}" -c model="$model" "$@"
+}
+
+launch_opencode() {
+  local host="$1"; local model="$2"; local config_only="$3"; shift 3
+  local cli="opencode"
+  # OpenCode reads providers from ~/.config/opencode/opencode.json. We write
+  # a temp config scoped to this invocation via OPENCODE_CONFIG, with a
+  # custom "bare" agent that disables every documented tool and replaces
+  # the system prompt with a one-liner. This is the OpenCode equivalent of
+  # `claude --bare`: agent-loop framing + tool descriptions get stripped
+  # so the small on-device model has room for the user's prompt.
+  #
+  # MEMORY HEADROOM: opencode 1.14+ still ships a ~2.3 k-token system prompt
+  # even in bare mode (verified by checking step_finish.tokens.input on a
+  # bare-agent run). At 16 k context on a 12 GB device, GPU mode + that
+  # prompt regularly trips the lowmemorykiller (PSS spike of ~1 GB above
+  # claude --bare's working set). We route opencode through a tiny LiteLLM
+  # proxy that injects `extra_body: {backend: "cpu"}` into every
+  # /v1/chat/completions call. The on-device service honours that override
+  # via HttpServer.handleOpenAiChat (see `body.optString("backend", "gpu")`).
+  # CPU is ~30 % slower at decode but doesn't OOM. Devices with ≥16 GB can
+  # set TEMUXLLM_OPENCODE_BACKEND=gpu to keep GPU.
+  #
+  # Caveats (documented in `.omc/research/21-opencode-bare.md`):
+  #   - OpenCode walks UP from cwd looking for AGENTS.md / CLAUDE.md and
+  #     prepends those to the system prompt with no off-switch. We `cd`
+  #     to a scratch dir to avoid leaking the user's project context.
+  #   - OPENCODE_DISABLE_CLAUDE_CODE=1 suppresses the `~/.claude/CLAUDE.md`
+  #     fallback specifically.
+  local backend_pref="${TEMUXLLM_OPENCODE_BACKEND:-cpu}"
+  local effective_base="$host/v1"
+  local extra_block=""
+  local bridge_port=""
+  if [[ "$backend_pref" == "cpu" ]]; then
+    bridge_port="${TEMUXLLM_LITELLM_PORT:-4000}"
+    effective_base="http://127.0.0.1:${bridge_port}/v1"
+    extra_block="# Backend forced to CPU via LiteLLM bridge on :${bridge_port}.
+# Set TEMUXLLM_OPENCODE_BACKEND=gpu (≥16 GB devices only) to skip the bridge."
+  fi
+  local cfg_block
+  cfg_block=$(cat <<EOF
+{
+  "\$schema": "https://opencode.ai/config.json",
+  "provider": {
+    "temuxllm": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "temux_llm (local)",
+      "options": { "baseURL": "$effective_base", "apiKey": "ollama" },
+      "models": { "$model": { "name": "$model" } }
+    }
+  },
+  "model": "temuxllm/$model",
+  "default_agent": "bare",
+  "agent": {
+    "bare": {
+      "description": "Minimal chat — no tools, terse prompt.",
+      "mode": "primary",
+      "model": "temuxllm/$model",
+      "prompt": "You are a helpful assistant. Reply concisely.",
+      "tools": {
+        "write": false, "edit": false, "bash": false, "read": false,
+        "glob": false, "grep": false, "list": false, "patch": false,
+        "todowrite": false, "todoread": false, "webfetch": false,
+        "task": false, "lsp_diagnostics": false, "lsp_hover": false
+      }
+    }
+  }
+}
+EOF
+)
+  if [[ "$config_only" == "1" ]]; then
+    echo "# bare-mode config snippet for: ~/.config/opencode/opencode.json"
+    echo "$cfg_block"
+    echo
+    if [[ -n "$extra_block" ]]; then echo "$extra_block"; echo; fi
+    echo "# bare-mode invocation (cd to scratch to suppress AGENTS.md walk-up):"
+    if [[ "$backend_pref" == "cpu" ]]; then
+      echo "# Step 1 — bridge (one-time setup):"
+      echo "pip install 'litellm[proxy]'"
+      echo "cat > /tmp/tmuxllm-litellm.yaml <<'YAML'"
+      echo "model_list:"
+      echo "  - model_name: $model"
+      echo "    litellm_params:"
+      echo "      model: openai/$model"
+      echo "      api_base: $host/v1"
+      echo "      api_key: ollama"
+      echo "      extra_body: { backend: cpu }"
+      echo "litellm_settings: { drop_params: true }"
+      echo "YAML"
+      echo "litellm --config /tmp/tmuxllm-litellm.yaml --port ${bridge_port:-4000} &"
+      echo
+    fi
+    echo "# Step 2 — invoke:"
+    echo "tmpd=\$(mktemp -d) && cd \"\$tmpd\" && \\"
+    echo "  OPENCODE_DISABLE_CLAUDE_CODE=1 OPENCODE_CONFIG=\"<path>\" opencode run \"\$@\""
+    return 0
+  fi
+  command -v "$cli" >/dev/null 2>&1 || die "install OpenCode first: https://opencode.ai"
+  local cfgdir scratch trap_cmd
+  cfgdir=$(mktemp -d -t temuxllm-opencode.XXXXXX)
+  scratch=$(mktemp -d -t temuxllm-opencode-cwd.XXXXXX)
+  trap_cmd="rm -rf '$cfgdir' '$scratch'"
+  if [[ "$backend_pref" == "cpu" ]]; then
+    if ! command -v litellm >/dev/null 2>&1; then
+      log "OpenCode default route is via LiteLLM bridge to force backend=cpu (12 GB devices OOM on GPU)."
+      log "install: pip install 'litellm[proxy]'   OR   set TEMUXLLM_OPENCODE_BACKEND=gpu (≥16 GB devices)"
+      die "missing dependency: litellm"
+    fi
+    # v0.7.1 (codex PR review P2#5): only reuse an existing bridge if its
+    # /v1/models advertises THIS run's model. Otherwise a stale bridge from
+    # a previous `launch opencode --model X` will route this `launch
+    # opencode --model Y` to a config still pointing at X, causing
+    # opencode to hit "model not found" with the bridge healthy.
+    local bridge_ok=0
+    if curl -fsS --max-time 1 "http://127.0.0.1:${bridge_port}/health/readiness" >/dev/null 2>&1; then
+      if curl -fsS --max-time 2 "http://127.0.0.1:${bridge_port}/v1/models" 2>/dev/null \
+           | grep -qE "\"id\"[[:space:]]*:[[:space:]]*\"${model}\""; then
+        bridge_ok=1
+      else
+        log "existing LiteLLM bridge on :${bridge_port} doesn't list model='$model' — restarting"
+        # try to kill any litellm we can match on the port (best effort).
+        pkill -f "litellm.*--port ${bridge_port}" 2>/dev/null || true
+        sleep 1
+      fi
+    fi
+    if [[ "$bridge_ok" -ne 1 ]]; then
+      local bridge_yaml="$cfgdir/litellm.yaml"
+      cat > "$bridge_yaml" <<EOF
+model_list:
+  - model_name: $model
+    litellm_params:
+      model: openai/$model
+      api_base: $host/v1
+      api_key: ollama
+      extra_body: { backend: cpu }
+litellm_settings: { drop_params: true }
+EOF
+      log "starting LiteLLM bridge on :$bridge_port (forces backend=cpu)"
+      litellm --config "$bridge_yaml" --port "$bridge_port" --host 127.0.0.1 \
+        > "$cfgdir/litellm.log" 2>&1 &
+      local bridge_pid=$!
+      trap_cmd="kill $bridge_pid 2>/dev/null; $trap_cmd"
+      # 25-second window: cold-start LiteLLM is Python import + uvicorn
+      # boot + model registration. On first-ever pip-cached run can hit
+      # 15-20 s. Codex CLI's similar bridges use 30 s. We split the wait
+      # so we can log mid-way that we're still waiting (vs silently
+      # hanging or dying just before readiness).
+      local i ready=0
+      for i in $(seq 1 25); do
+        if curl -fsS --max-time 1 "http://127.0.0.1:${bridge_port}/health/readiness" >/dev/null 2>&1; then
+          ready=1; break
+        fi
+        if [[ "$i" -eq 12 ]]; then
+          log "still waiting for LiteLLM bridge ($i s)..."
+        fi
+        sleep 1
+      done
+      if [[ "$ready" -ne 1 ]]; then
+        log "LiteLLM bridge did not become ready in 25 s; tailing log:"
+        tail -20 "$cfgdir/litellm.log" >&2 || true
+        die "LiteLLM bridge failed to start. Re-run after pip install completes, OR set TEMUXLLM_OPENCODE_BACKEND=gpu (≥16 GB devices only)."
+      fi
+    fi
+  fi
+  echo "$cfg_block" > "$cfgdir/opencode.json"
+  log "launching opencode (bare agent, tools off, backend=$backend_pref) cfg=$cfgdir/opencode.json cwd=$scratch"
+  trap "$trap_cmd" EXIT INT TERM
+  ( cd "$scratch" && \
+    OPENCODE_DISABLE_CLAUDE_CODE=1 \
+    OPENCODE_CONFIG="$cfgdir/opencode.json" \
+    "$cli" "$@" )
+}
+
+launch_openclaw() {
+  local host="$1"; local model="$2"; local config_only="$3"; shift 3
+  local cli="openclaw"
+  # OpenClaw expects native Ollama API (NOT /v1). Its config lives in
+  # ~/.openclaw/ and varies by version; we surface env vars commonly accepted
+  # plus a printable config block.
+  if [[ "$config_only" == "1" ]]; then
+    cat <<EOF
+# env for: openclaw
+OLLAMA_HOST=$host
+OLLAMA_BASE_URL=$host
+OPENCLAW_PROVIDER=ollama
+OPENCLAW_MODEL=$model
+# config block for ~/.openclaw/config.yaml (Ollama provider section):
+provider: ollama
+ollama:
+  baseUrl: "$host"        # NOT http://host:11434/v1 — /v1 breaks tool calling
+  apiKey: "ollama-local"
+  model: "$model"
+EOF
+    return 0
+  fi
+  command -v "$cli" >/dev/null 2>&1 || die "install OpenClaw first: https://openclaw.ai"
+  log "launching openclaw with model=$model via $host (native Ollama API)"
+  OLLAMA_HOST="$host" \
+  OLLAMA_BASE_URL="$host" \
+  OPENCLAW_PROVIDER=ollama \
+  OPENCLAW_MODEL="$model" \
+    exec "$cli" "$@"
+}
+
+launch_gemini() {
+  local host="$1"; local model="$2"; local config_only="$3"; shift 3
+  # IMPORTANT: stock `gemini` (google-gemini/gemini-cli) cannot be redirected
+  # to a local OpenAI-compatible endpoint. v0.5.0 shipped a GEMINI_SYSTEM_MD +
+  # GOOGLE_GEMINI_BASE_URL recipe that empirically does not work — verified on
+  # gemini 0.36 against our litellm bridge at /tmp/tmuxllm_litellm.log. Stock
+  # Gemini CLI ignores the base URL when cached OAuth credentials exist and
+  # routes traffic to Google's servers. The relevant feature requests
+  # (google-gemini/gemini-cli #1605, #5945, #24166) remain open.
+  #
+  # The supported path is the @vybestack/llxprt-code fork — a downstream of
+  # gemini-cli that adds first-class OpenAI / Anthropic / Ollama providers
+  # via /provider, /baseurl, /key, /model. We use it as the `gemini` target
+  # and the launcher prints clear install instructions if it isn't present.
+  local cli="llxprt"
+  if [[ "$config_only" == "1" ]]; then
+    cat <<EOF
+# bare-mode invocation for: gemini  (via @vybestack/llxprt-code fork)
+# Stock gemini CLI cannot be redirected — see code comment in scripts/temuxllm.
+npm install -g @vybestack/llxprt-code
+
+# One-shot non-interactive:
+llxprt --provider openai --baseurl $host/v1 --key ollama \\
+       --model $model --prompt "your prompt"
+
+# Interactive REPL (configures provider on first use):
+llxprt
+# at the prompt:
+#   /provider openai
+#   /baseurl $host/v1/
+#   /key ollama
+#   /model $model
+EOF
+    return 0
+  fi
+  if ! command -v "$cli" >/dev/null 2>&1; then
+    log "stock 'gemini' CLI cannot be redirected to a local endpoint."
+    log "install the supported fork: npm install -g @vybestack/llxprt-code"
+    log "or run: $PROG launch gemini --config-only   for the full recipe."
+    die "missing dependency: llxprt"
+  fi
+  log "launching llxprt (Gemini CLI fork, OpenAI provider) with model=$model via $host"
+  exec "$cli" --provider openai --baseurl "$host/v1" --key ollama \
+              --model "$model" "$@"
+}
+
+# ----------------------------------- Main ------------------------------------
+
+main() {
+  if [[ $# -eq 0 ]]; then usage; exit 0; fi
+  case "$1" in
+    -h|--help|help) usage; exit 0;;
+    status) shift; cmd_status "$@";;
+    launch)
+      shift
+      [[ $# -ge 1 ]] || die "expected: $PROG launch <cli> [...args]"
+      local cli_name="$1"; shift
+      local valid=0
+      for c in "${SUPPORTED_CLIS[@]}"; do [[ "$c" == "$cli_name" ]] && valid=1; done
+      [[ $valid -eq 1 ]] || die "unsupported cli: '$cli_name'. supported: ${SUPPORTED_CLIS[*]}"
+
+      local model_override=""
+      local config_only="0"
+      local cli_args=()
+      while [[ $# -gt 0 ]]; do
+        case "$1" in
+          --model) model_override="${2:-}"; shift 2;;
+          --config-only) config_only="1"; shift;;
+          --) shift; cli_args=("$@"); break;;
+          *) cli_args+=("$1"); shift;;
+        esac
+      done
+
+      local host model
+      if [[ "$config_only" == "1" ]]; then
+        # config-only is a dry run: don't require a device, don't probe.
+        host="${TEMUXLLM_HOST:-http://127.0.0.1:11434}"
+        model="${model_override:-<MODEL>}"
+      else
+        ensure_forward
+        host=$(probe_service)
+        model=$(pick_model "$host" "$model_override")
+      fi
+
+      case "$cli_name" in
+        claude)   launch_claude   "$host" "$model" "$config_only" "${cli_args[@]+"${cli_args[@]}"}";;
+        codex)    launch_codex    "$host" "$model" "$config_only" "${cli_args[@]+"${cli_args[@]}"}";;
+        opencode) launch_opencode "$host" "$model" "$config_only" "${cli_args[@]+"${cli_args[@]}"}";;
+        openclaw) launch_openclaw "$host" "$model" "$config_only" "${cli_args[@]+"${cli_args[@]}"}";;
+        gemini)   launch_gemini   "$host" "$model" "$config_only" "${cli_args[@]+"${cli_args[@]}"}";;
+      esac
+      ;;
+    *) die "unknown command: '$1'. try $PROG --help";;
+  esac
+}
+
+main "$@"

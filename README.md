@@ -89,6 +89,257 @@ litertlm --help
 
 ---
 
+## Use with CLI coding agents (v0.6.0 verified matrix)
+
+> **v0.6.0 highlights:** vision input on `/v1/messages` /
+> `/v1/chat/completions` / `/api/chat` / `/v1/responses` (Galaxy S25 read
+> "STOP" from a 64×48 PNG — no fork required); tool-call success rate on
+> Gemma 4 E4B raised from **77 % → 100 %** (n=30) via a stack-based
+> JSON repair port from Ollama; `/api/probe/native_tools` endpoint hits
+> 100 % using the SDK's native tool path 30 % faster, opt-in for v0.7
+> via `native_tools=on` in `temuxllm.conf`; codex `web_search` is now
+> filtered out of `/v1/responses` ingress so the model stops fabricating
+> hosted-tool calls.
+
+
+
+`temux_llm` impersonates Ollama closely enough that the popular coding-agent
+CLIs talk to it without a proxy. The matrix below is what we **actually
+re-ran end-to-end on a Galaxy S25 (12 GB / 16 k context, default backend
+CPU)** for v0.5.1 — not what should work in theory.
+
+| CLI | Verified | Endpoint | Notes |
+|---|---|---|---|
+| **Claude Code** (`claude --bare`) | ✅ | `/v1/messages` (Anthropic SSE) | works directly; `--bare` strips ~16 k system prompt |
+| **OpenAI Codex** 0.125+ | ✅ | `/v1/responses` (OpenAI SSE) | needs custom provider; `wire_api="chat"` is dropped, `--oss` forces gpt-oss:20b |
+| **llxprt-code** (Gemini CLI fork) | ✅ | `/v1/chat/completions` | `npm i -g @vybestack/llxprt-code`; native OpenAI provider |
+| **OpenCode** 1.14+ | ✅ via bridge | `/v1/chat/completions` | needs LiteLLM bridge to inject `backend=cpu` (12 GB devices OOM in GPU mode) |
+| **stock Gemini CLI** | ❌ | — | no env var redirects to local; cached OAuth bypasses any base URL override (g-g/gemini-cli #1605, #5945, #24166) |
+| **OpenClaw** | not retested in v0.5.1 | `/api/chat` (Ollama native) | wire is correct; flagged for v0.6.0 retest |
+
+### One-shot launcher
+
+Once the service is running on the phone, forward port 11434 from your host:
+
+```sh
+adb forward tcp:11434 tcp:11434
+```
+
+Then use the bundled launcher (does what `ollama launch <cli>` does in
+Ollama 0.15+ — probe service, pick active model, set the right env / config,
+exec the CLI):
+
+```sh
+scripts/temuxllm launch claude          # Claude Code, --bare
+scripts/temuxllm launch codex           # Codex CLI (custom temuxllm provider)
+scripts/temuxllm launch opencode        # OpenCode (auto-spawns LiteLLM cpu bridge)
+scripts/temuxllm launch gemini          # llxprt-code (Gemini CLI fork)
+scripts/temuxllm launch openclaw        # Ollama-native, untested in v0.5.1
+
+scripts/temuxllm launch claude --config-only   # print env block, do not exec
+scripts/temuxllm launch codex --model gemma-4-E2B-it
+```
+
+### Manual setup per CLI
+
+If you'd rather wire the env / config yourself, here are the **exact
+configs the launcher uses**. Each was re-run on v0.5.1 against the real
+service before being committed.
+
+#### Claude Code
+
+```sh
+export ANTHROPIC_BASE_URL=http://127.0.0.1:11434
+export ANTHROPIC_AUTH_TOKEN=ollama
+export ANTHROPIC_API_KEY=
+export ANTHROPIC_MODEL=model
+export ANTHROPIC_DEFAULT_OPUS_MODEL=model
+export ANTHROPIC_DEFAULT_SONNET_MODEL=model
+export ANTHROPIC_DEFAULT_HAIKU_MODEL=model
+claude --bare           # add --print "your prompt" for one-shot
+```
+
+`--bare` is required on 12 GB / 16 k devices: the full Claude Code agent
+system prompt is ~16 k tokens which leaves zero output room. Drop it on
+≥16 GB devices with `TEMUXLLM_MAX_TOKENS=24576+` set.
+
+#### Codex CLI 0.125+
+
+Codex 0.125 broke the simple `--oss` shorthand for non-stock models:
+`wire_api="chat"` was dropped, `--oss --local-provider ollama` overrides
+`-c model=` and forces `gpt-oss:20b`, and `model_providers.ollama.*` is
+reserved as a built-in name. Codex's default `reasoning_effort="xhigh"`
+also adds ~5 k tokens of `<think>` trace per turn, blowing 12 GB / 16 k
+device budgets. We use a custom `temuxllm` provider with a tiny
+instructions file and `reasoning_effort="minimal"`:
+
+```sh
+echo "You are a helpful coding assistant. Reply concisely." > /tmp/tiny.md
+
+codex exec \
+  -c project_doc_max_bytes=0 \
+  -c 'model_reasoning_effort="minimal"' \
+  -c 'model_instructions_file="/tmp/tiny.md"' \
+  -c 'model_provider="temuxllm"' \
+  -c 'model_providers.temuxllm.name="temuxllm"' \
+  -c 'model_providers.temuxllm.base_url="http://127.0.0.1:11434/v1"' \
+  -c 'model_providers.temuxllm.wire_api="responses"' \
+  -c 'model="model"' \
+  "your prompt"
+```
+
+**Important:** on 12 GB devices, drop `max_tokens` to **12288** (16384
+OOMs under codex's prompt prefill + GPU init). Push the conf:
+
+```sh
+adb shell 'echo max_tokens=12288 > /data/local/tmp/litertlm/temuxllm.conf'
+adb shell 'am force-stop dev.temuxllm.service'
+# next request restarts the engine with the new ceiling
+```
+
+Override the launcher's defaults with `TEMUXLLM_CODEX_REASONING=high|low`
+or `TEMUXLLM_CODEX_INSTRUCTIONS_FILE=/path/to/your.md`.
+
+#### llxprt-code (Gemini CLI fork)
+
+**Stock `gemini` CLI cannot be redirected to a local OpenAI-compatible
+endpoint** — verified empirically against gemini 0.36 with a LiteLLM
+bridge. The `GOOGLE_GEMINI_BASE_URL` and `GEMINI_API_KEY` env vars are
+ignored when cached OAuth credentials exist; traffic goes to Google's
+servers. The relevant feature requests
+([#1605](https://github.com/google-gemini/gemini-cli/issues/1605),
+[#5945](https://github.com/google-gemini/gemini-cli/discussions/5945),
+[#24166](https://github.com/google-gemini/gemini-cli/discussions/24166))
+remain open as of v0.5.1.
+
+Use the [`@vybestack/llxprt-code`](https://github.com/vybestack/llxprt-code)
+fork, which adds first-class OpenAI / Anthropic / Ollama providers:
+
+```sh
+npm install -g @vybestack/llxprt-code
+
+# one-shot
+llxprt --provider openai \
+       --baseurl http://127.0.0.1:11434/v1 \
+       --key ollama \
+       --model model \
+       --prompt "your prompt"
+
+# interactive REPL — set provider once at the prompt
+llxprt
+# /provider openai
+# /baseurl http://127.0.0.1:11434/v1/
+# /key ollama
+# /model model
+```
+
+#### OpenCode 1.14+ (via LiteLLM bridge)
+
+OpenCode 1.14's bare-mode agent still ships a ~2.3 k-token system prompt.
+On 12 GB devices, GPU mode + that prompt regularly trips
+`lowmemorykiller`. We route OpenCode through a tiny LiteLLM proxy that
+injects `extra_body: {backend: "cpu"}` into every call so the on-device
+service runs the request on CPU instead. The launcher auto-spawns the
+bridge; for a manual setup:
+
+```sh
+pip install 'litellm[proxy]'
+
+# bridge config
+cat > /tmp/tmuxllm-litellm.yaml <<'YAML'
+model_list:
+  - model_name: model
+    litellm_params:
+      model: openai/model
+      api_base: http://127.0.0.1:11434/v1
+      api_key: ollama
+      extra_body: { backend: cpu }
+litellm_settings: { drop_params: true }
+YAML
+
+litellm --config /tmp/tmuxllm-litellm.yaml --port 4000 &
+
+# OpenCode config (writes to a temp file; cd to scratch dir to dodge
+# AGENTS.md / CLAUDE.md walk-up that re-bloats the prompt)
+cat > /tmp/opencode.json <<'JSON'
+{
+  "$schema": "https://opencode.ai/config.json",
+  "provider": {
+    "temuxllm": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "temux_llm (local)",
+      "options": { "baseURL": "http://127.0.0.1:4000/v1", "apiKey": "ollama" },
+      "models": { "model": { "name": "model" } }
+    }
+  },
+  "model": "temuxllm/model",
+  "default_agent": "bare",
+  "agent": {
+    "bare": {
+      "mode": "primary",
+      "model": "temuxllm/model",
+      "prompt": "You are a helpful assistant. Reply concisely.",
+      "tools": { "write": false, "edit": false, "bash": false, "read": false,
+                 "glob": false, "grep": false, "list": false, "patch": false,
+                 "todowrite": false, "todoread": false, "webfetch": false,
+                 "task": false, "lsp_diagnostics": false, "lsp_hover": false }
+    }
+  }
+}
+JSON
+
+(cd "$(mktemp -d)" && \
+  OPENCODE_DISABLE_CLAUDE_CODE=1 OPENCODE_CONFIG=/tmp/opencode.json \
+  opencode run --agent bare "your prompt")
+```
+
+On ≥16 GB devices set `TEMUXLLM_OPENCODE_BACKEND=gpu` to skip the bridge.
+
+### What works vs what doesn't (v0.5.1)
+
+**Works:**
+- All four wire envelopes (Anthropic SSE, OpenAI SSE, OpenAI Responses,
+  Ollama NDJSON) round-trip plain text and tool calls.
+- Tool calling via prompt-injection + brace-balance JSON parser (no
+  Conversation::Clone yet — single-turn only).
+- Memory observability: `MemoryProbe` samples PSS / VmHWM / oom_score_adj
+  during inference. After an LMK kill, `AutoFallback` downshifts
+  `maxNumTokens` for the next start (device-fingerprinted).
+- Auto CPU/GPU default via `default_backend=` in
+  `/data/local/tmp/litertlm/temuxllm.conf` or `TEMUXLLM_DEFAULT_BACKEND=`.
+
+**Doesn't work / known limitations:**
+- **Multi-turn agent loops** on 12 GB / 16 k devices once the prompt
+  prefill grows past ~10 k tokens. Memory pressure trips LMK before
+  decode starts. Mitigation: use `e2b` model + `--bare` flags + the CPU
+  default backend.
+- **Image inputs.** `image_url` / `input_image` blocks return 400.
+- **Stock Gemini CLI redirect.** No env-var path; use llxprt-code.
+
+### Tool calling, MCP, skills, web search
+
+`--bare` modes strip auto-discovered tools by design. The matrix of
+which CLI keeps which capability — and how to get web search / MCP /
+skills back when you need them — lives in
+[`docs/cli-tool-matrix.md`](docs/cli-tool-matrix.md). Short version:
+
+| CLI | What `--bare` keeps | How to add web search / MCP back |
+|---|---|---|
+| `claude --bare` | Bash, Read, Edit only | `--mcp-config <file>` + `--strict-mcp-config` |
+| `codex exec` (minimal) | All 29 built-ins + MCP + skills | already on; add MCP servers in `~/.codex/config.toml` |
+| `llxprt` | All built-ins + MCP + skills (no bare knob) | `EXA_API_KEY=...` for web search; `llxprt mcp add` for MCP |
+| `opencode run --agent bare` | Nothing — every tool off | swap to `--agent build` and re-enable `webfetch` / `websearch` |
+
+Single-shot tool calling works on all four wire envelopes
+(`/api/chat`, `/v1/chat/completions`, `/v1/messages`, `/v1/responses`).
+Multi-turn agent loops are unreliable on Gemma 4 today — fixed in
+v0.6.0 (KV reuse via `Conversation::Clone()`).
+
+For a plain reference of every endpoint we expose and which CLI each one is
+for, see [`docs/ollama-compat.md`](docs/ollama-compat.md).
+
+---
+
 ## Termux-native (no APK)
 
 Don't want to sideload the APK? Run the LiteRT-LM binary directly inside
@@ -184,10 +435,25 @@ POST /api/generate  -> NDJSON stream of {response, done} (or one JSON if stream=
 ```json
 {
   "prompt":  "Hi",
-  "backend": "cpu" | "gpu",   // default: "gpu"
+  "backend": "cpu" | "gpu",   // default: see Tunables below
   "stream":  true             // default: true (NDJSON one-line-per-token)
 }
 ```
+
+### Tunables (v0.5.1+)
+
+`/data/local/tmp/litertlm/temuxllm.conf` is read at every engine init:
+
+```
+max_tokens=16384         # KV-cache ceiling. Drop to 8192 on 8 GB devices
+default_backend=cpu      # cpu|gpu. Default for /v1 calls when the body
+                         # omits a `backend` field. CLIs like Codex and
+                         # OpenCode never send one — set this to `cpu`
+                         # on 12 GB / 16 k devices to avoid LMK kills.
+```
+
+`TEMUXLLM_DEFAULT_BACKEND=cpu` env var is read as a fallback when the
+file is absent.
 
 Streaming response: one JSON object per line (`application/x-ndjson`):
 

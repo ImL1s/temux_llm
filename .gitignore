@@ -10,7 +10,13 @@ __pycache__/
 android/app/build/
 android/.gradle/
 android/local.properties
-android/app/src/main/assets/
+android/app/src/main/assets/*
+# v0.8.0 G4: tool_exemplars.json ships as a real asset so
+# ExemplarBank can load it at runtime; everything else under
+# assets/ is build output and stays ignored. (`/*` excludes file
+# entries but lets git descend into the dir; `!` then re-includes
+# the one file we want tracked.)
+!android/app/src/main/assets/tool_exemplars.json
 android/build/
 android/app/src/main/jniLibs/
 .claude/

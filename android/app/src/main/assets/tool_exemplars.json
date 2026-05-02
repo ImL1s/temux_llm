@@ -1,0 +1,47 @@
+{
+  "get_weather": {
+    "user": "What is the weather in Tokyo?",
+    "assistant_tool_call": { "name": "get_weather", "arguments": { "location": "Tokyo" } },
+    "tool_result": "Sunny, 22°C"
+  },
+  "read_file": {
+    "user": "Show me the contents of README.md.",
+    "assistant_tool_call": { "name": "read_file", "arguments": { "path": "README.md" } },
+    "tool_result": "# My Project\nA simple README."
+  },
+  "write_file": {
+    "user": "Create a file called hello.txt with the text Hello World.",
+    "assistant_tool_call": { "name": "write_file", "arguments": { "path": "hello.txt", "content": "Hello World" } },
+    "tool_result": "File written: hello.txt"
+  },
+  "glob": {
+    "user": "List all TypeScript files in src/.",
+    "assistant_tool_call": { "name": "glob", "arguments": { "pattern": "src/**/*.ts" } },
+    "tool_result": "src/index.ts\nsrc/utils.ts"
+  },
+  "grep": {
+    "user": "Find all usages of TODO in the codebase.",
+    "assistant_tool_call": { "name": "grep", "arguments": { "pattern": "TODO", "path": "." } },
+    "tool_result": "src/index.ts:12: // TODO: add error handling"
+  },
+  "bash": {
+    "user": "Run the tests and show me the output.",
+    "assistant_tool_call": { "name": "bash", "arguments": { "command": "npm test 2>&1" } },
+    "tool_result": "All 5 tests passed."
+  },
+  "direct_web_fetch": {
+    "user": "Fetch the page at https://example.com.",
+    "assistant_tool_call": { "name": "direct_web_fetch", "arguments": { "url": "https://example.com" } },
+    "tool_result": "<html>Example Domain</html>"
+  },
+  "list_directory": {
+    "user": "What files are in the project root?",
+    "assistant_tool_call": { "name": "list_directory", "arguments": { "path": "." } },
+    "tool_result": "README.md\nsrc/\npackage.json"
+  },
+  "_default": {
+    "user": "Use a tool to complete this task.",
+    "assistant_tool_call": { "name": "tool_name", "arguments": { "input": "value" } },
+    "tool_result": "Tool executed successfully."
+  }
+}

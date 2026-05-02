@@ -70,14 +70,30 @@ echo "  $DEVICE_SERIAL  $MODEL_NAME  SoC=$SOC  ABI=$ABI  Android=$RELEASE"
 [[ "$ABI" == "arm64-v8a" ]] || die "device ABI is $ABI, expected arm64-v8a"
 
 # ---- 3. pick model ----
+# Choice depends on BOTH SoC class AND total RAM. E4B is 3.4 GB on disk and
+# wants ~6 GB process RSS at 16 k context — that fits comfortably on a 12 GB
+# device but pushes 8 GB phones close to the lowmemorykiller cliff. E2B
+# (2.4 GB on disk, ~4 GB RSS) leaves ~1 GB more KV headroom on tight devices,
+# at the cost of being a smaller model. Auto-detect via /proc/meminfo
+# (in kB) and step down to E2B if RAM is < 11 GB physical (8 GB tier).
+TOTAL_MEM_KB=$(adb -s "$DEVICE_SERIAL" shell 'cat /proc/meminfo' | sed -n 's/^MemTotal:[[:space:]]*\([0-9]*\) kB.*/\1/p')
+TOTAL_MEM_GB=$(( (TOTAL_MEM_KB + 524288) / 1024 / 1024 ))
+echo "  device RAM ≈ ${TOTAL_MEM_GB} GB"
 if [[ -z "${MODEL:-}" ]]; then
   case "$SOC" in
     SM8750|SM8650|SM8550|SM8450|MT6989|MT6991|MT6993)
-      MODEL=e4b
-      echo "  detected high-end SoC ($SOC); defaulting to gemma-4-E4B (3.4 GB)" ;;
+      if [[ "$TOTAL_MEM_GB" -ge 11 ]]; then
+        MODEL=e4b
+        echo "  high-end SoC ($SOC) + ${TOTAL_MEM_GB} GB RAM -> gemma-4-E4B (3.4 GB)"
+      else
+        MODEL=e2b
+        echo "  high-end SoC ($SOC) but only ${TOTAL_MEM_GB} GB RAM -> gemma-4-E2B (2.4 GB) for KV headroom"
+      fi
+      ;;
     *)
       MODEL=e2b
-      echo "  defaulting to gemma-4-E2B (2.4 GB) — set MODEL=e4b to try the bigger one" ;;
+      echo "  ${SOC} (${TOTAL_MEM_GB} GB) -> gemma-4-E2B (2.4 GB); set MODEL=e4b to try the bigger one"
+      ;;
   esac
 fi
 case "$MODEL" in
@@ -149,6 +165,60 @@ TOK=$(printf '%s' "$RESP" | sed -n 's/.*"output_tokens":\([0-9]*\).*/\1/p')
 TOTAL=$(printf '%s' "$RESP" | sed -n 's/.*"total_duration_ms":\([0-9]*\).*/\1/p')
 echo "  response=$TEXT  tokens=$TOK  total_ms=$TOTAL"
 [[ -n "$TEXT" ]] || die "/api/generate returned no response field (raw: $RESP)"
+
+# ---- 9b. smoke the Ollama-compat surface ----
+say "smoke-testing Ollama-compat endpoints"
+PROBE=$(adb -s "$DEVICE_SERIAL" shell "curl -sm 3 http://127.0.0.1:11434/" | tr -d '\r')
+[[ "$PROBE" == "Ollama is running" ]] || die "GET / did not return 'Ollama is running' (got: $PROBE)"
+echo "  GET /                    -> $PROBE"
+
+VER=$(adb -s "$DEVICE_SERIAL" shell "curl -sm 3 http://127.0.0.1:11434/api/version")
+echo "  GET /api/version         -> $(printf '%s' "$VER" | sed -n 's/.*"version":"\([^"]*\)".*/\1/p')"
+
+TAGS_HAS_DIGEST=$(adb -s "$DEVICE_SERIAL" shell "curl -sm 3 http://127.0.0.1:11434/api/tags" | grep -c '"digest"' || true)
+[[ "$TAGS_HAS_DIGEST" -ge 1 ]] || die "/api/tags missing 'digest' field (Ollama-shape upgrade lost)"
+echo "  GET /api/tags            -> includes Ollama-shaped digest"
+
+# v1/models is a list endpoint — just confirm it returns object:list.
+MODELS=$(adb -s "$DEVICE_SERIAL" shell "curl -sm 3 http://127.0.0.1:11434/v1/models")
+echo "$MODELS" | grep -q '"object":"list"' || die "/v1/models did not return object:list (got: $MODELS)"
+echo "  GET /v1/models           -> object:list"
+
+# Anthropic non-streaming with explicit auth + version headers.
+ANT=$(adb -s "$DEVICE_SERIAL" shell \
+  "curl -sm 60 -X POST http://127.0.0.1:11434/v1/messages \
+    -H 'Content-Type: application/json' \
+    -H 'x-api-key: ollama' \
+    -H 'anthropic-version: 2023-06-01' \
+    --data-binary '{\"model\":\"local\",\"max_tokens\":32,\"messages\":[{\"role\":\"user\",\"content\":\"Reply OK in 1 word.\"}],\"stream\":false}'")
+echo "$ANT" | grep -q '"end_turn"' || die "/v1/messages non-streaming did not return end_turn (got: $ANT)"
+echo "  POST /v1/messages        -> non-streaming OK"
+
+# OpenAI Chat non-streaming.
+OAI=$(adb -s "$DEVICE_SERIAL" shell \
+  "curl -sm 60 -X POST http://127.0.0.1:11434/v1/chat/completions \
+    -H 'Content-Type: application/json' \
+    -H 'Authorization: Bearer ollama' \
+    --data-binary '{\"model\":\"local\",\"messages\":[{\"role\":\"user\",\"content\":\"Reply OK in 1 word.\"}],\"stream\":false}'")
+echo "$OAI" | grep -q '"chat.completion"' || die "/v1/chat/completions did not return chat.completion (got: $OAI)"
+echo "  POST /v1/chat/completions -> chat.completion OK"
+
+# Ollama-native chat.
+OCHAT=$(adb -s "$DEVICE_SERIAL" shell \
+  "curl -sm 60 -X POST http://127.0.0.1:11434/api/chat \
+    -H 'Content-Type: application/json' \
+    --data-binary '{\"model\":\"local\",\"messages\":[{\"role\":\"user\",\"content\":\"Reply OK in 1 word.\"}],\"stream\":false}'")
+echo "$OCHAT" | grep -q '"done_reason"' || die "/api/chat did not return done_reason (got: $OCHAT)"
+echo "  POST /api/chat           -> done_reason OK"
+
+# /v1/responses (Codex CLI). Streaming probe — first event must be response.created.
+FIRST_EVT=$(adb -s "$DEVICE_SERIAL" shell \
+  "curl -sNm 60 -X POST http://127.0.0.1:11434/v1/responses \
+    -H 'Content-Type: application/json' \
+    --data-binary '{\"model\":\"local\",\"input\":\"Reply OK in 1 word.\",\"stream\":true}'" \
+  | head -n 1 | tr -d '\r')
+[[ "$FIRST_EVT" == "event: response.created" ]] || die "/v1/responses first SSE event was not response.created (got: $FIRST_EVT)"
+echo "  POST /v1/responses       -> response.created OK"
 
 # ---- done ----
 say "✓ install complete on $MODEL_NAME ($DEVICE_SERIAL)"

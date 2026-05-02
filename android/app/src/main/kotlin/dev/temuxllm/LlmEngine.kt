@@ -1,14 +1,22 @@
 package dev.temuxllm
 
 import android.content.Context
+import android.os.Build
 import android.util.Log
 import com.google.ai.edge.litertlm.Backend
+import com.google.ai.edge.litertlm.Content
+import com.google.ai.edge.litertlm.Contents
+import com.google.ai.edge.litertlm.ConversationConfig
 import com.google.ai.edge.litertlm.Engine
 import com.google.ai.edge.litertlm.EngineConfig
 import com.google.ai.edge.litertlm.Message
+import com.google.ai.edge.litertlm.OpenApiTool
+import com.google.ai.edge.litertlm.ToolException
+import com.google.ai.edge.litertlm.tool
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.sync.withLock
 import java.io.File
 
 /**
@@ -31,20 +39,97 @@ import java.io.File
  * calls with a single mutex. NanoHTTPD's per-request thread will block until prior
  * requests finish, which is correct behavior for a single-GPU device.
  */
-class LlmEngine(private val context: Context) {
+class LlmEngine(private val context: Context) : LlmEngineApi {
 
     companion object {
         private const val TAG = "LlmEngine"
         const val SOURCE_MODEL_PATH = "/data/local/tmp/litertlm/model.litertlm"
+        // v0.8.0 sec review HIGH (post-pass): cap on sidecar-supplied
+        // max_tokens to prevent shell-UID DoS via /data/local/tmp.
+        private const val MAX_TOKENS_HARD_CAP = 65_536
     }
 
     @Volatile private var engine: Engine? = null
     @Volatile private var activeBackend: String = ""
     private val lock = Any()
 
-    fun modelDir(): File = File(context.filesDir, "litertlm").apply { mkdirs() }
-    fun activeModelPath(): File = File(modelDir(), "model.litertlm")
-    fun isLoaded(): Boolean = engine != null
+    init {
+        // v0.8.0 G1: SDK ExperimentalFlags set ONCE at construction.
+        //
+        // Bisect 2026-05-03:
+        //   - constrained=true global → n=30 tools 30/30 PASS, but tools-less
+        //     prose stops at first "```" fence (snake/Python tests ≤30 toks).
+        //   - constrained=true per-call (flip on for tools, off otherwise) →
+        //     n=30 drops to 15/30 (deterministic OOM at idx ~15) — flag flips
+        //     leak grammar-compiler memory, plausibly because each "off→on"
+        //     transition recompiles from scratch and never frees prior pass.
+        //   - constrained=false global → preserves v0.7.2 prose behavior, but
+        //     loses the +60pp T1 multi-tool reliability win.
+        //
+        // Resolution: constrained=true is the v0.8.0 default — the reliability
+        // win is the reason-for-being. Tools-less code-block prose regression
+        // is a known limitation; users who need snake-style code-block prose
+        // can opt out via /data/local/tmp/litertlm/temuxllm.conf with line
+        // `constrained_decode=0`, which we resolve below.
+        @OptIn(com.google.ai.edge.litertlm.ExperimentalApi::class)
+        try {
+            val constrained = readConstrainedDecodingPreference()
+            val caseNorm = (System.getenv("TEMUXLLM_TOOL_CASE_NORMALIZE") ?: "1").lowercase() in listOf("1", "true", "on")
+            com.google.ai.edge.litertlm.ExperimentalFlags.enableConversationConstrainedDecoding = constrained
+            com.google.ai.edge.litertlm.ExperimentalFlags.convertCamelToSnakeCaseInToolDescription = caseNorm
+            Log.i(TAG, "SDK ExperimentalFlags init: constrainedDecoding=$constrained caseNormalize=$caseNorm")
+        } catch (t: Throwable) {
+            Log.w(TAG, "could not set ExperimentalFlags (SDK upgrade may have removed them?)", t)
+        }
+    }
+
+    /**
+     * Resolution order for `enableConversationConstrainedDecoding` preference:
+     *   1. `<filesDir>/temuxllm.conf` line `constrained_decode=0|off|false` → off
+     *   2. `/data/local/tmp/litertlm/temuxllm.conf` (adb-pushable) same line
+     *   3. `TEMUXLLM_CONSTRAINED_DECODE` env var (rarely propagated)
+     *   4. Default: true (the v0.8.0 reliability win)
+     */
+    private fun readConstrainedDecodingPreference(): Boolean {
+        for (cfg in listOf(
+            File(context.filesDir, "temuxllm.conf"),
+            File("/data/local/tmp/litertlm/temuxllm.conf"),
+        )) {
+            try {
+                if (!cfg.exists()) continue
+                val line = cfg.readText(Charsets.UTF_8).lineSequence()
+                    .map { it.trim() }
+                    .firstOrNull { it.startsWith("constrained_decode=") }
+                    ?: continue
+                val v = line.removePrefix("constrained_decode=").trim().lowercase()
+                if (v in listOf("0", "off", "false", "no")) {
+                    Log.i(TAG, "constrained_decode=false from $cfg")
+                    return false
+                }
+            } catch (t: Throwable) {
+                Log.w(TAG, "constrained_decode read failed from $cfg", t)
+            }
+        }
+        val env = System.getenv("TEMUXLLM_CONSTRAINED_DECODE")?.trim()?.lowercase()
+        if (env != null) return env in listOf("1", "true", "on", "yes")
+        return true
+    }
+
+    /**
+     * Serializes inference requests across the entire generate() collect path.
+     * The previous code only locked ensureEngine() — concurrent /api/chat
+     * requests could call createConversation().sendMessageAsync() in parallel,
+     * which the SDK's single-Engine + single-Conversation model does not
+     * support (codex outside-review caught this race v0.4.0). All callers of
+     * generate() / generateBlocking() pass through this lock so that NanoHTTPD's
+     * per-request worker thread blocks until the prior inference finishes,
+     * which is the correct behavior on a single-GPU device.
+     */
+    private val inferenceMutex = kotlinx.coroutines.sync.Mutex()
+
+    override fun modelDir(): File = File(context.filesDir, "litertlm").apply { mkdirs() }
+    override fun activeModelPath(): File = File(modelDir(), "model.litertlm")
+    override fun isLoaded(): Boolean = engine != null
 
     /**
      * One-time model copy from /data/local/tmp/litertlm/model.litertlm into our
@@ -81,6 +166,7 @@ class LlmEngine(private val context: Context) {
     @Synchronized
     fun ensureEngine(backend: String): Engine {
         require(backend == "cpu" || backend == "gpu") { "backend must be cpu|gpu (got $backend)" }
+        // v0.8.0 ExperimentalFlags moved to init {} block (sec review LOW #5).
         val current = engine
         if (current != null && backend == activeBackend) return current
         if (current != null) {
@@ -90,8 +176,38 @@ class LlmEngine(private val context: Context) {
         }
         val modelPath = ensureModelStaged()
         val backendInst = if (backend == "gpu") Backend.GPU() else Backend.CPU()
-        val cfg = EngineConfig(modelPath = modelPath, backend = backendInst)
-        Log.i(TAG, "Engine.initialize(backend=$backend) starting")
+        // EngineConfig.maxNumTokens caps the prefill+decode KV-cache size.
+        // The SDK default is the model's compiled default (4096 for Gemma 4
+        // .litertlm bundles) — too tight for Claude Code's ~16 k built-in
+        // agent system prompt or Codex CLI's ~8 k. KV-cache scales linearly
+        // with this value; on 12 GB devices (S25 / Adreno 830) 32 k OOMs
+        // the foreground service via lowmemorykiller, while 16 k fits.
+        //
+        // Resolution order (highest priority first):
+        //   1. Per-install override file: <filesDir>/temuxllm.conf
+        //      with a line `max_tokens=<int>`. Lets power users (Fold7 /
+        //      Tab S10 Ultra owners) bump to 24 576 / 32 768 without
+        //      rebuilding the APK; engineers tuning a device push the
+        //      file via `adb push` into /data/local/tmp and we copy it
+        //      into filesDir on first staging.
+        //   2. TEMUXLLM_MAX_TOKENS env var (only honored if Android
+        //      somehow inherits it; foreground services usually don't).
+        //   3. Auto-detect from /proc/meminfo MemTotal — the device tier
+        //      table below is conservative and verified on real hardware.
+        val maxTokens = computeMaxNumTokens()
+        // v0.6.0 G3: enable vision encoder on the same backend as text.
+        // Gemma 4 E4B's vision encoder runs on either CPU or GPU; mirroring
+        // text backend keeps memory contention predictable. maxNumImages
+        // capped to 4 to avoid runaway prefill — image tokens are
+        // 70-1120 each at the SDK's discretion (Gemma 4 launch blog).
+        val cfg = EngineConfig(
+            modelPath = modelPath,
+            backend = backendInst,
+            visionBackend = backendInst,
+            maxNumTokens = maxTokens,
+            maxNumImages = 4,
+        )
+        Log.i(TAG, "Engine.initialize(backend=$backend) starting maxTokens=$maxTokens")
         val t0 = System.currentTimeMillis()
         val e = Engine(cfg)
         e.initialize()
@@ -99,6 +215,21 @@ class LlmEngine(private val context: Context) {
         Log.i(TAG, "Engine.initialize(backend=$backend) done in $dt ms")
         engine = e
         activeBackend = backend
+        // Stamp the running configuration into the process so a future LMK
+        // post-mortem can recover it via getHistoricalProcessExitReasons.
+        try {
+            if (Build.VERSION.SDK_INT >= 30) {
+                val am = context.getSystemService(Context.ACTIVITY_SERVICE) as android.app.ActivityManager
+                val packed = AutoFallback.packStateSummary(
+                    maxNumTokens = maxTokens,
+                    backend = backend,
+                    modelName = activeModelPath().nameWithoutExtension,
+                )
+                am.setProcessStateSummary(packed)
+            }
+        } catch (t: Throwable) {
+            Log.w(TAG, "setProcessStateSummary failed", t)
+        }
         return e
     }
 
@@ -108,47 +239,56 @@ class LlmEngine(private val context: Context) {
      *
      * The SDK's sendMessageAsync returns Flow<Message>; we re-emit each Message's
      * text into our own GenerateEvent stream and close with a Done summary.
+     *
+     * The full collect path is serialized on [inferenceMutex]: concurrent
+     * /api/chat requests must NOT call createConversation().sendMessageAsync()
+     * in parallel (the SDK's Engine is single-inference-at-a-time). Per
+     * codex outside-review, the prior code only locked engine init, not
+     * the whole inference path.
      */
-    sealed class GenerateEvent {
-        data class Token(val text: String) : GenerateEvent()
-        data class Done(
-            val backend: String,
-            val totalDurationMs: Long,
-            val outputTokens: Int,
-            val outputChars: Int,
-        ) : GenerateEvent()
-        data class Error(val message: String, val cause: Throwable? = null) : GenerateEvent()
-    }
-
-    fun generate(prompt: String, backend: String): Flow<GenerateEvent> = flow {
-        val started = System.currentTimeMillis()
-        val accum = StringBuilder()
-        var tokens = 0
-        try {
-            val e = synchronized(lock) { ensureEngine(backend) }
-            // Single-conversation per request — fresh state, deterministic.
-            e.createConversation().use { conv ->
-                conv.sendMessageAsync(prompt).collect { msg: Message ->
-                    val piece = msg.toString()
-                    if (piece.isNotEmpty()) {
-                        accum.append(piece)
-                        tokens += 1
-                        emit(GenerateEvent.Token(piece))
+    override fun generate(prompt: String, backend: String, imageBytes: ByteArray?): Flow<GenerateEvent> = flow {
+        inferenceMutex.withLock {
+            val started = System.currentTimeMillis()
+            val accum = StringBuilder()
+            var tokens = 0
+            try {
+                val e = synchronized(lock) { ensureEngine(backend) }
+                e.createConversation().use { conv ->
+                    // v0.6.0 G3: when image is supplied, build a multi-content
+                    // message; otherwise keep the fast string path that also
+                    // matches the SDK's most-tested entry point.
+                    val flow = if (imageBytes != null) {
+                        // Contents constructor is private; use Companion.of(vararg).
+                        val contents = Contents.of(
+                            Content.ImageBytes(imageBytes),
+                            Content.Text(prompt),
+                        )
+                        conv.sendMessageAsync(contents)
+                    } else {
+                        conv.sendMessageAsync(prompt)
+                    }
+                    flow.collect { msg: Message ->
+                        val piece = msg.toString()
+                        if (piece.isNotEmpty()) {
+                            accum.append(piece)
+                            tokens += 1
+                            emit(GenerateEvent.Token(piece))
+                        }
                     }
                 }
-            }
-            val total = System.currentTimeMillis() - started
-            emit(
-                GenerateEvent.Done(
-                    backend = backend,
-                    totalDurationMs = total,
-                    outputTokens = tokens,
-                    outputChars = accum.length,
+                val total = System.currentTimeMillis() - started
+                emit(
+                    GenerateEvent.Done(
+                        backend = backend,
+                        totalDurationMs = total,
+                        outputTokens = tokens,
+                        outputChars = accum.length,
+                    )
                 )
-            )
-        } catch (t: Throwable) {
-            Log.e(TAG, "generate failed", t)
-            emit(GenerateEvent.Error(t.message ?: t.javaClass.simpleName, t))
+            } catch (t: Throwable) {
+                Log.e(TAG, "generate failed", t)
+                emit(GenerateEvent.Error(t.message ?: t.javaClass.simpleName, t))
+            }
         }
     }
 
@@ -156,12 +296,12 @@ class LlmEngine(private val context: Context) {
      * Blocking convenience for non-streaming `/api/generate`. Drains the flow into
      * one final string + metrics.
      */
-    fun generateBlocking(prompt: String, backend: String): GenerateResult = runBlocking {
+    override fun generateBlocking(prompt: String, backend: String, imageBytes: ByteArray?): GenerateResult = runBlocking {
         val text = StringBuilder()
         var tokens = 0
         var doneEvent: GenerateEvent.Done? = null
         var errorMsg: String? = null
-        generate(prompt, backend).collect { ev ->
+        generate(prompt, backend, imageBytes).collect { ev ->
             when (ev) {
                 is GenerateEvent.Token -> { text.append(ev.text); tokens++ }
                 is GenerateEvent.Done -> doneEvent = ev
@@ -177,13 +317,131 @@ class LlmEngine(private val context: Context) {
         )
     }
 
-    data class GenerateResult(
-        val text: String,
+    /**
+     * v0.6.0 native-tools probe (Option B empirical test).
+     *
+     * Builds a `ConversationConfig` with `tools = [tool(openApiTool)]` and
+     * `automaticToolCalling = false`, sends the prompt synchronously, and
+     * returns the SDK-typed `Message.toolCalls` result.
+     *
+     * Why probe-only (not wired into /v1 routes): upstream LiteRT-LM 0.11.0-rc1
+     * has 5 OPEN bugs around the native tool API
+     * (LiteRT-LM #1539 / #1859 / #1027 / #1181 / #1874). Gemma 4 E4B is
+     * NOT in the testdata Jinja templates and the C++ data processor for
+     * Gemma 4 has zero hits for tool tokens. The expected outcome is
+     * one of: SIGSEGV during sendMessage, empty toolCalls list, or
+     * tool definitions never injected into the prompt. We probe to know
+     * which without committing the architecture pivot.
+     *
+     * Caller dispatches the actual tool — we throw ToolException from
+     * execute() so SDK never tries to call it (only matters if the caller
+     * accidentally flips automaticToolCalling=true).
+     *
+     * Returns a JSON-shaped result for HttpServer.handleProbeNativeTools.
+     */
+    data class NativeToolsProbeResult(
         val backend: String,
-        val outputTokens: Int,
-        val totalDurationMs: Long,
+        val durationMs: Long,
+        val role: String,
+        val rawText: String,
+        val toolCallNames: List<String>,
+        val toolCallArgs: List<Map<String, Any?>>,
         val error: String?,
     )
+
+    // v0.7.0: real native-tools generate. Used by /v1 routes when
+    // nativeToolsEnabled flag is on AND request has tools[]. The probe
+    // endpoint also calls this with a one-element list.
+    //
+    // Accepts multiple tool definitions and an optional image. Sync only —
+    // SDK's sendMessageAsync populates Message.toolCalls only at the
+    // terminal frame, so for tool-using flows the buffer-then-emit pattern
+    // is the cleanest.
+    fun generateWithNativeTools(
+        backend: String,
+        prompt: String,
+        toolDescJsons: List<String>,
+        imageBytes: ByteArray? = null,
+    ): NativeToolsProbeResult {
+        val started = System.currentTimeMillis()
+        val openApiTools = toolDescJsons.map { td ->
+            object : OpenApiTool {
+                override fun getToolDescriptionJsonString(): String = td
+                override fun execute(arguments: String): String {
+                    throw ToolException(
+                        "service is stateless; caller dispatches",
+                        null,
+                    )
+                }
+            }
+        }
+        return runBlocking {
+            inferenceMutex.withLock {
+                try {
+                    val e = synchronized(lock) { ensureEngine(backend) }
+                    val cfg = ConversationConfig(
+                        systemInstruction = null,
+                        initialMessages = emptyList(),
+                        tools = openApiTools.map { tool(it) },
+                        samplerConfig = null,
+                        automaticToolCalling = false,
+                        channels = null,
+                        extraContext = emptyMap(),
+                    )
+                    e.createConversation(cfg).use { conv ->
+                        // Sync sendMessage; we want the full Message back, not a stream.
+                        val msg = if (imageBytes != null) {
+                            conv.sendMessage(Contents.of(
+                                Content.ImageBytes(imageBytes),
+                                Content.Text(prompt),
+                            ))
+                        } else {
+                            conv.sendMessage(prompt)
+                        }
+                        val names = msg.toolCalls.map { it.name }
+                        val args = msg.toolCalls.map { it.arguments }
+                        // v0.8.1 codex P1: was `.take(4096)` from when this
+                        // method was a probe-only diagnostic. v0.7.0
+                        // promoted it to the production path for tool-
+                        // enabled `/api/chat`, `/v1/chat/completions`,
+                        // `/v1/messages`, `/v1/responses` — at that point
+                        // the cap silently truncated long assistant
+                        // content (`read_file` results, snake-game-sized
+                        // outputs, etc). Drop the cap; rely on the SDK's
+                        // own KV-cache budget (maxNumTokens) to bound
+                        // size.
+                        NativeToolsProbeResult(
+                            backend = backend,
+                            durationMs = System.currentTimeMillis() - started,
+                            role = msg.role.toString(),
+                            rawText = msg.toString(),
+                            toolCallNames = names,
+                            toolCallArgs = args,
+                            error = null,
+                        )
+                    }
+                } catch (t: Throwable) {
+                    Log.e(TAG, "generateWithNativeTools failed", t)
+                    NativeToolsProbeResult(
+                        backend = backend,
+                        durationMs = System.currentTimeMillis() - started,
+                        role = "",
+                        rawText = "",
+                        toolCallNames = emptyList(),
+                        toolCallArgs = emptyList(),
+                        error = "${t.javaClass.simpleName}: ${t.message ?: ""}",
+                    )
+                }
+            }
+        }
+    }
+
+    /** Probe-endpoint wrapper kept for /api/probe/native_tools back-compat. */
+    fun probeNativeToolCall(
+        backend: String,
+        prompt: String,
+        toolDescJson: String,
+    ): NativeToolsProbeResult = generateWithNativeTools(backend, prompt, listOf(toolDescJson), null)
 
     fun close() {
         synchronized(lock) {
@@ -191,5 +449,127 @@ class LlmEngine(private val context: Context) {
             engine = null
             activeBackend = ""
         }
+    }
+
+    /**
+     * Variant of [close] that also acquires [inferenceMutex] so concurrent
+     * generate() flows finish (or fail safely) before we tear down the
+     * JNI handle. Called by LlmService.onTrimMemory(RUNNING_CRITICAL) per
+     * codex outside-review v0.4.0 (close was racing with in-flight work).
+     */
+    fun closeUnderInferenceLock() {
+        runBlocking { inferenceMutex.withLock { close() } }
+    }
+
+    /**
+     * Pick a KV-cache size based on (in priority order) a config sidecar,
+     * an inheritable env var, or auto-detection from /proc/meminfo.
+     *
+     * Tiers (verified or conservatively projected):
+     *   ≤ 6 GB  → 4096   (E2B-only territory; Gemma 4 default)
+     *   ≤ 9 GB  → 8192   (8 GB phones; safe headroom for E2B)
+     *   ≤ 13 GB → 16384  (S25 / 12 GB / Adreno 830 — verified works)
+     *   ≤ 18 GB → 24576  (Fold7 / 16 GB — projected ceiling)
+     *   else    → 32768  (Tab S10 Ultra and similar 24+ GB devices)
+     */
+    private fun computeMaxNumTokens(): Int {
+        // Priority chain (highest first):
+        //   1)  <filesDir>/temuxllm.conf            user-owned, app-private
+        //   1b) /data/local/tmp/litertlm/temuxllm.conf  user-owned, adb-pushable
+        //   2)  <filesDir>/auto_max_tokens.conf     post-LMK auto-downshift
+        //   3)  TEMUXLLM_MAX_TOKENS env var         rarely propagated
+        //   4)  /proc/meminfo tier table            auto-detect
+        //
+        // codex outside-review v0.4.0 caught that the auto-downshift file
+        // must NOT take precedence over the manual /data/local/tmp path —
+        // that's the existing supported override channel for users who
+        // can't write into the app's filesDir.
+        // v0.8.0 sec review HIGH (post-pass): clamp sidecar-supplied
+        // max_tokens to MAX_TOKENS_HARD_CAP (65536) so a hostile actor
+        // with shell UID write access to /data/local/tmp/litertlm/ can't
+        // OOM the service by setting Int.MAX_VALUE. The hardware tier
+        // table caps at 32768 already; 65536 leaves headroom for future
+        // higher-RAM devices without trusting unbounded user input.
+        try {
+            val cfg = File(context.filesDir, "temuxllm.conf")
+            if (cfg.exists()) {
+                val line = cfg.readText(Charsets.UTF_8).lineSequence()
+                    .map { it.trim() }
+                    .firstOrNull { it.startsWith("max_tokens=") }
+                if (line != null) {
+                    val v = line.removePrefix("max_tokens=").trim().toIntOrNull()
+                    if (v != null && v in 1..MAX_TOKENS_HARD_CAP) {
+                        Log.i(TAG, "computeMaxNumTokens: $v from $cfg override")
+                        return v
+                    } else if (v != null) {
+                        Log.w(TAG, "computeMaxNumTokens: $cfg max_tokens=$v out of [1..$MAX_TOKENS_HARD_CAP]; ignoring")
+                    }
+                }
+            }
+        } catch (t: Throwable) {
+            Log.w(TAG, "computeMaxNumTokens: temuxllm.conf read failed", t)
+        }
+        // 1b) Mirror in /data/local/tmp so users pushing config without app
+        // running can take effect on next service start.
+        try {
+            val tmpCfg = File("/data/local/tmp/litertlm/temuxllm.conf")
+            if (tmpCfg.exists()) {
+                val line = tmpCfg.readText(Charsets.UTF_8).lineSequence()
+                    .map { it.trim() }
+                    .firstOrNull { it.startsWith("max_tokens=") }
+                if (line != null) {
+                    val v = line.removePrefix("max_tokens=").trim().toIntOrNull()
+                    if (v != null && v in 1..MAX_TOKENS_HARD_CAP) {
+                        Log.i(TAG, "computeMaxNumTokens: $v from $tmpCfg override")
+                        return v
+                    } else if (v != null) {
+                        Log.w(TAG, "computeMaxNumTokens: $tmpCfg max_tokens=$v out of [1..$MAX_TOKENS_HARD_CAP]; ignoring")
+                    }
+                }
+            }
+        } catch (t: Throwable) {
+            Log.w(TAG, "computeMaxNumTokens: /data/local/tmp/.../temuxllm.conf read failed", t)
+        }
+        // 2) auto_max_tokens.conf — populated by AutoFallback after a
+        //    previous LMK kill. Below both manual override paths so a
+        //    user adb-push to /data/local/tmp/.../temuxllm.conf always
+        //    wins. Fingerprint check invalidates the value if hardware
+        //    has changed between the recorded LMK and now.
+        try {
+            val fp = AutoFallback.deviceFingerprint(context)
+            val auto = AutoFallback.readPersistedFallback(context, fp)
+            if (auto != null && auto > 0) {
+                Log.i(TAG, "computeMaxNumTokens: $auto from auto_max_tokens.conf (post-LMK fallback)")
+                return auto
+            }
+        } catch (t: Throwable) {
+            Log.w(TAG, "computeMaxNumTokens: auto_max_tokens.conf read failed", t)
+        }
+        // 3) Env var (rarely honored by Android service inheritance).
+        val ctxEnv = System.getenv("TEMUXLLM_MAX_TOKENS")?.toIntOrNull()
+        if (ctxEnv != null && ctxEnv > 0) {
+            Log.i(TAG, "computeMaxNumTokens: $ctxEnv from TEMUXLLM_MAX_TOKENS env")
+            return ctxEnv
+        }
+        // 3) Auto-detect from /proc/meminfo MemTotal.
+        val memKb = try {
+            File("/proc/meminfo").readLines()
+                .firstOrNull { it.startsWith("MemTotal:") }
+                ?.trim()
+                ?.split(Regex("\\s+"))
+                ?.getOrNull(1)
+                ?.toLongOrNull() ?: 0L
+        } catch (_: Throwable) { 0L }
+        val memGb = (memKb + 524288L) / 1024L / 1024L  // round up to nearest GB
+        val auto = when {
+            memGb <= 0L -> 4096
+            memGb <= 6L -> 4096
+            memGb <= 9L -> 8192
+            memGb <= 13L -> 16384
+            memGb <= 18L -> 24576
+            else -> 32768
+        }
+        Log.i(TAG, "computeMaxNumTokens: $auto auto-selected (MemTotal≈${memGb} GB)")
+        return auto
     }
 }
