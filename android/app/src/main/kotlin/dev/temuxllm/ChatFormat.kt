@@ -65,6 +65,10 @@ object ChatFormat {
                 "user" -> sb.append("User: ").append(text).append('\n')
                 "assistant" -> sb.append("Assistant: ").append(text).append('\n')
                 "tool" -> {
+                    // v0.6.0 G2: unified prose. Same shape as the content-block
+                    // tool_result branch in extractText() so models see ONE
+                    // tool-result format across single-turn AND multi-turn,
+                    // across all four wire envelopes.
                     val toolName = msg.optString("name", "tool")
                     sb.append("Tool[").append(toolName).append("]: ").append(text).append('\n')
                 }
@@ -99,15 +103,51 @@ object ChatFormat {
                     // OpenAI Responses output shape — Codex echoes prior
                     // assistant turns back into `input` as `output_text` items.
                     "output_text" -> sb.append(block.optString("text"))
-                    "image", "image_url", "input_image" ->
-                        return Result.Bad("image content is not supported on this model")
-                    // Anthropic and OpenAI Responses tool blocks.
-                    "tool_use", "tool_result", "tool_call", "function_call" ->
+                    "image", "image_url", "input_image" -> {
+                        // v0.6.0 G3: image content is now extracted at the
+                        // HttpServer level (extractFirstImage) and passed to
+                        // engine.generate(... imageBytes = ...). The block here
+                        // is a placeholder marker so the prompt text doesn't
+                        // accidentally collapse multi-block content.
+                        if (sb.isNotEmpty() && !sb.last().isWhitespace()) sb.append(' ')
+                    }
+                    // v0.6.0 G2: unified prose for all envelope tool-result blocks.
+                    // Previously raw-JSON-stringified for Anthropic / OpenAI Chat /
+                    // Ollama (only Responses path used prose), which Gemma 4 doesn't
+                    // know how to follow on the second turn (template not in training
+                    // distribution). All four envelopes now emit the same prose form
+                    // so multi-turn tool flows work the same regardless of wire.
+                    "tool_result" -> {
+                        // Anthropic v1/messages — name lives on the originating
+                        // tool_use block, not on the tool_result. We approximate
+                        // with tool_use_id when name isn't carried.
+                        val name = block.optString("name").ifBlank { block.optString("tool_use_id", "tool") }
+                        val resultText = when (val r = block.opt("content")) {
+                            is String -> r
+                            is JSONArray -> {
+                                val parts = StringBuilder()
+                                for (j in 0 until r.length()) {
+                                    val sub = r.optJSONObject(j) ?: continue
+                                    if (sub.optString("type") == "text") parts.append(sub.optString("text"))
+                                }
+                                parts.toString()
+                            }
+                            null -> ""
+                            else -> r.toString()
+                        }
+                        sb.append('\n').append("Tool[").append(name).append("]: ").append(resultText).append('\n')
+                    }
+                    "tool_use", "tool_call", "function_call" ->
+                        // Caller's prior assistant turn carrying a tool call —
+                        // serialize as text so flatten() can echo it back without
+                        // confusing the model. The tool result follows in a
+                        // subsequent block, picked up by the tool_result branch.
                         sb.append('\n').append(block.toString()).append('\n')
                     "function_call_output" -> {
                         // OpenAI Responses tool-result block — body is `output`.
+                        val name = block.optString("name").ifBlank { "tool" }
                         val out = block.opt("output")?.toString().orEmpty()
-                        sb.append('\n').append("Tool result: ").append(out).append('\n')
+                        sb.append('\n').append("Tool[").append(name).append("]: ").append(out).append('\n')
                     }
                     "" -> { if (sb.isNotEmpty()) sb.append(' ') }
                     else -> {
@@ -193,10 +233,33 @@ object ChatFormat {
         if (raw.isBlank()) return ParsedOutput(raw, emptyList())
         val idx = findToolCallsObjectStart(raw)
         if (idx < 0) return ParsedOutput(raw.trim(), emptyList())
+        // v0.6.0: try strict balance first; if model emitted unbalanced JSON
+        // (the 7/30 Gemma 4 baseline failures we saw — `{"tool_calls":[...]]`
+        // missing the outer `}`), fall through to repair-and-retry. Same
+        // approach as Ollama's `repairGemma4ToolCallArgs` (`model/parsers/gemma4.go:485`).
         val end = findMatchingBrace(raw, idx)
-        if (end < 0) return ParsedOutput(raw.trim(), emptyList())
-        val candidate = raw.substring(idx, end + 1)
-        val parsed = try { JSONObject(candidate) } catch (_: Throwable) { return ParsedOutput(raw.trim(), emptyList()) }
+        var parsed: JSONObject? = null
+        var consumedEnd: Int = end  // index of last char consumed from raw
+        if (end >= 0) {
+            parsed = try { JSONObject(raw.substring(idx, end + 1)) } catch (_: Throwable) { null }
+        }
+        if (parsed == null) {
+            // Repair attempt: take from idx to end of raw, balance braces/brackets.
+            val tail = raw.substring(idx)
+            val repaired = repairToolCallJson(tail)
+            if (repaired != null) {
+                parsed = try { JSONObject(repaired) } catch (_: Throwable) { null }
+                if (parsed != null) {
+                    consumedEnd = raw.length - 1   // repair consumed everything from idx
+                    // Guard with try/catch — unit tests don't mock android.util.Log,
+                    // and the parser is on the hot path; never let logging crash.
+                    try {
+                        android.util.Log.i("ChatFormat", "tool_call repair applied; tail_len=${tail.length} repaired_len=${repaired.length}")
+                    } catch (_: Throwable) {}
+                }
+            }
+        }
+        if (parsed == null) return ParsedOutput(raw.trim(), emptyList())
         val arr = parsed.optJSONArray("tool_calls") ?: return ParsedOutput(raw.trim(), emptyList())
         val calls = mutableListOf<ToolCall>()
         for (i in 0 until arr.length()) {
@@ -221,8 +284,98 @@ object ChatFormat {
             val id = "call_" + UUID.randomUUID().toString().replace("-", "").take(20)
             calls += ToolCall(id = id, name = n, arguments = a)
         }
-        val text = (raw.substring(0, idx) + raw.substring(end + 1)).trim()
+        val text = (raw.substring(0, idx) + (if (consumedEnd + 1 <= raw.length) raw.substring(consumedEnd + 1) else "")).trim()
         return ParsedOutput(text, calls)
+    }
+
+    /**
+     * Repair a Gemma 4-style malformed tool-call JSON tail. Walks the string
+     * tracking string-quote / brace / bracket depth; on EOF, appends matching
+     * closers in the right order (innermost first). Returns null if there's
+     * nothing recognizable to repair.
+     *
+     * The 7/30 baseline failures (May 2026 v0.5.2 measurement) all share the
+     * pattern `{"tool_calls":[{"name":"x","arguments":{"city":"Cairo"}]}` —
+     * inner object close `}` missing, then bracket close, then outer close
+     * also missing. This handler appends the missing closers deterministically.
+     *
+     * Inspired by Ollama's `model/parsers/gemma4.go:485 repairGemma4ToolCallArgs`
+     * but only does the closing-brace/bracket pass that explains 100% of our
+     * Gemma 4 E4B baseline failures. Trailing-comma / single-quote repairs
+     * are deferred until empirical baseline shows we need them.
+     *
+     * @param tail string starting at the `{` of a tool-call object
+     * @return repaired JSON string, or null if the input is too broken
+     */
+    fun repairToolCallJson(tail: String): String? {
+        if (tail.isEmpty() || tail[0] != '{') return null
+        // Defense-in-depth caps. Largest realistic Gemma output for a tool
+        // call is ~2 KiB; 64 KiB is 30x that and still safely under any
+        // memory pressure on a 12 GB device. Beyond this threshold the
+        // input is almost certainly a probe / pathological payload and
+        // not worth attempting repair on. (security review HIGH#1 +
+        // code review HIGH#1)
+        if (tail.length > 64 * 1024) return null
+        val maxDepth = 128
+        // Stack-based balanced rewriter. The 7/30 Gemma 4 E4B baseline failure
+        // pattern (`{"tool_calls":[{"name":"x","arguments":{"k":"v"}]}`) drops
+        // a `}` BEFORE the `]`, not at EOF — naive "append closers at EOF"
+        // can't fix it. We track open brackets in a stack; when we see `]`
+        // while the top is `{`, we insert `}` until top is `[`, then pop.
+        // Stray closers are dropped (model occasionally over-closes).
+        val out = StringBuilder()
+        val stack = ArrayDeque<Char>()
+        var inString = false
+        var escaped = false
+        var i = 0
+        while (i < tail.length) {
+            val c = tail[i]
+            if (inString) {
+                out.append(c)
+                if (escaped) escaped = false
+                else if (c == '\\') escaped = true
+                else if (c == '"') inString = false
+            } else {
+                when (c) {
+                    '"' -> { out.append(c); inString = true }
+                    '{' -> {
+                        if (stack.size >= maxDepth) return null   // bail on pathological nesting
+                        out.append(c); stack.addLast('{')
+                    }
+                    '[' -> {
+                        if (stack.size >= maxDepth) return null
+                        out.append(c); stack.addLast('[')
+                    }
+                    '}' -> {
+                        if (stack.isNotEmpty() && stack.last() == '{') {
+                            stack.removeLast(); out.append(c)
+                        }
+                        // Stray `}` (over-close): drop silently.
+                    }
+                    ']' -> {
+                        // If top is `{`, we have one or more missing `}` before this `]`.
+                        while (stack.isNotEmpty() && stack.last() == '{') {
+                            out.append('}'); stack.removeLast()
+                        }
+                        if (stack.isNotEmpty() && stack.last() == '[') {
+                            stack.removeLast(); out.append(c)
+                        }
+                        // Stray `]`: drop.
+                    }
+                    else -> out.append(c)
+                }
+            }
+            i += 1
+        }
+        if (inString) return null
+        // EOF: pop any remaining open brackets, appending matching closers.
+        while (stack.isNotEmpty()) {
+            when (stack.removeLast()) {
+                '{' -> out.append('}')
+                '[' -> out.append(']')
+            }
+        }
+        return out.toString()
     }
 
     /**

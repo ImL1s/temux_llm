@@ -85,7 +85,18 @@ litertlm --help
 
 ---
 
-## 跟 CLI coding agent 一起用（v0.5.1 實測矩陣）
+## 跟 CLI coding agent 一起用（v0.6.0 實測矩陣）
+
+> **v0.6.0 重點**：vision 圖片輸入接到 `/v1/messages` /
+> `/v1/chat/completions` / `/api/chat` / `/v1/responses` 四條 wire
+> （Galaxy S25 讀出 64×48 PNG 裡的 "STOP" — 不需要 fork）；Gemma 4 E4B
+> tool-call 通過率從 **77 % → 100 %**（n=30），靠 port 自 Ollama 的
+> stack-based JSON repair；新 endpoint `/api/probe/native_tools` 走
+> SDK 原生 tool 路徑也 100 %、快 30 %，v0.7 透過 `temuxllm.conf` 的
+> `native_tools=on` 切過去；codex 的 `web_search` 在 `/v1/responses`
+> 入口被過濾掉，model 不再瞎掰 hosted-tool 結果。
+
+
 
 `temux_llm` 對外協定模仿 Ollama 0.13+，常見 coding agent CLI 可以直接接，
 不需要 proxy。下面這張表是 **v0.5.1 在 Galaxy S25（12 GB / 16k context、

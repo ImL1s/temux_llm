@@ -68,6 +68,191 @@ class HttpServer(
     // no override is set so 16 GB+ devices keep the fast path.
     private val defaultBackend: String = resolveDefaultBackend(context)
 
+    // v0.6.0 G7-alt: opt-in native SDK tool API (Option B).
+    // STATUS in v0.6.0: this flag (a) gates the /api/probe/native_tools
+    // endpoint and (b) is exposed via /api/version. It does NOT yet route
+    // /v1/* tool requests through the native path — that wiring lands in
+    // v0.7.0 once streaming-with-tools delta semantics are sorted. The
+    // probe endpoint is the only consumer right now.
+    // Empirical: Galaxy S25 + Gemma 4 E4B + 0.11.0-rc1 = 30/30 tool calls
+    // pass via SDK native path (vs 23/30 = 77% via prompt-injection
+    // baseline; v0.6.0 G1 repair lifts that to 30/30 too). Native is ~30 %
+    // faster (5.7 s vs 7-8 s/call) and emits typed `tool_calls`, no
+    // brace-balance parser needed. Disabled by default because:
+    //   - upstream LiteRT-LM has 5 OPEN tool-API issues for OTHER models
+    //     (Qwen3 / Gemma 3n / FunctionGemma) that may bite users on
+    //     non-Gemma-4 models.
+    //   - streaming-with-tools surface isn't yet wired to native path
+    //     (MessageCallback.onMessage delivery semantics differ from our
+    //     NDJSON delta flow).
+    //   - we want the Option A repair path as a safety net for any future
+    //     SDK regression.
+    // Override via env var or /data/local/tmp/litertlm/temuxllm.conf:
+    //   native_tools=on
+    private val nativeToolsEnabled: Boolean = run {
+        val fromConf = try {
+            listOfNotNull(
+                File(context.filesDir, "temuxllm.conf"),
+                File("/data/local/tmp/litertlm/temuxllm.conf"),
+            ).firstOrNull { it.canRead() }
+                ?.readLines()?.map { it.trim() }
+                ?.firstOrNull { it.startsWith("native_tools=", ignoreCase = true) }
+                ?.substringAfter('=')?.trim()?.lowercase()
+        } catch (_: Throwable) { null }
+        val raw = fromConf ?: System.getenv("TEMUXLLM_NATIVE_TOOLS")?.trim()?.lowercase()
+        raw == "on" || raw == "1" || raw == "true"
+    }
+
+    /**
+     * v0.6.0 G3: extract first image bytes from a request body.
+     * Walks `messages[].content[]` looking for the first OpenAI/Anthropic
+     * image content block. Returns the decoded bytes plus a 4xx error
+     * shorthand if the block was malformed.
+     *
+     * Accepted shapes (data-URI base64 only — http(s) URLs rejected per
+     * Ollama precedent, since fetching arbitrary remote URLs from a
+     * localhost service is a clear SSRF risk):
+     *   Anthropic: { type:"image", source:{type:"base64",media_type,data} }
+     *   OpenAI:    { type:"image_url", image_url:{url:"data:image/...;base64,..."} }
+     *   OpenAI Responses: { type:"input_image", image_url:"data:..." }
+     *   Ollama:    top-level field `images: ["base64,...", ...]` on user message
+     *
+     * Caps: 2 MiB raw bytes after base64 decode. Larger -> 413.
+     */
+    private data class ImageOrError(val bytes: ByteArray?, val error: Response?)
+
+    private fun extractFirstImage(body: JSONObject): ImageOrError {
+        val maxBytes = 2 * 1024 * 1024
+        // Ollama-style top-level images on the last user message
+        val msgs = body.optJSONArray("messages")
+        if (msgs != null) {
+            for (i in 0 until msgs.length()) {
+                val m = msgs.optJSONObject(i) ?: continue
+                if (m.optString("role") != "user") continue
+                val imgs = m.optJSONArray("images")
+                if (imgs != null && imgs.length() > 0) {
+                    val raw = imgs.optString(0)
+                    return decodeImagePayload(raw, maxBytes)
+                }
+                val content = m.opt("content") as? JSONArray ?: continue
+                for (j in 0 until content.length()) {
+                    val block = content.optJSONObject(j) ?: continue
+                    val parsed = parseImageBlock(block, maxBytes)
+                    if (parsed != null) return parsed
+                }
+            }
+        }
+        // Responses input array
+        val input = body.opt("input")
+        if (input is JSONArray) {
+            for (i in 0 until input.length()) {
+                val item = input.optJSONObject(i) ?: continue
+                val content = item.opt("content") as? JSONArray ?: continue
+                for (j in 0 until content.length()) {
+                    val block = content.optJSONObject(j) ?: continue
+                    val parsed = parseImageBlock(block, maxBytes)
+                    if (parsed != null) return parsed
+                }
+            }
+        }
+        return ImageOrError(null, null)   // no image found, OK
+    }
+
+    private fun parseImageBlock(block: JSONObject, maxBytes: Int): ImageOrError? {
+        return when (block.optString("type")) {
+            "image" -> {
+                // Anthropic: source.type = "base64", source.data
+                val src = block.optJSONObject("source") ?: return null
+                if (src.optString("type") != "base64") {
+                    return ImageOrError(null, errorJson(Response.Status.BAD_REQUEST, "image source.type must be base64 (got ${src.optString("type")})"))
+                }
+                decodeImagePayload(src.optString("data"), maxBytes)
+            }
+            "image_url" -> {
+                val urlObj = block.opt("image_url")
+                val url = when (urlObj) {
+                    is JSONObject -> urlObj.optString("url")
+                    is String -> urlObj
+                    else -> return null
+                }
+                decodeImagePayload(url, maxBytes)
+            }
+            "input_image" -> {
+                // OpenAI Responses: image_url is a string here
+                decodeImagePayload(block.optString("image_url"), maxBytes)
+            }
+            else -> null
+        }
+    }
+
+    private fun decodeImagePayload(raw: String, maxBytes: Int): ImageOrError {
+        if (raw.isBlank()) return ImageOrError(null, errorJson(Response.Status.BAD_REQUEST, "image payload empty"))
+        // data:image/...;base64,<...>  OR raw base64 (Ollama).
+        val b64 = if (raw.startsWith("data:")) {
+            val comma = raw.indexOf(',')
+            if (comma < 0) return ImageOrError(null, errorJson(Response.Status.BAD_REQUEST, "data URI missing payload"))
+            // Reject http(s) URLs: they'd be the rare data: URL with http inside, but we don't fetch.
+            raw.substring(comma + 1)
+        } else if (raw.contains("://")) {
+            // Reject every URL scheme other than data: — http(s) (SSRF),
+            // file:// (LFI), content:// (Android content provider), and any
+            // future scheme. We never fetch; bare base64 or data: only.
+            // (security review HIGH#1)
+            return ImageOrError(null, errorJson(Response.Status.BAD_REQUEST,
+                "image URL scheme '${raw.substringBefore("://")}' is rejected; inline as data: URI or bare base64 only"))
+        } else {
+            raw   // bare base64 (Ollama-style)
+        }
+        val bytes = try {
+            android.util.Base64.decode(b64, android.util.Base64.DEFAULT)
+        } catch (_: Throwable) {
+            return ImageOrError(null, errorJson(Response.Status.BAD_REQUEST, "image base64 decode failed"))
+        }
+        if (bytes.size > maxBytes) {
+            return ImageOrError(null, json(
+                Response.Status.lookup(413) ?: Response.Status.BAD_REQUEST,
+                JSONObject().apply {
+                    put("error", "image_too_large")
+                    put("message", "image bytes exceed 2 MiB cap (got ${bytes.size})")
+                },
+            ))
+        }
+        return ImageOrError(bytes, null)
+    }
+
+    /**
+     * v0.6.0 G4: filter codex's hosted `web_search` / `web_search_preview`
+     * tool definitions out of the inbound tools array. Returns the filtered
+     * array (or null if no tools remain) plus an optional system-prompt
+     * sentence to inject when filtering removed at least one entry.
+     *
+     * The hint says we don't have web access so the model is steered against
+     * pretending to use a search tool. Without the hint the model sometimes
+     * confabulates web_search_call items that codex silently treats as
+     * "server already ran this" — see protocol/src/models.rs:854.
+     */
+    private fun filterWebSearchTools(tools: JSONArray?): Pair<JSONArray?, String?> {
+        if (tools == null || tools.length() == 0) return Pair(tools, null)
+        val allow = System.getenv("TEMUXLLM_ALLOW_WEB_SEARCH") == "1"
+        if (allow) return Pair(tools, null)
+        val filtered = JSONArray()
+        var stripped = 0
+        for (i in 0 until tools.length()) {
+            val t = tools.optJSONObject(i) ?: continue
+            val type = t.optString("type")
+            if (type == "web_search" || type == "web_search_preview") {
+                stripped += 1
+                continue
+            }
+            filtered.put(t)
+        }
+        val out = if (filtered.length() == 0) null else filtered
+        val hint = if (stripped > 0) {
+            "You do not have web access; respond without referencing real-time information."
+        } else null
+        return Pair(out, hint)
+    }
+
     private fun resolveDefaultBackend(ctx: Context): String {
         fun readKey(file: File): String? = try {
             if (!file.canRead()) null
@@ -134,6 +319,16 @@ class HttpServer(
             session.uri == "/v1/responses" && session.method == Method.POST ->
                 handleOpenAiResponses(session)
 
+            // v0.6.0 probe (Option B empirical test): native SDK tool API.
+            // Gated behind nativeToolsEnabled flag — even though the service
+            // binds 127.0.0.1, any app on-device can POST here and a malformed
+            // tool_description triggers JNI parsing in the SDK that may
+            // SIGSEGV (security review MEDIUM#3). Off by default; turn on with
+            // `native_tools=on` in temuxllm.conf or TEMUXLLM_NATIVE_TOOLS=1.
+            session.uri == "/api/probe/native_tools" && session.method == Method.POST ->
+                if (nativeToolsEnabled) handleProbeNativeTools(session)
+                else text(Response.Status.NOT_FOUND, "404 ${session.method} ${session.uri}\n")
+
             else -> text(Response.Status.NOT_FOUND, "404 ${session.method} ${session.uri}\n")
         }
     } catch (_: BodyTooLarge) {
@@ -171,6 +366,7 @@ class HttpServer(
         put("phase", "3a")
         put("runtime", "litertlm-android 0.11.0-rc1 (in-process Engine)")
         put("default_backend", defaultBackend)
+        put("native_tools_enabled", nativeToolsEnabled)
         put("engine_loaded", engine.isLoaded())
     }
 
@@ -232,6 +428,10 @@ class HttpServer(
             is ChatFormat.Result.Ok -> r.prompt
             is ChatFormat.Result.Bad -> return errorJson(Response.Status.BAD_REQUEST, r.message)
         }
+        // v0.6.0 G3: vision input — extracted before backend so 4xx returns
+        // arrive without engine init.
+        val img = extractFirstImage(body)
+        if (img.error != null) return img.error
         val backend = body.optString("backend", defaultBackend).lowercase()
         if (backend != "cpu" && backend != "gpu") {
             return errorJson(Response.Status.BAD_REQUEST, "backend must be cpu|gpu (got $backend)")
@@ -241,8 +441,8 @@ class HttpServer(
         val allowedToolNames = ChatFormat.toolNamesFromRequest(tools)
         return when {
             stream && hasTools -> runStreamBuffered(prompt, backend, NdjsonChatEncoder(resolved.name), allowedToolNames)
-            stream -> runStream(prompt, backend, NdjsonChatEncoder(resolved.name))
-            else -> blockingGenerate(prompt, backend, resolved.name, ResponseShape.OllamaChat, parseTools = hasTools, allowedToolNames = allowedToolNames)
+            stream -> runStream(prompt, backend, NdjsonChatEncoder(resolved.name), img.bytes)
+            else -> blockingGenerate(prompt, backend, resolved.name, ResponseShape.OllamaChat, parseTools = hasTools, allowedToolNames = allowedToolNames, imageBytes = img.bytes)
         }
     }
 
@@ -262,6 +462,8 @@ class HttpServer(
             is ChatFormat.Result.Ok -> r.prompt
             is ChatFormat.Result.Bad -> return errorJson(Response.Status.BAD_REQUEST, r.message)
         }
+        val img = extractFirstImage(body)
+        if (img.error != null) return img.error
         val backend = body.optString("backend", defaultBackend).lowercase()
         if (backend != "cpu" && backend != "gpu") {
             return errorJson(Response.Status.BAD_REQUEST, "backend must be cpu|gpu (got $backend)")
@@ -271,8 +473,8 @@ class HttpServer(
         val allowedToolNames = ChatFormat.toolNamesFromRequest(tools)
         return when {
             stream && hasTools -> runStreamBuffered(prompt, backend, OpenAiSseEncoder(resolved.name), allowedToolNames)
-            stream -> runStream(prompt, backend, OpenAiSseEncoder(resolved.name))
-            else -> blockingGenerate(prompt, backend, resolved.name, ResponseShape.OpenAiChat, parseTools = hasTools, allowedToolNames = allowedToolNames)
+            stream -> runStream(prompt, backend, OpenAiSseEncoder(resolved.name), img.bytes)
+            else -> blockingGenerate(prompt, backend, resolved.name, ResponseShape.OpenAiChat, parseTools = hasTools, allowedToolNames = allowedToolNames, imageBytes = img.bytes)
         }
     }
 
@@ -312,6 +514,8 @@ class HttpServer(
             is ChatFormat.Result.Ok -> r.prompt
             is ChatFormat.Result.Bad -> return errorJson(Response.Status.BAD_REQUEST, r.message)
         }
+        val img = extractFirstImage(body)
+        if (img.error != null) return img.error
         val backend = body.optString("backend", defaultBackend).lowercase()
         if (backend != "cpu" && backend != "gpu") {
             return errorJson(Response.Status.BAD_REQUEST, "backend must be cpu|gpu (got $backend)")
@@ -321,9 +525,62 @@ class HttpServer(
         val allowedToolNames = ChatFormat.toolNamesFromRequest(tools)
         return when {
             stream && hasTools -> runStreamBuffered(prompt, backend, AnthropicSseEncoder(resolved.name), allowedToolNames)
-            stream -> runStream(prompt, backend, AnthropicSseEncoder(resolved.name))
-            else -> blockingGenerate(prompt, backend, resolved.name, ResponseShape.AnthropicMessages, parseTools = hasTools, allowedToolNames = allowedToolNames)
+            stream -> runStream(prompt, backend, AnthropicSseEncoder(resolved.name), img.bytes)
+            else -> blockingGenerate(prompt, backend, resolved.name, ResponseShape.AnthropicMessages, parseTools = hasTools, allowedToolNames = allowedToolNames, imageBytes = img.bytes)
         }
+    }
+
+    // v0.6.0 probe (Option B empirical test): native SDK tool API.
+    //
+    // POST body schema: prompt (string), tool_description (JSON-string of the
+    // single OpenAI/Anthropic tool def), backend (cpu|gpu, default = defaultBackend).
+    //
+    // Response schema: backend, duration_ms, role, raw_text, tool_calls (array
+    // of name+arguments), error (nullable string).
+    //
+    // Hidden from /v1 paths because LiteRT-LM 0.11.0-rc1's native tool API
+    // has 5 OPEN upstream issues (#1539 #1859 #1027 #1181 #1874). Probe is
+    // for empirical comparison vs Option A (prompt-injection + JSON repair).
+    private fun handleProbeNativeTools(session: IHTTPSession): Response {
+        val body = readJsonBody(session) ?: return errorJson(Response.Status.BAD_REQUEST, "invalid JSON body")
+        val prompt = body.optString("prompt").ifBlank {
+            return errorJson(Response.Status.BAD_REQUEST, "prompt is required")
+        }
+        val toolDesc = body.optString("tool_description").ifBlank {
+            return errorJson(Response.Status.BAD_REQUEST, "tool_description (JSON string) is required")
+        }
+        val backend = body.optString("backend", defaultBackend).lowercase()
+        if (backend != "cpu" && backend != "gpu") {
+            return errorJson(Response.Status.BAD_REQUEST, "backend must be cpu|gpu (got $backend)")
+        }
+        // Only LlmEngine has the SDK probe surface; LlmEngineApi (interface used
+        // for testing) does not. Cast or 500.
+        val real = engine as? LlmEngine
+            ?: return errorJson(Response.Status.INTERNAL_ERROR, "native probe requires LlmEngine instance (got ${engine.javaClass.simpleName})")
+        val result = real.probeNativeToolCall(backend, prompt, toolDesc)
+        val payload = JSONObject().apply {
+            put("backend", result.backend)
+            put("duration_ms", result.durationMs)
+            put("role", result.role)
+            put("raw_text", result.rawText)
+            val callsArr = JSONArray()
+            result.toolCallNames.forEachIndexed { i, name ->
+                val argsObj = JSONObject()
+                result.toolCallArgs.getOrNull(i)?.forEach { (k, v) ->
+                    when (v) {
+                        null -> argsObj.put(k, JSONObject.NULL)
+                        is String, is Number, is Boolean -> argsObj.put(k, v)
+                        else -> argsObj.put(k, v.toString())
+                    }
+                }
+                callsArr.put(JSONObject().apply {
+                    put("name", name); put("arguments", argsObj)
+                })
+            }
+            put("tool_calls", callsArr)
+            put("error", result.error)
+        }
+        return json(Response.Status.OK, payload)
     }
 
     private fun handleOpenAiResponses(session: IHTTPSession): Response {
@@ -341,9 +598,19 @@ class HttpServer(
         // so Codex's agent loop with tool turns is parsed correctly.
         val input = body.opt("input")
         val instructions = body.optString("instructions").ifBlank { null }
-        val tools = body.optJSONArray("tools")
+        val rawTools = body.optJSONArray("tools")
+        // v0.6.0 G4: codex web_search ingress filter.
+        // Codex 0.125's `web_search` is a hosted OpenAI tool — codex never
+        // dispatches `web_search_call` items locally (verified codex-rs
+        // protocol/src/models.rs:854, event_mapping.rs:182-192). If our
+        // model emits one, codex silently treats it as "the server already
+        // ran it, here's the result" and the assistant turn continues with
+        // a hallucinated answer. We strip the tool def and warn the model.
+        // Override: TEMUXLLM_ALLOW_WEB_SEARCH=1 (caller will pipe their own
+        // search tool through MCP and route to web_search themselves).
+        val (tools, webSearchHint) = filterWebSearchTools(rawTools)
         val toolBlock = ChatFormat.renderToolBlock(tools)
-        val combinedInstructions = listOfNotNull(toolBlock, instructions).filter { it.isNotBlank() }.let {
+        val combinedInstructions = listOfNotNull(toolBlock, instructions, webSearchHint).filter { it.isNotBlank() }.let {
             if (it.isEmpty()) null else it.joinToString("\n")
         }
         val prompt: String = when (val r = ChatFormat.flattenResponsesInput(input, combinedInstructions)) {
@@ -557,12 +824,12 @@ class HttpServer(
      *   - Errors emitted by LlmEngine become an envelope-specific error frame
      *     followed by clean stream close.
      */
-    private fun runStream(prompt: String, backend: String, encoder: StreamEncoder): Response {
+    private fun runStream(prompt: String, backend: String, encoder: StreamEncoder, imageBytes: ByteArray? = null): Response {
         val pipeIn = PipedInputStream(64 * 1024)
         val pipeOut = PipedOutputStream(pipeIn)
         thread(start = true, name = "litertlm-stream") {
             val writer = PrintWriter(pipeOut.writer(Charsets.UTF_8), false)
-            memoryProbe?.start("stream backend=$backend")
+            memoryProbe?.start("stream backend=$backend img=${imageBytes != null}")
             // Defer emitStart() until the first token actually arrives. If the
             // engine errors during init (e.g. token-limit overflow or backend
             // failure) BEFORE producing any output, we emit only the error
@@ -574,7 +841,7 @@ class HttpServer(
             try {
                 val started = System.currentTimeMillis()
                 runBlocking {
-                    engine.generate(prompt, backend).collect { ev ->
+                    engine.generate(prompt, backend, imageBytes).collect { ev ->
                         when (ev) {
                             is GenerateEvent.Token -> {
                                 if (!startEmitted) {
@@ -630,10 +897,11 @@ class HttpServer(
         shape: ResponseShape,
         parseTools: Boolean = false,
         allowedToolNames: Set<String> = emptySet(),
+        imageBytes: ByteArray? = null,
     ): Response {
-        Log.i(TAG, "generate blocking shape=$shape backend=$backend model=$model tools=$parseTools prompt=${prompt.take(80)}…")
-        memoryProbe?.start("blocking shape=$shape backend=$backend tools=$parseTools")
-        val r = try { engine.generateBlocking(prompt, backend) } finally { memoryProbe?.stop() }
+        Log.i(TAG, "generate blocking shape=$shape backend=$backend model=$model tools=$parseTools img=${imageBytes != null} prompt=${prompt.take(80)}…")
+        memoryProbe?.start("blocking shape=$shape backend=$backend tools=$parseTools img=${imageBytes != null}")
+        val r = try { engine.generateBlocking(prompt, backend, imageBytes) } finally { memoryProbe?.stop() }
         if (r.error != null) {
             return when (shape) {
                 ResponseShape.OpenAiChat ->

@@ -45,17 +45,20 @@ class ChatFormatTest {
         assertTrue(r.prompt.startsWith("System: You are X"))
     }
 
-    @Test fun `image content block returns Bad result`() {
+    @Test fun `image content block is no longer rejected (v0_6_0 G3)`() {
+        // v0.6.0: image extraction lives at HttpServer level (extractFirstImage);
+        // ChatFormat.flatten() should pass through with text content only.
+        // The image block is silently consumed (caller will pass bytes to engine).
         val content = JSONArray()
             .put(JSONObject().apply { put("type", "text"); put("text", "describe") })
-            .put(JSONObject().apply { put("type", "image_url"); put("image_url", "x") })
+            .put(JSONObject().apply { put("type", "image_url"); put("image_url", "data:image/png;base64,iVBORw0KGgo=") })
         val msgs = JSONArray().put(JSONObject().apply {
             put("role", "user")
             put("content", content)
         })
         val r = ChatFormat.flatten(msgs)
-        assertTrue("expected Bad on image content but got $r", r is ChatFormat.Result.Bad)
-        assertTrue((r as ChatFormat.Result.Bad).message.contains("image"))
+        assertTrue("expected Ok now that image is HttpServer-handled, got $r", r is ChatFormat.Result.Ok)
+        assertTrue((r as ChatFormat.Result.Ok).prompt.contains("describe"))
     }
 
     @Test fun `empty messages array returns Bad`() {
@@ -217,5 +220,64 @@ class ChatFormatTest {
         val parsed = ChatFormat.parseToolCalls(raw)
         assertEquals(1, parsed.toolCalls.size)
         assertEquals("v", parsed.toolCalls[0].arguments.optString("k"))
+    }
+
+    // v0.6.0: repair pass for Gemma 4 E4B malformed tool calls.
+    // 7/30 baseline failures (May 2026) all share this exact pattern —
+    // the inner object close `}` is missing BEFORE the array close `]`.
+
+    @Test fun `parseToolCalls repairs Gemma E4B baseline failure (missing inner brace)`() {
+        // Verbatim from /tmp/optA_results/log.txt sample [1]
+        val raw = """{"tool_calls":[{"name":"get_weather","arguments":{"city":"Paris"}]}"""
+        val parsed = ChatFormat.parseToolCalls(raw)
+        assertEquals("repair should recover the call", 1, parsed.toolCalls.size)
+        assertEquals("get_weather", parsed.toolCalls[0].name)
+        assertEquals("Paris", parsed.toolCalls[0].arguments.optString("city"))
+    }
+
+    @Test fun `parseToolCalls repairs missing outer close at EOF`() {
+        // Variant: trailing `}` also missing, only `]`.
+        val raw = """{"tool_calls":[{"name":"f","arguments":{"k":"v"}]"""
+        val parsed = ChatFormat.parseToolCalls(raw)
+        assertEquals(1, parsed.toolCalls.size)
+        assertEquals("v", parsed.toolCalls[0].arguments.optString("k"))
+    }
+
+    @Test fun `parseToolCalls repairs raw stream with trailing prose`() {
+        val raw = """{"tool_calls":[{"name":"f","arguments":{"k":"v"}]}  Hope that helps!"""
+        val parsed = ChatFormat.parseToolCalls(raw)
+        assertEquals(1, parsed.toolCalls.size)
+    }
+
+    @Test fun `parseToolCalls repairs nested args missing closer`() {
+        val raw = """{"tool_calls":[{"name":"f","arguments":{"a":{"b":1}]}"""
+        val parsed = ChatFormat.parseToolCalls(raw)
+        assertEquals(1, parsed.toolCalls.size)
+        assertEquals(1, parsed.toolCalls[0].arguments.optJSONObject("a")?.optInt("b"))
+    }
+
+    @Test fun `parseToolCalls already-balanced JSON unchanged by repair path`() {
+        // Sanity: 23/30 baseline passes must remain passing after repair landed.
+        val raw = """{"tool_calls":[{"name":"get_weather","arguments":{"city":"Tokyo"}}]}"""
+        val parsed = ChatFormat.parseToolCalls(raw)
+        assertEquals(1, parsed.toolCalls.size)
+        assertEquals("Tokyo", parsed.toolCalls[0].arguments.optString("city"))
+    }
+
+    @Test fun `parseToolCalls truly garbled returns plain text (repair fail-open)`() {
+        val raw = """{"tool_calls":[{"name": "broken without quote close"""
+        val parsed = ChatFormat.parseToolCalls(raw)
+        assertEquals(0, parsed.toolCalls.size)
+    }
+
+    @Test fun `repairToolCallJson is idempotent on valid input`() {
+        val valid = """{"tool_calls":[{"name":"f","arguments":{"k":"v"}}]}"""
+        val repaired = ChatFormat.repairToolCallJson(valid)
+        // For already-valid input, repair pass should produce equivalent JSON
+        // (string equality not required — JSON equality is).
+        assertNotNull(repaired)
+        val a = org.json.JSONObject(valid).toString()
+        val b = org.json.JSONObject(repaired!!).toString()
+        assertEquals(a, b)
     }
 }

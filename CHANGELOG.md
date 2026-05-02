@@ -9,6 +9,176 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 (no unreleased changes)
 
+## [0.6.0] — 2026-05-02
+
+Vision input + tool-call repair + codex web_search filter + native SDK
+tool API probe. The original "fork LiteRT-LM" v0.6.0 plan was scrapped
+after deep-dive research established three of its three promises were
+either upstream-imminent (Conversation::Clone), unverifiable
+(INT8 KV regression on Gemma 4), or simply not present upstream
+(native `<|tool_call|>` tokens — zero hits in LiteRT-LM repo).
+Replaced with measurable improvements that ship today.
+
+### Empirical: Gemma 4 E4B tool-call success rate (n=30, S25, CPU)
+
+| Path | Score | Speed/call |
+|---|---|---|
+| v0.5.x baseline (prompt-injection + naive parser) | 23/30 = **76.7 %** | ~7-8 s |
+| v0.6.0 prompt-injection + Ollama-style repair (G1) | **30/30 = 100 %** | ~7-8 s |
+| v0.6.0 native SDK tool API (probe) | **30/30 = 100 %** | **~5.7 s (-30 %)** |
+
+The native path was expected to fail per 5 OPEN upstream issues
+(google-ai-edge/LiteRT-LM #1539, #1859, #1027, #1181, #1874), all
+filed against SDK 0.10.0 and FunctionGemma / Qwen3 / Gemma 3n. On
+0.11.0-rc1 + Gemma 4 E4B + our `OpenApiTool` wrapper with
+`automaticToolCalling=false` it works, 30/30, no SIGSEGV.
+
+### G1 — lenient JSON repair (port of Ollama's `repairGemma4ToolCallArgs`)
+
+`ChatFormat.repairToolCallJson` does a stack-based balanced-bracket
+rewrite on malformed tool-call JSON. Detects open `{`/`[` not closed,
+inserts `}` before stray `]` (the exact Gemma 4 E4B failure pattern —
+all 7 baseline failures had `{"...":"...":...]}` with the inner `}`
+missing). Stray over-close characters are dropped. Pure string
+manipulation; never throws, returns null only when input doesn't
+start with `{`.
+
+7 new test cases in `ChatFormatTest`, including the verbatim 7 failure
+patterns from the May 2 baseline run. Tests + the existing 22 cases
+all pass.
+
+### G2 — unified `tool_result` prose across envelopes
+
+Previously only `/v1/responses` used the `Tool[name]: <result>` prose
+format that small models can follow on the second turn. The other
+three envelopes (`/v1/messages`, `/v1/chat/completions`, `/api/chat`)
+stringified `tool_use` / `tool_result` blocks as raw JSON which Gemma
+4 doesn't recognize from training. All four now emit the same prose.
+
+### G3 — vision input (multi-modal)
+
+Wires the SDK's `Content.ImageBytes(byteArray)` + `Contents.of(...)`
+into `LlmEngine.generate`. EngineConfig now sets `visionBackend` to
+match the text backend and caps `maxNumImages` at 4.
+
+`HttpServer.extractFirstImage` parses the four wire shapes:
+- Anthropic `{type:"image", source:{type:"base64", media_type, data}}`
+- OpenAI `{type:"image_url", image_url:{url:"data:image/...;base64,..."}}`
+- OpenAI Responses `{type:"input_image", image_url:"data:..."}`
+- Ollama top-level `images: ["base64,...", ...]` on user message
+
+Caps decoded bytes at 2 MiB; rejects http(s) URLs (SSRF guard, same
+policy as Ollama). Real-device verified on Galaxy S25:
+
+```
+$ curl ... -d '{... "image": <64x48 PNG of word "STOP">, "text": "What word is in this image?"}'
+{"content": [{"type": "text", "text": "STOP"}], ...}
+```
+
+Model read the rendered word back. Memory peak ~5.8 GB during prefill
+(image expansion ~280 tokens) — fits 12 GB devices at `max_tokens=12288`.
+
+CLI path (`litert_lm_main`) is **NOT** updated — upstream binary has
+only 4 flags, none for vision. CLI vision deferred to v0.7.x.
+
+### G4 — codex `web_search` ingress filter
+
+`HttpServer.filterWebSearchTools` strips `{type:"web_search"}` and
+`{type:"web_search_preview"}` entries from the inbound `/v1/responses`
+tools array, and injects "You do not have web access; respond without
+referencing real-time information." into the system prompt. Reasoning:
+codex never dispatches `web_search_call` items locally (verified
+against codex-rs `protocol/src/models.rs:854`, `event_mapping.rs:182-192`)
+— if our model emits one, codex silently treats it as "the server
+already ran it, here's the result" and the assistant turn continues
+with a hallucinated answer.
+
+Override: `TEMUXLLM_ALLOW_WEB_SEARCH=1` keeps the tool in the array
+for users wiring their own MCP search.
+
+### Native SDK tool API — probe + opt-in flag
+
+New endpoint: `POST /api/probe/native_tools` — single-shot empirical
+test of SDK's `ConversationConfig.tools` + `OpenApiTool` +
+`automaticToolCalling=false` path. Returns typed `tool_calls`
+extracted by SDK from the model's native template. Does NOT require
+prompt-injection or our brace parser.
+
+New flag: `native_tools` in `temuxllm.conf` (or `TEMUXLLM_NATIVE_TOOLS`
+env var). When `on` / `1` / `true`, future v0.7.x will route /v1
+tool requests through the native path. v0.6.0 reads the flag for
+`/api/version` reporting only — full /v1 wiring deferred because:
+- Streaming-with-tools surface needs new MessageCallback delta
+  semantics work
+- Risk gate: 5 OPEN upstream tool-API issues for OTHER models could
+  bite users on non-Gemma-4 stacks. Empirical: works perfectly on
+  our pinned Gemma 4 E4B.
+
+### Known limitations (deferred to v0.7.x)
+
+- **Vision + tools + streaming combo.** When all three are present in
+  one request, the streaming-buffered path drops the image (image goes
+  to engine via the non-streaming path only). Single-pair combos
+  (vision + tool, vision + stream, tool + stream) work. Documented to
+  unblock v0.6.0 ship; the `runStreamBuffered` signature extension is
+  scheduled for v0.7.0.
+- **Probe endpoint reachable via env flag only.** `/api/probe/native_tools`
+  is gated by `native_tools=on` per security-review MEDIUM#3 to prevent
+  third-party apps on-device from triggering JNI-level crashes via
+  malformed tool descriptions. Probe is on for empirical study; off
+  for production.
+
+### Cancelled from v0.6.0 spec
+
+- **G7 native chat templates (hardcoded Gemma 4 + Qwen3 Jinja
+  constants).** Option B probe verified the SDK already applies the
+  model's native chat template internally; hardcoding it ourselves
+  would duplicate the SDK's work.
+- **G8 `response_format` + 1-retry.** Low value vs implementation
+  cost; pushed to v0.7.0.
+- **G9 CLI shell port of G1/G2.** codex outside-review flagged
+  maintenance risk (two diverging bash implementations); CLI stays
+  at the Python helper inside the wrapper. CLI users still benefit
+  from G1+G2 by talking to the APK service via adb forward.
+- **Forking LiteRT-LM.** Confirmed not viable — the three promises
+  the fork plan made are either upstream-imminent
+  (Conversation::Clone, issue #966 maintainer commitment), unverifiable
+  (INT8 KV regression risk), or upstream-absent (native tool tokens).
+
+### Files changed
+
+- `android/app/src/main/kotlin/dev/temuxllm/ChatFormat.kt` —
+  `repairToolCallJson` stack-based rewriter + 7 test cases.
+  Unified `tool_result` prose. Image content blocks no longer return
+  `Bad`; HttpServer handles them.
+- `android/app/src/main/kotlin/dev/temuxllm/LlmEngine.kt` —
+  `generate()` and `generateBlocking()` accept optional `imageBytes`.
+  EngineConfig sets `visionBackend` and `maxNumImages`. New
+  `probeNativeToolCall` method for `/api/probe/native_tools`.
+- `android/app/src/main/kotlin/dev/temuxllm/LlmEngineApi.kt` —
+  imageBytes parameter on the interface (default null preserves
+  back-compat for fakes/tests).
+- `android/app/src/main/kotlin/dev/temuxllm/HttpServer.kt` —
+  `extractFirstImage`, `filterWebSearchTools`, `handleProbeNativeTools`,
+  `nativeToolsEnabled` flag, vision wiring through
+  `runStream` / `blockingGenerate` for the 4 main endpoints
+  (`/v1/messages`, `/v1/chat/completions`, `/api/chat`, plus existing
+  Responses path retains tool routing).
+- `android/app/build.gradle.kts` — versionCode=14, versionName=0.6.0.
+
+### Acceptance gates (all green)
+
+- 60 unit tests pass (7 new for G1 repair, 1 updated for G3 vision)
+- `:app:lintDebug` passes
+- APK builds; installed on Galaxy S25
+- Real-device smoke:
+  - Plain text round-trip on /v1/messages, /v1/chat/completions ✓
+  - Vision via /v1/messages reads "STOP" PNG ✓
+  - codex `web_search` filtered → model replies honestly ("I do not
+    have access to real-time information") ✓
+  - Option B probe endpoint: 30/30 native `tool_calls` extracted ✓
+  - Option A repair path: 30/30 (was 23/30 baseline) ✓
+
 ## [0.5.2] — 2026-05-02
 
 Docs-only release. Documents which CLIs keep which tools / MCP servers /

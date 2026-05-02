@@ -4,9 +4,15 @@ import android.content.Context
 import android.os.Build
 import android.util.Log
 import com.google.ai.edge.litertlm.Backend
+import com.google.ai.edge.litertlm.Content
+import com.google.ai.edge.litertlm.Contents
+import com.google.ai.edge.litertlm.ConversationConfig
 import com.google.ai.edge.litertlm.Engine
 import com.google.ai.edge.litertlm.EngineConfig
 import com.google.ai.edge.litertlm.Message
+import com.google.ai.edge.litertlm.OpenApiTool
+import com.google.ai.edge.litertlm.ToolException
+import com.google.ai.edge.litertlm.tool
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.runBlocking
@@ -123,10 +129,17 @@ class LlmEngine(private val context: Context) : LlmEngineApi {
         //   3. Auto-detect from /proc/meminfo MemTotal — the device tier
         //      table below is conservative and verified on real hardware.
         val maxTokens = computeMaxNumTokens()
+        // v0.6.0 G3: enable vision encoder on the same backend as text.
+        // Gemma 4 E4B's vision encoder runs on either CPU or GPU; mirroring
+        // text backend keeps memory contention predictable. maxNumImages
+        // capped to 4 to avoid runaway prefill — image tokens are
+        // 70-1120 each at the SDK's discretion (Gemma 4 launch blog).
         val cfg = EngineConfig(
             modelPath = modelPath,
             backend = backendInst,
+            visionBackend = backendInst,
             maxNumTokens = maxTokens,
+            maxNumImages = 4,
         )
         Log.i(TAG, "Engine.initialize(backend=$backend) starting maxTokens=$maxTokens")
         val t0 = System.currentTimeMillis()
@@ -167,7 +180,7 @@ class LlmEngine(private val context: Context) : LlmEngineApi {
      * codex outside-review, the prior code only locked engine init, not
      * the whole inference path.
      */
-    override fun generate(prompt: String, backend: String): Flow<GenerateEvent> = flow {
+    override fun generate(prompt: String, backend: String, imageBytes: ByteArray?): Flow<GenerateEvent> = flow {
         inferenceMutex.withLock {
             val started = System.currentTimeMillis()
             val accum = StringBuilder()
@@ -175,7 +188,20 @@ class LlmEngine(private val context: Context) : LlmEngineApi {
             try {
                 val e = synchronized(lock) { ensureEngine(backend) }
                 e.createConversation().use { conv ->
-                    conv.sendMessageAsync(prompt).collect { msg: Message ->
+                    // v0.6.0 G3: when image is supplied, build a multi-content
+                    // message; otherwise keep the fast string path that also
+                    // matches the SDK's most-tested entry point.
+                    val flow = if (imageBytes != null) {
+                        // Contents constructor is private; use Companion.of(vararg).
+                        val contents = Contents.of(
+                            Content.ImageBytes(imageBytes),
+                            Content.Text(prompt),
+                        )
+                        conv.sendMessageAsync(contents)
+                    } else {
+                        conv.sendMessageAsync(prompt)
+                    }
+                    flow.collect { msg: Message ->
                         val piece = msg.toString()
                         if (piece.isNotEmpty()) {
                             accum.append(piece)
@@ -204,12 +230,12 @@ class LlmEngine(private val context: Context) : LlmEngineApi {
      * Blocking convenience for non-streaming `/api/generate`. Drains the flow into
      * one final string + metrics.
      */
-    override fun generateBlocking(prompt: String, backend: String): GenerateResult = runBlocking {
+    override fun generateBlocking(prompt: String, backend: String, imageBytes: ByteArray?): GenerateResult = runBlocking {
         val text = StringBuilder()
         var tokens = 0
         var doneEvent: GenerateEvent.Done? = null
         var errorMsg: String? = null
-        generate(prompt, backend).collect { ev ->
+        generate(prompt, backend, imageBytes).collect { ev ->
             when (ev) {
                 is GenerateEvent.Token -> { text.append(ev.text); tokens++ }
                 is GenerateEvent.Done -> doneEvent = ev
@@ -223,6 +249,97 @@ class LlmEngine(private val context: Context) : LlmEngineApi {
             totalDurationMs = doneEvent?.totalDurationMs ?: (System.currentTimeMillis() - 0),
             error = errorMsg,
         )
+    }
+
+    /**
+     * v0.6.0 native-tools probe (Option B empirical test).
+     *
+     * Builds a `ConversationConfig` with `tools = [tool(openApiTool)]` and
+     * `automaticToolCalling = false`, sends the prompt synchronously, and
+     * returns the SDK-typed `Message.toolCalls` result.
+     *
+     * Why probe-only (not wired into /v1 routes): upstream LiteRT-LM 0.11.0-rc1
+     * has 5 OPEN bugs around the native tool API
+     * (LiteRT-LM #1539 / #1859 / #1027 / #1181 / #1874). Gemma 4 E4B is
+     * NOT in the testdata Jinja templates and the C++ data processor for
+     * Gemma 4 has zero hits for tool tokens. The expected outcome is
+     * one of: SIGSEGV during sendMessage, empty toolCalls list, or
+     * tool definitions never injected into the prompt. We probe to know
+     * which without committing the architecture pivot.
+     *
+     * Caller dispatches the actual tool — we throw ToolException from
+     * execute() so SDK never tries to call it (only matters if the caller
+     * accidentally flips automaticToolCalling=true).
+     *
+     * Returns a JSON-shaped result for HttpServer.handleProbeNativeTools.
+     */
+    data class NativeToolsProbeResult(
+        val backend: String,
+        val durationMs: Long,
+        val role: String,
+        val rawText: String,
+        val toolCallNames: List<String>,
+        val toolCallArgs: List<Map<String, Any?>>,
+        val error: String?,
+    )
+
+    fun probeNativeToolCall(
+        backend: String,
+        prompt: String,
+        toolDescJson: String,
+    ): NativeToolsProbeResult {
+        val started = System.currentTimeMillis()
+        val openApiTool = object : OpenApiTool {
+            override fun getToolDescriptionJsonString(): String = toolDescJson
+            override fun execute(arguments: String): String {
+                throw ToolException(
+                    "service is stateless; caller dispatches",
+                    null,
+                )
+            }
+        }
+        return runBlocking {
+            inferenceMutex.withLock {
+                try {
+                    val e = synchronized(lock) { ensureEngine(backend) }
+                    val cfg = ConversationConfig(
+                        systemInstruction = null,
+                        initialMessages = emptyList(),
+                        tools = listOf(tool(openApiTool)),
+                        samplerConfig = null,
+                        automaticToolCalling = false,
+                        channels = null,
+                        extraContext = emptyMap(),
+                    )
+                    e.createConversation(cfg).use { conv ->
+                        // Sync sendMessage; we want the full Message back, not a stream.
+                        val msg = conv.sendMessage(prompt)
+                        val names = msg.toolCalls.map { it.name }
+                        val args = msg.toolCalls.map { it.arguments }
+                        NativeToolsProbeResult(
+                            backend = backend,
+                            durationMs = System.currentTimeMillis() - started,
+                            role = msg.role.toString(),
+                            rawText = msg.toString().take(4096),
+                            toolCallNames = names,
+                            toolCallArgs = args,
+                            error = null,
+                        )
+                    }
+                } catch (t: Throwable) {
+                    Log.e(TAG, "probeNativeToolCall failed", t)
+                    NativeToolsProbeResult(
+                        backend = backend,
+                        durationMs = System.currentTimeMillis() - started,
+                        role = "",
+                        rawText = "",
+                        toolCallNames = emptyList(),
+                        toolCallArgs = emptyList(),
+                        error = "${t.javaClass.simpleName}: ${t.message ?: ""}",
+                    )
+                }
+            }
+        }
     }
 
     fun close() {

@@ -24,11 +24,16 @@ interface LlmEngineApi {
     /**
      * Stream tokens for [prompt] on the chosen [backend] (`cpu` | `gpu`).
      * Emits Token events, terminated by either Done or Error.
+     *
+     * v0.6.0: optional [imageBytes] enables multi-modal input via
+     * `Content.ImageBytes(...)`. SDK supports JPEG / PNG / WebP. Caller
+     * is responsible for size + dimension caps; LlmEngine does NOT
+     * pre-resize or re-encode.
      */
-    fun generate(prompt: String, backend: String): Flow<GenerateEvent>
+    fun generate(prompt: String, backend: String, imageBytes: ByteArray? = null): Flow<GenerateEvent>
 
     /** Drain [generate] into a single result; convenience for non-stream callers. */
-    fun generateBlocking(prompt: String, backend: String): GenerateResult
+    fun generateBlocking(prompt: String, backend: String, imageBytes: ByteArray? = null): GenerateResult
 }
 
 /** Token / lifecycle event from the engine. Top-level so fakes don't import LlmEngine. */

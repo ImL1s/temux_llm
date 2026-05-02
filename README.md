@@ -89,7 +89,19 @@ litertlm --help
 
 ---
 
-## Use with CLI coding agents (v0.5.1 verified matrix)
+## Use with CLI coding agents (v0.6.0 verified matrix)
+
+> **v0.6.0 highlights:** vision input on `/v1/messages` /
+> `/v1/chat/completions` / `/api/chat` / `/v1/responses` (Galaxy S25 read
+> "STOP" from a 64×48 PNG — no fork required); tool-call success rate on
+> Gemma 4 E4B raised from **77 % → 100 %** (n=30) via a stack-based
+> JSON repair port from Ollama; `/api/probe/native_tools` endpoint hits
+> 100 % using the SDK's native tool path 30 % faster, opt-in for v0.7
+> via `native_tools=on` in `temuxllm.conf`; codex `web_search` is now
+> filtered out of `/v1/responses` ingress so the model stops fabricating
+> hosted-tool calls.
+
+
 
 `temux_llm` impersonates Ollama closely enough that the popular coding-agent
 CLIs talk to it without a proxy. The matrix below is what we **actually
