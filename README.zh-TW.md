@@ -292,6 +292,24 @@ JSON
 - **Image input**：`image_url` / `input_image` block 一律回 400。
 - **stock Gemini CLI 重 base URL**：沒有 env 路徑；改用 llxprt-code。
 
+### Tool calling、MCP、skills、web search
+
+各 CLI 的 `--bare` 模式設計上會把 auto-discovery 的 tool 砍掉。完整
+矩陣（誰留了什麼、怎麼把 web search / MCP / skills 加回來）寫在
+[`docs/cli-tool-matrix.md`](docs/cli-tool-matrix.md)。簡版：
+
+| CLI | `--bare` 保留 | 加回 web search / MCP |
+|---|---|---|
+| `claude --bare` | 只剩 Bash、Read、Edit | `--mcp-config <檔案>` + `--strict-mcp-config` |
+| `codex exec` (minimal) | 29 個 built-in + MCP + skills 全在 | 預設都開；`~/.codex/config.toml` 加 MCP server |
+| `llxprt` | 全部 built-in + MCP + skills（沒 bare 開關） | `EXA_API_KEY=...` 開 web search；`llxprt mcp add` 接 MCP |
+| `opencode run --agent bare` | 零工具（我們的 launcher 把 14 個全關了） | 換成 `--agent build`，把 `webfetch` / `websearch` 開回來 |
+
+單輪 tool calling 4 個 wire envelope 都過（`/api/chat`、
+`/v1/chat/completions`、`/v1/messages`、`/v1/responses`）。多輪 agent loop
+在 Gemma 4 上不可靠 — v0.6.0 用 `Conversation::Clone()` 加 KV reuse 後
+才會穩。
+
 完整 endpoint 對照與 wire format 細節：
 [`docs/ollama-compat.md`](docs/ollama-compat.md)。
 

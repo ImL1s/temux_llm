@@ -9,6 +9,53 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 (no unreleased changes)
 
+## [0.5.2] — 2026-05-02
+
+Docs-only release. Documents which CLIs keep which tools / MCP servers /
+skills / web-search built-ins under their respective `--bare`-style minimal
+modes — and what our four wire envelopes actually translate vs not.
+
+### New
+
+- **`docs/cli-tool-matrix.md`** — per-CLI capability matrix verified against
+  locally-installed CLIs (`claude` 2.1.126, `codex-cli` 0.125.0,
+  `llxprt` 0.9.3, `opencode` 1.14.31). Covers:
+  - What each `--bare` / minimal mode strips by default.
+  - Concrete recipes to add MCP / web search / skills back when needed.
+  - Service-side translation status: every envelope except `/api/generate`
+    parses `tools[]`, prompt-injects an LCD JSON format
+    (`{"tool_calls":[...]}`), and translates the model's reply into
+    wire-correct `tool_calls` / `tool_use` / `function_call` frames.
+  - Known multi-turn agent-loop gaps (`tool_result` template, KV reuse,
+    `tool_choice`, multi-call parser) that v0.6.0's fork plan addresses.
+- **README + README.zh-TW** "Tool calling, MCP, skills, web search"
+  subsection linking to the matrix doc.
+
+### Behind the finding
+
+Four parallel research agents cross-verified by reading each CLI's
+source + running its `--help`:
+
+- `claude --bare` only guarantees Bash + Read + Edit; WebSearch and
+  WebFetch are NOT in the bare allowlist. MCP must be re-added via
+  `--mcp-config <file>` + `--strict-mcp-config`. Anthropic-spec
+  `tool_use` wire is always emitted regardless of `--bare`.
+- `codex exec` with `model_reasoning_effort="minimal"` does NOT strip
+  tools — all 29 built-ins (shell, apply_patch, web_search, MCP) still
+  ship. `model_instructions_file` REPLACES the system prompt but tools
+  live in a separate field. Codex's `web_search` is an OpenAI-hosted
+  tool; the local runtime never dispatches it — use an MCP fetch
+  server instead.
+- `llxprt` has no bare knob; tools are always sent. `exa-web-search`
+  + `direct-web-fetch` ship in `~/.llxprt/prompts/tools/`.
+- `opencode run --agent bare` (our launcher's default) explicitly
+  disables all 14 documented tools — web search is unreachable in
+  bare. Swap to `--agent build` if you need it.
+
+The single biggest agent-loop reliability fix is still v0.6.0's
+`Conversation::Clone()` + INT8 KV; this v0.5.2 just makes the current
+state unambiguous.
+
 ## [0.5.1] — 2026-05-02
 
 Honest CLI matrix re-verification + tunable default backend.

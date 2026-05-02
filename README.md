@@ -304,6 +304,25 @@ On ≥16 GB devices set `TEMUXLLM_OPENCODE_BACKEND=gpu` to skip the bridge.
 - **Image inputs.** `image_url` / `input_image` blocks return 400.
 - **Stock Gemini CLI redirect.** No env-var path; use llxprt-code.
 
+### Tool calling, MCP, skills, web search
+
+`--bare` modes strip auto-discovered tools by design. The matrix of
+which CLI keeps which capability — and how to get web search / MCP /
+skills back when you need them — lives in
+[`docs/cli-tool-matrix.md`](docs/cli-tool-matrix.md). Short version:
+
+| CLI | What `--bare` keeps | How to add web search / MCP back |
+|---|---|---|
+| `claude --bare` | Bash, Read, Edit only | `--mcp-config <file>` + `--strict-mcp-config` |
+| `codex exec` (minimal) | All 29 built-ins + MCP + skills | already on; add MCP servers in `~/.codex/config.toml` |
+| `llxprt` | All built-ins + MCP + skills (no bare knob) | `EXA_API_KEY=...` for web search; `llxprt mcp add` for MCP |
+| `opencode run --agent bare` | Nothing — every tool off | swap to `--agent build` and re-enable `webfetch` / `websearch` |
+
+Single-shot tool calling works on all four wire envelopes
+(`/api/chat`, `/v1/chat/completions`, `/v1/messages`, `/v1/responses`).
+Multi-turn agent loops are unreliable on Gemma 4 today — fixed in
+v0.6.0 (KV reuse via `Conversation::Clone()`).
+
 For a plain reference of every endpoint we expose and which CLI each one is
 for, see [`docs/ollama-compat.md`](docs/ollama-compat.md).
 
