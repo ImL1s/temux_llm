@@ -140,14 +140,29 @@ class ModelRegistry(private val context: Context, private val engine: LlmEngineA
     fun capabilities(): List<String> {
         val out = mutableListOf("completion")
         val noTools = !System.getenv("TEMUXLLM_NO_TOOLS").isNullOrBlank()
-        if (toolsVerified && !noTools) out += "tools"
+        // v0.7.1 (codex PR review P2#6): we structurally support tools
+        // across all 4 wire envelopes since v0.6.0 (prompt-injection +
+        // repair) and v0.7.0 (native SDK path). Advertise it. The flag
+        // remains overridable via TEMUXLLM_NO_TOOLS=1 for the rare
+        // model that mis-emits tool tokens and confuses tool-using
+        // clients.
+        if (!noTools) out += "tools"
         return out
     }
 
-    /** Full /api/tags payload, Ollama 0.13+ shape. */
+    /**
+     * /api/tags payload — Ollama 0.13+ shape.
+     *
+     * v0.7.1 (codex PR review P1#2): only emits the active staged model,
+     * matching `resolve()`'s policy. v0.7.0's behavior of listing every
+     * .litertlm file in the dir caused tool clients to pick a non-active
+     * ID from /api/tags and then 404 on /api/chat — wire inconsistency.
+     */
     fun ollamaTags(): JSONObject {
         val arr = JSONArray()
-        for (e in list()) {
+        val activeEntry = active()
+        val visible = if (activeEntry != null) listOf(activeEntry) else emptyList()
+        for (e in visible) {
             arr.put(
                 JSONObject().apply {
                     // Ollama-shaped fields. We deliberately omit the `path`

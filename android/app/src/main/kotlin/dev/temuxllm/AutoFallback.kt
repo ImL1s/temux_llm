@@ -89,9 +89,14 @@ object AutoFallback {
         val r = reasons.firstOrNull() ?: return null
         // REASON_LOW_MEMORY (10) is the explicit LMK signal — but many
         // OEMs report SIGKILL (REASON_SIGNALED + signal=9) instead.
+        // v0.7.1 (codex PR review P2#4): use ApplicationExitInfo.status
+        // for the signal number (Android docs: "for REASON_SIGNALED,
+        // this field is the signal number"). The previous heuristic of
+        // `description.contains("9")` produced false positives (any
+        // description like "killed at 19:00" matched) and false
+        // negatives (null / empty descriptions on stock AOSP).
         val isLikelyLmk = r.reason == ApplicationExitInfo.REASON_LOW_MEMORY ||
-            (r.reason == ApplicationExitInfo.REASON_SIGNALED &&
-                (r.description ?: "").contains("9"))
+            (r.reason == ApplicationExitInfo.REASON_SIGNALED && r.status == 9)
         if (!isLikelyLmk) return null
         Log.i(TAG, "previous exit was LMK-class: ${r.reason} ${r.description}")
         return r.processStateSummary

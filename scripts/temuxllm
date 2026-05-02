@@ -372,7 +372,24 @@ EOF
       log "install: pip install 'litellm[proxy]'   OR   set TEMUXLLM_OPENCODE_BACKEND=gpu (≥16 GB devices)"
       die "missing dependency: litellm"
     fi
-    if ! curl -fsS --max-time 1 "http://127.0.0.1:${bridge_port}/health/readiness" >/dev/null 2>&1; then
+    # v0.7.1 (codex PR review P2#5): only reuse an existing bridge if its
+    # /v1/models advertises THIS run's model. Otherwise a stale bridge from
+    # a previous `launch opencode --model X` will route this `launch
+    # opencode --model Y` to a config still pointing at X, causing
+    # opencode to hit "model not found" with the bridge healthy.
+    local bridge_ok=0
+    if curl -fsS --max-time 1 "http://127.0.0.1:${bridge_port}/health/readiness" >/dev/null 2>&1; then
+      if curl -fsS --max-time 2 "http://127.0.0.1:${bridge_port}/v1/models" 2>/dev/null \
+           | grep -qE "\"id\"[[:space:]]*:[[:space:]]*\"${model}\""; then
+        bridge_ok=1
+      else
+        log "existing LiteLLM bridge on :${bridge_port} doesn't list model='$model' — restarting"
+        # try to kill any litellm we can match on the port (best effort).
+        pkill -f "litellm.*--port ${bridge_port}" 2>/dev/null || true
+        sleep 1
+      fi
+    fi
+    if [[ "$bridge_ok" -ne 1 ]]; then
       local bridge_yaml="$cfgdir/litellm.yaml"
       cat > "$bridge_yaml" <<EOF
 model_list:

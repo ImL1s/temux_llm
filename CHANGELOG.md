@@ -9,6 +9,111 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 (no unreleased changes)
 
+## [0.7.1] — 2026-05-02
+
+Patch addressing 7 findings codex's PR-bot auto-review flagged on PR #11
+after the v0.7.0 push (commit `8b1ebd1`). Two were P1, five P2; two of
+those (vision wiring on /v1/responses + streaming-with-tools dropping
+imageBytes) had already been fixed in v0.7.0 but codex was still
+reviewing the v0.6.0 commit when those landed.
+
+### P1#1 — `handleGenerate` defensive sanity check (false-positive clarification)
+
+Codex flagged: handler resolves `model` to a registry entry but
+inference uses `LlmEngine.activeModelPath()`, so non-active models
+silently get the wrong response.
+
+Investigation: `ModelRegistry.resolve()` is documented (and
+implemented) to ONLY return the active staged entry — it returns null
+for any name that doesn't map to active, which the handler converts to
+404. So `resolved.path == active.path` always holds at the
+`blockingGenerate` call site. No actual bug.
+
+Fix: added an explicit comment + a defensive `Log.w` if a future
+regression sneaks a non-active entry through `resolve()`.
+
+### P1#2 — `/api/tags` now matches `resolve()` policy
+
+`ModelRegistry.ollamaTags()` previously listed every `.litertlm` file
+in the staging dir. `resolve()` only accepts the active one, so a
+client that picked an ID from `/api/tags` and then hit `/api/chat`
+got a 404 — wire-level inconsistency.
+
+Fixed: `ollamaTags()` returns only the active entry (matching
+`/v1/models` which was already consistent).
+
+### P2#3 — `cmd_status` already calls `ensure_forward()`
+
+Codex pointed at a line range that didn't match — the existing
+`cmd_status()` does call `ensure_forward()`. No-op fix; verified.
+
+### P2#4 — `AutoFallback.lastExitWasLmk` checks signal number, not description text
+
+Was: `r.description.contains("9")` — false positives (descriptions
+with "9" in them) + false negatives (null/empty descriptions on
+stock AOSP).
+
+Now: `r.status == 9` per Android docs (for `REASON_SIGNALED`,
+`status` holds the signal number).
+
+### P2#5 — OpenCode bridge reuse validates model match
+
+Was: any healthy bridge on `:bridge_port` was reused. If a previous
+`launch opencode --model X` left a bridge running, this `launch
+opencode --model Y` reused it; OpenCode hit "model not found" with
+the bridge healthy.
+
+Now: probe `/v1/models` on the bridge and only reuse if the listed
+ID matches this run's `--model`. Otherwise `pkill -f "litellm.*--port
+N"` and respawn.
+
+### P2#6 — `/api/show` advertises `"tools"` capability
+
+Was: `capabilities()` gated `"tools"` on a `toolsVerified` field that
+was initialized `false` and never written. So `/api/show` always
+reported `["completion"]` only — clients consulting capabilities
+disabled tool flows even though we structurally support them.
+
+Now: removed the `toolsVerified` gate. We've supported tools across
+all 4 wire envelopes since v0.6.0 (prompt-injection + repair) and
+v0.7.0 (native SDK path). `TEMUXLLM_NO_TOOLS=1` opt-out is
+preserved for users who hit a model that mis-emits tool tokens.
+
+### P2#7 — `extractFirstImage` returns the LAST user image
+
+Was: walked `messages` from index 0 forward; first image found was
+returned. Multi-turn requests with multiple user images sent
+inference against stale earlier media.
+
+Now: walks BACKWARDS so the most recent user image wins. Method
+name kept for back-compat — semantics changed to "most-recent" not
+"first". Same fix applied to the Responses input-array path.
+
+### Files
+
+- `android/app/src/main/kotlin/dev/temuxllm/HttpServer.kt` — defensive
+  sanity log in `handleGenerate`; backward iteration in
+  `extractFirstImage`.
+- `android/app/src/main/kotlin/dev/temuxllm/ModelRegistry.kt` —
+  `ollamaTags()` filters to active; `capabilities()` always reports
+  `"tools"` unless opt-out env set.
+- `android/app/src/main/kotlin/dev/temuxllm/AutoFallback.kt` —
+  signal-number check.
+- `scripts/temuxllm` — bridge model-match validation +
+  port-restart on mismatch.
+- `android/app/build.gradle.kts` — versionCode 15 → 16, versionName
+  0.7.0 → 0.7.1.
+
+### Acceptance
+
+- 60 unit tests pass.
+- `:app:lintDebug` clean.
+- APK installs on Galaxy S25.
+- Real-device verified:
+  - `/api/tags` returns single active entry ✓
+  - `/api/show` capabilities = `["completion", "tools"]` ✓
+  - `/v1/version` includes `native_tools_enabled` flag ✓
+
 ## [0.7.0] — 2026-05-02
 
 Closes the 4 gaps that v0.6.0 punted to "v0.7.0 future work" and the

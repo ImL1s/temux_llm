@@ -123,32 +123,35 @@ class HttpServer(
 
     private fun extractFirstImage(body: JSONObject): ImageOrError {
         val maxBytes = 2 * 1024 * 1024
-        // Ollama-style top-level images on the last user message
+        // v0.7.1 (codex PR review P2#7): walk messages BACKWARDS so
+        // multi-turn requests use the most recent user image, not a
+        // stale one from earlier turns. (Method name is kept for
+        // backward compat — semantics changed to "last" not "first".)
         val msgs = body.optJSONArray("messages")
         if (msgs != null) {
-            for (i in 0 until msgs.length()) {
+            for (i in (msgs.length() - 1) downTo 0) {
                 val m = msgs.optJSONObject(i) ?: continue
                 if (m.optString("role") != "user") continue
                 val imgs = m.optJSONArray("images")
                 if (imgs != null && imgs.length() > 0) {
-                    val raw = imgs.optString(0)
+                    val raw = imgs.optString(imgs.length() - 1)   // last image in this turn
                     return decodeImagePayload(raw, maxBytes)
                 }
                 val content = m.opt("content") as? JSONArray ?: continue
-                for (j in 0 until content.length()) {
+                for (j in (content.length() - 1) downTo 0) {
                     val block = content.optJSONObject(j) ?: continue
                     val parsed = parseImageBlock(block, maxBytes)
                     if (parsed != null) return parsed
                 }
             }
         }
-        // Responses input array
+        // Responses input array — same backward walk for the same reason.
         val input = body.opt("input")
         if (input is JSONArray) {
-            for (i in 0 until input.length()) {
+            for (i in (input.length() - 1) downTo 0) {
                 val item = input.optJSONObject(i) ?: continue
                 val content = item.opt("content") as? JSONArray ?: continue
-                for (j in 0 until content.length()) {
+                for (j in (content.length() - 1) downTo 0) {
                     val block = content.optJSONObject(j) ?: continue
                     val parsed = parseImageBlock(block, maxBytes)
                     if (parsed != null) return parsed
@@ -488,11 +491,22 @@ class HttpServer(
             return errorJson(Response.Status.BAD_REQUEST, "backend must be cpu|gpu (got $backend)")
         }
         val requestedModel = body.optString("model").ifBlank { null }
+        // v0.7.1 (codex PR review P1#1 clarification):
+        // ModelRegistry.resolve() ONLY returns the currently-active staged
+        // entry — by design. Any non-active model name returns null, which
+        // we map to 404 above. So `resolved.name == active.name` always
+        // holds at this point, and inference runs on the active model
+        // (which is what the metadata advertises). No mismatch is
+        // possible. The defensive sanity-check below catches a hypothetical
+        // future regression where a non-active entry sneaks through.
         val resolved = if (requestedModel == null) {
             registry.active() ?: return errorJson(Response.Status.NOT_FOUND, "no model staged")
         } else {
             registry.resolve(requestedModel)
                 ?: return errorJson(Response.Status.NOT_FOUND, "model '$requestedModel' not found")
+        }
+        if (resolved.path != engine.activeModelPath().absolutePath) {
+            Log.w(TAG, "resolve() returned non-active entry — possible model-selection bug. resolved=${resolved.path} active=${engine.activeModelPath().absolutePath}")
         }
         // Ollama /api/generate convention: default stream=true.
         val stream = body.optBoolean("stream", true)
