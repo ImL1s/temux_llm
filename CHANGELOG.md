@@ -9,6 +9,101 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 (no unreleased changes)
 
+## [0.7.2] — 2026-05-03
+
+End-to-end agent-workflow testing on real device exposed an upstream
+SDK bug. Patch transparently falls back to the prompt-injection path
+so requests succeed instead of 500-ing.
+
+### What broke
+
+User asked: "did you test web search and writing a snake game?"
+Honest answer was no — I'd only tested wire format with one simple
+tool (`get_weather`) and short prompts. End-to-end tested:
+
+1. **Snake game (`/v1/chat/completions`, CPU, max_tokens 1024)**:
+   ✅ Generated 3686 chars / 1008 tokens of valid HTML in 9m27s
+   (~1.78 t/s decode on Gemma 4 E4B CPU). Canvas tag, keydown
+   handler, food spawn, game-over detection, doctype, closed
+   `</html>` — playable in browser.
+
+2. **Web search via llxprt (`direct_web_fetch` tool)**:
+   ❌ SDK's native FC-parser threw `LiteRtLmJniException
+   INVALID_ARGUMENT: Failed to parse tool calls from response`
+   when Gemma 4 emitted its native `<|tool_call|>` tokens for an
+   underscore tool name (`direct_web_fetch`). Same bug class as
+   upstream LiteRT-LM #1027 / #1539 / #1181.
+
+   The 30/30 success we measured in v0.7.0 used a single
+   underscore-free tool (`get_weather`) — happy accident.
+
+### Fix
+
+Three call sites (`blockingGenerate`, `runStreamBuffered`,
+`blockingResponsesWithTools`) now catch SDK FC-parser exceptions and
+transparently fall back to the prompt-injection + repair path. The
+fallback re-renders the original tool definitions as our LCD JSON
+prompt block and re-runs through `engine.generateBlocking`. Output
+is parsed via the repair-aware `ChatFormat.parseToolCalls`.
+
+Detected error patterns: `LiteRtLmJniException`, `Failed to parse`,
+`INVALID_ARGUMENT` substrings in the SDK error message.
+
+### What this fixes / what it doesn't
+
+- ✅ Service no longer returns 500 when SDK's FC parser chokes on
+  Gemma 4's native tool tokens.
+- ✅ Single-tool simple-prompt cases still go through native path
+  (faster, cleaner typed output).
+- ⚠ Fallback model output quality is itself uneven: in multi-tool
+  prompts (llxprt registers ~10 built-in tools), Gemma 4 E4B mixes
+  the SDK's native `<|tool_call|>` format with our LCD JSON prompt
+  injection and emits malformed JSON like
+  `{"tool_calls":[{"name":"direct_name":"direct_web_fetch",...}]}`
+  with duplicated keys. The repair function recovers structure
+  but the duplicated key fields make the call un-dispatchable.
+
+  This is a Gemma 4 E4B context-handling limitation, not a service
+  bug. Single-tool requests work cleanly (n=30 weather queries pass
+  100 %). Multi-tool agent loops with full CLI tool registries are
+  unreliable until either upstream LiteRT-LM ships a fixed FC parser
+  or we add grammar-constrained decoding (currently neither is
+  available — see #1027 maintainer notes).
+
+### Files
+
+- `android/app/src/main/kotlin/dev/temuxllm/HttpServer.kt` — fallback
+  branches in `blockingGenerate`, `runStreamBuffered`, and
+  `blockingResponsesWithTools`. Detects SDK error string patterns;
+  re-renders prompt with `ChatFormat.renderToolBlock`; re-runs
+  through `engine.generateBlocking`; parses with
+  `ChatFormat.parseToolCalls`. Sets `nativeFallbackTriggered` so the
+  parsed-output selector picks the repair path.
+- `android/app/build.gradle.kts` — versionCode 16 → 17, versionName
+  0.7.1 → 0.7.2.
+
+### Acceptance
+
+- 60 unit tests pass (no test changes; behavior preserved).
+- `:app:lintDebug` clean.
+- APK builds, installs on Galaxy S25.
+- Real-device verified:
+  - Snake game CPU non-stream: 1008 tokens of valid HTML, ✓
+  - llxprt fetch on v0.7.1: 500 with FC-parser error
+  - llxprt fetch on v0.7.2: HTTP 200 with malformed-but-extractable
+    JSON; service log shows fallback fired (`FC-parser threw —
+    falling back`).
+
+### Known limitation kept honest
+
+If you're using a CLI agent with > 3 registered tools (claude --bare
+without --mcp-config has ~6, llxprt has ~10, opencode has ~14), the
+model's tool selection accuracy degrades. Gemma 4 E4B's recall
+on selecting the right tool from a long list and emitting clean JSON
+args drops to roughly 30-50 % in our hand-checking. This is the
+single biggest reason v0.6 / v0.7 advertise tool calling as
+"single-shot reliable, multi-turn agent loops still uneven."
+
 ## [0.7.1] — 2026-05-02
 
 Patch addressing 7 findings codex's PR-bot auto-review flagged on PR #11

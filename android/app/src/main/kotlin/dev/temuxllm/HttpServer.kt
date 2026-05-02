@@ -790,30 +790,48 @@ class HttpServer(
             val realEngine = engine as? LlmEngine
                 ?: return errorJson(Response.Status.INTERNAL_ERROR, "native tools require LlmEngine instance")
             val nr = realEngine.generateWithNativeTools(backend, prompt, nativeToolDescriptions!!, imageBytes)
-            if (nr.error != null) {
+            val sdkParserError = nr.error != null &&
+                (nr.error.contains("LiteRtLmJniException") || nr.error.contains("Failed to parse") || nr.error.contains("INVALID_ARGUMENT"))
+            if (sdkParserError) {
+                // v0.7.2: fall back to prompt-injection on SDK FC-parser error
+                Log.w(TAG, "blockingResponses native FC-parser threw — falling back. err=${nr.error}")
+                val toolJsonArr = JSONArray()
+                nativeToolDescriptions!!.forEach { toolJsonArr.put(JSONObject(it)) }
+                val fbBlock = ChatFormat.renderToolBlock(toolJsonArr)
+                val fbPrompt = if (fbBlock != null) "$fbBlock\n\n$prompt" else prompt
+                r = engine.generateBlocking(fbPrompt, backend, imageBytes)
+                if (r.error != null) {
+                    return json(Response.Status.INTERNAL_ERROR, JSONObject().apply {
+                        put("type", "error")
+                        put("error", JSONObject().apply { put("code", "server_error"); put("message", "fallback also failed: ${r.error}") })
+                    })
+                }
+                parsed = ChatFormat.parseToolCalls(r.text, allowedToolNames.takeIf { it.isNotEmpty() })
+            } else if (nr.error != null) {
                 return json(Response.Status.INTERNAL_ERROR, JSONObject().apply {
                     put("type", "error")
                     put("error", JSONObject().apply { put("code", "server_error"); put("message", "native tools generate failed: ${nr.error}") })
                 })
-            }
-            r = GenerateResult(text = nr.rawText, backend = nr.backend, outputTokens = 0, totalDurationMs = nr.durationMs, error = null)
-            val typedCalls = nr.toolCallNames.zip(nr.toolCallArgs).mapNotNull { (name, args) ->
-                if (allowedToolNames.isNotEmpty() && name !in allowedToolNames) return@mapNotNull null
-                val argsObj = JSONObject()
-                args.forEach { (k, v) ->
-                    when (v) {
-                        null -> argsObj.put(k, JSONObject.NULL)
-                        is String, is Number, is Boolean -> argsObj.put(k, v)
-                        else -> argsObj.put(k, v.toString())
+            } else {
+                r = GenerateResult(text = nr.rawText, backend = nr.backend, outputTokens = 0, totalDurationMs = nr.durationMs, error = null)
+                val typedCalls = nr.toolCallNames.zip(nr.toolCallArgs).mapNotNull { (name, args) ->
+                    if (allowedToolNames.isNotEmpty() && name !in allowedToolNames) return@mapNotNull null
+                    val argsObj = JSONObject()
+                    args.forEach { (k, v) ->
+                        when (v) {
+                            null -> argsObj.put(k, JSONObject.NULL)
+                            is String, is Number, is Boolean -> argsObj.put(k, v)
+                            else -> argsObj.put(k, v.toString())
+                        }
                     }
+                    ChatFormat.ToolCall(
+                        id = "call_" + UUID.randomUUID().toString().replace("-", "").take(20),
+                        name = name,
+                        arguments = argsObj,
+                    )
                 }
-                ChatFormat.ToolCall(
-                    id = "call_" + UUID.randomUUID().toString().replace("-", "").take(20),
-                    name = name,
-                    arguments = argsObj,
-                )
+                parsed = ChatFormat.ParsedOutput(r.text, typedCalls)
             }
-            parsed = ChatFormat.ParsedOutput(r.text, typedCalls)
         } else {
             r = engine.generateBlocking(prompt, backend, imageBytes)
             if (r.error != null) {
@@ -968,28 +986,44 @@ class HttpServer(
                         return@thread
                     }
                     val nr = realEngine.generateWithNativeTools(backend, prompt, nativeToolDescriptions!!, imageBytes)
-                    if (nr.error != null) {
+                    val sdkParserError = nr.error != null &&
+                        (nr.error.contains("LiteRtLmJniException") || nr.error.contains("Failed to parse") || nr.error.contains("INVALID_ARGUMENT"))
+                    if (sdkParserError) {
+                        // v0.7.2: fallback to prompt-injection on SDK FC-parser error
+                        Log.w(TAG, "runStreamBuffered native FC-parser threw — falling back. err=${nr.error}")
+                        val toolJsonArr = JSONArray()
+                        nativeToolDescriptions!!.forEach { toolJsonArr.put(JSONObject(it)) }
+                        val fbBlock = ChatFormat.renderToolBlock(toolJsonArr)
+                        val fbPrompt = if (fbBlock != null) "$fbBlock\n\n$prompt" else prompt
+                        r = engine.generateBlocking(fbPrompt, backend, imageBytes)
+                        if (r.error != null) {
+                            encoder.emitError(writer, "fallback also failed: ${r.error}")
+                            return@thread
+                        }
+                        parsed = ChatFormat.parseToolCalls(r.text, allowedToolNames)
+                    } else if (nr.error != null) {
                         encoder.emitError(writer, "native tools: ${nr.error}")
                         return@thread
-                    }
-                    r = GenerateResult(text = nr.rawText, backend = nr.backend, outputTokens = 0, totalDurationMs = nr.durationMs, error = null)
-                    val typedCalls = nr.toolCallNames.zip(nr.toolCallArgs).mapNotNull { (name, args) ->
-                        if (allowedToolNames.isNotEmpty() && name !in allowedToolNames) return@mapNotNull null
-                        val argsObj = JSONObject()
-                        args.forEach { (k, v) ->
-                            when (v) {
-                                null -> argsObj.put(k, JSONObject.NULL)
-                                is String, is Number, is Boolean -> argsObj.put(k, v)
-                                else -> argsObj.put(k, v.toString())
+                    } else {
+                        r = GenerateResult(text = nr.rawText, backend = nr.backend, outputTokens = 0, totalDurationMs = nr.durationMs, error = null)
+                        val typedCalls = nr.toolCallNames.zip(nr.toolCallArgs).mapNotNull { (name, args) ->
+                            if (allowedToolNames.isNotEmpty() && name !in allowedToolNames) return@mapNotNull null
+                            val argsObj = JSONObject()
+                            args.forEach { (k, v) ->
+                                when (v) {
+                                    null -> argsObj.put(k, JSONObject.NULL)
+                                    is String, is Number, is Boolean -> argsObj.put(k, v)
+                                    else -> argsObj.put(k, v.toString())
+                                }
                             }
+                            ChatFormat.ToolCall(
+                                id = "call_" + UUID.randomUUID().toString().replace("-", "").take(20),
+                                name = name,
+                                arguments = argsObj,
+                            )
                         }
-                        ChatFormat.ToolCall(
-                            id = "call_" + UUID.randomUUID().toString().replace("-", "").take(20),
-                            name = name,
-                            arguments = argsObj,
-                        )
+                        parsed = ChatFormat.ParsedOutput(r.text, typedCalls)
                     }
-                    parsed = ChatFormat.ParsedOutput(r.text, typedCalls)
                 } else {
                     r = engine.generateBlocking(prompt, backend, imageBytes)
                     if (r.error != null) {
@@ -1120,6 +1154,14 @@ class HttpServer(
         // path-agnostic way.
         val r: GenerateResult
         val nativeToolCalls: List<ChatFormat.ToolCall>
+        // v0.7.2: when native path errors with SDK FC-parser exception
+        // (Gemma 4 emits <|tool_call|> tokens but SDK's grammar fails on
+        // underscore tool names / complex args — upstream LiteRT-LM
+        // #1027 #1539 #1181), we transparently fall back to the
+        // prompt-injection + repair path. nativeFallbackTriggered is
+        // set so the parsed-output branch below takes the parseTools
+        // path instead of trusting nativeToolCalls.
+        var nativeFallbackTriggered = false
         if (useNative) {
             val realEngine = engine as? LlmEngine
             if (realEngine == null) {
@@ -1128,17 +1170,35 @@ class HttpServer(
             }
             val started = System.currentTimeMillis()
             val nr = try { realEngine.generateWithNativeTools(backend, prompt, nativeToolDescriptions!!, imageBytes) } finally { memoryProbe?.stop() }
-            if (nr.error != null) {
+            val isSdkParserError = nr.error != null &&
+                (nr.error.contains("LiteRtLmJniException") || nr.error.contains("Failed to parse") || nr.error.contains("INVALID_ARGUMENT"))
+            if (isSdkParserError) {
+                Log.w(TAG, "native tools SDK FC-parser threw — falling back. err=${nr.error}")
+                nativeFallbackTriggered = true
+                // Re-run via prompt-injection path. Add the tool block
+                // since the original prompt didn't contain it (handler
+                // skipped renderToolBlock when useNative=true).
+                val toolJsonArr = JSONArray()
+                nativeToolDescriptions!!.forEach { toolJsonArr.put(JSONObject(it)) }
+                val fbBlock = ChatFormat.renderToolBlock(toolJsonArr)
+                val fbPrompt = if (fbBlock != null) "$fbBlock\n\n$prompt" else prompt
+                memoryProbe?.start("blocking-fallback shape=$shape backend=$backend img=${imageBytes != null}")
+                r = try { engine.generateBlocking(fbPrompt, backend, imageBytes) } finally { memoryProbe?.stop() }
+                if (r.error != null) {
+                    return errorJson(Response.Status.INTERNAL_ERROR, "fallback also failed: ${r.error}")
+                }
+                nativeToolCalls = emptyList()   // parseTools path will populate parsed.toolCalls below
+            } else if (nr.error != null) {
                 return errorJson(Response.Status.INTERNAL_ERROR, "native tools generate failed: ${nr.error}")
-            }
-            r = GenerateResult(
-                text = nr.rawText,   // SDK extracted tool calls separately; rawText is residual prose
-                backend = nr.backend,
-                outputTokens = 0,    // SDK doesn't expose token count on sync path
-                totalDurationMs = System.currentTimeMillis() - started,
-                error = null,
-            )
-            nativeToolCalls = nr.toolCallNames.zip(nr.toolCallArgs).mapNotNull { (name, args) ->
+            } else {
+                r = GenerateResult(
+                    text = nr.rawText,
+                    backend = nr.backend,
+                    outputTokens = 0,
+                    totalDurationMs = System.currentTimeMillis() - started,
+                    error = null,
+                )
+                nativeToolCalls = nr.toolCallNames.zip(nr.toolCallArgs).mapNotNull { (name, args) ->
                 if (allowedToolNames.isNotEmpty() && name !in allowedToolNames) return@mapNotNull null
                 val argsObj = JSONObject()
                 args.forEach { (k, v) ->
@@ -1153,6 +1213,7 @@ class HttpServer(
                     name = name,
                     arguments = argsObj,
                 )
+            }
             }
         } else {
             r = try { engine.generateBlocking(prompt, backend, imageBytes) } finally { memoryProbe?.stop() }
@@ -1186,9 +1247,11 @@ class HttpServer(
         // name wasn't in the request's tools array — defense against prompt
         // injection that fakes a tool invocation.
         // v0.7.0: native path provides typed tool calls; skip prompt-parse.
-        val parsed = if (useNative) {
+        // v0.7.2: when native fell back to prompt-injection, parse via the
+        // injection path (nativeToolCalls is empty in that case).
+        val parsed = if (useNative && !nativeFallbackTriggered) {
             ChatFormat.ParsedOutput(r.text, nativeToolCalls)
-        } else if (parseTools) {
+        } else if (parseTools || nativeFallbackTriggered) {
             ChatFormat.parseToolCalls(r.text, allowedToolNames.takeIf { it.isNotEmpty() })
         } else {
             ChatFormat.ParsedOutput(r.text, emptyList())
