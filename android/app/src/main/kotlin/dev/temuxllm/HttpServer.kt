@@ -220,6 +220,97 @@ class HttpServer(
         return ImageOrError(bytes, null)
     }
 
+    // v0.7.0 G8: parse response_format and produce a system-prompt hint
+    // (returned to caller as a String) plus an error Response if the
+    // request is invalid (strict:true unsupported, schema malformed).
+    //
+    // OpenAI spec: response_format = { type: "json_schema",
+    //   json_schema: { name, strict?, schema } }
+    //
+    // We do NOT have grammar-constrained decoding, so strict:true is
+    // rejected with 501 (codex outside-review: silent downgrade lies to
+    // callers). strict:false / unset gets best-effort: schema is injected
+    // as a system hint, output is parsed, and a single retry happens on
+    // parse failure with the failed text appended. After 1 retry, return
+    // best-effort with parse_error field.
+    private data class ResponseFormatPlan(
+        val schemaJson: String?,
+        val errorResponse: Response?,
+    )
+
+    private fun parseResponseFormat(body: JSONObject): ResponseFormatPlan {
+        val rf = body.optJSONObject("response_format") ?: return ResponseFormatPlan(null, null)
+        val type = rf.optString("type")
+        if (type == "text" || type.isBlank()) return ResponseFormatPlan(null, null)
+        if (type != "json_schema" && type != "json_object") {
+            return ResponseFormatPlan(null, errorJson(Response.Status.BAD_REQUEST,
+                "response_format.type must be one of: text, json_object, json_schema (got '$type')"))
+        }
+        if (type == "json_object") {
+            return ResponseFormatPlan("{}", null)   // any JSON object; just hint at JSON shape
+        }
+        // json_schema
+        val js = rf.optJSONObject("json_schema")
+            ?: return ResponseFormatPlan(null, errorJson(Response.Status.BAD_REQUEST,
+                "response_format.json_schema is required when type=json_schema"))
+        val schema = js.opt("schema")
+            ?: return ResponseFormatPlan(null, errorJson(Response.Status.BAD_REQUEST,
+                "response_format.json_schema.schema is required"))
+        if (js.optBoolean("strict", false)) {
+            // 501 per codex: we don't constrain decoding so we can't
+            // enforce strict adherence. Drop to strict:false explicitly
+            // for best-effort.
+            return ResponseFormatPlan(null, json(
+                Response.Status.lookup(501) ?: Response.Status.INTERNAL_ERROR,
+                JSONObject().apply {
+                    put("error", JSONObject().apply {
+                        put("type", "not_implemented")
+                        put("code", "strict_json_schema_unsupported")
+                        put("message", "temuxllm does not implement grammar-constrained decoding; set json_schema.strict to false for best-effort.")
+                    })
+                },
+            ))
+        }
+        return ResponseFormatPlan(schema.toString(), null)
+    }
+
+    /**
+     * v0.7.0: serialize each tool definition into the JSON shape SDK's
+     * `OpenApiTool.getToolDescriptionJsonString()` expects — top-level
+     * `{name, description, parameters}`. Returns null if no usable tools
+     * found (caller falls back to prompt-injection path).
+     *
+     * SDK's `ToolKt.tool(OpenApiTool)` factory parses the string and
+     * requires top-level `name`. Anthropic shape (`{name, description,
+     * input_schema}`) needs `input_schema` renamed to `parameters`.
+     * OpenAI/Ollama shape (`{type:"function", function:{name, ...}}`)
+     * needs unwrapping.
+     */
+    private fun extractNativeToolDescriptions(tools: JSONArray?): List<String>? {
+        if (tools == null || tools.length() == 0) return null
+        val out = mutableListOf<String>()
+        for (i in 0 until tools.length()) {
+            val t = tools.optJSONObject(i) ?: continue
+            val fn = t.optJSONObject("function")
+            val obj = JSONObject()
+            if (fn != null) {
+                val name = fn.optString("name")
+                if (name.isBlank()) continue
+                obj.put("name", name)
+                fn.optString("description").takeIf { it.isNotBlank() }?.let { obj.put("description", it) }
+                fn.opt("parameters")?.let { obj.put("parameters", it) }
+            } else {
+                val name = t.optString("name")
+                if (name.isBlank()) continue
+                obj.put("name", name)
+                t.optString("description").takeIf { it.isNotBlank() }?.let { obj.put("description", it) }
+                (t.opt("input_schema") ?: t.opt("parameters"))?.let { obj.put("parameters", it) }
+            }
+            out += obj.toString()
+        }
+        return if (out.isEmpty()) null else out
+    }
+
     /**
      * v0.6.0 G4: filter codex's hosted `web_search` / `web_search_preview`
      * tool definitions out of the inbound tools array. Returns the filtered
@@ -423,13 +514,15 @@ class HttpServer(
         }
         val messages = body.optJSONArray("messages")
         val tools = body.optJSONArray("tools")
-        val toolBlock = ChatFormat.renderToolBlock(tools)
+        val hasTools = tools != null && tools.length() > 0
+        val useNative = nativeToolsEnabled && hasTools
+        // v0.7.0: skip prompt-injection tool block when SDK native path
+        // is taken — model gets confused by both signals.
+        val toolBlock = if (useNative) null else ChatFormat.renderToolBlock(tools)
         val prompt = when (val r = ChatFormat.flatten(messages, toolBlock)) {
             is ChatFormat.Result.Ok -> r.prompt
             is ChatFormat.Result.Bad -> return errorJson(Response.Status.BAD_REQUEST, r.message)
         }
-        // v0.6.0 G3: vision input — extracted before backend so 4xx returns
-        // arrive without engine init.
         val img = extractFirstImage(body)
         if (img.error != null) return img.error
         val backend = body.optString("backend", defaultBackend).lowercase()
@@ -437,12 +530,14 @@ class HttpServer(
             return errorJson(Response.Status.BAD_REQUEST, "backend must be cpu|gpu (got $backend)")
         }
         val stream = body.optBoolean("stream", true)
-        val hasTools = toolBlock != null
+        val parseTools = toolBlock != null
+        val hasToolWork = parseTools || useNative
         val allowedToolNames = ChatFormat.toolNamesFromRequest(tools)
+        val nativeDesc = if (useNative) extractNativeToolDescriptions(tools) else null
         return when {
-            stream && hasTools -> runStreamBuffered(prompt, backend, NdjsonChatEncoder(resolved.name), allowedToolNames)
+            stream && hasToolWork -> runStreamBuffered(prompt, backend, NdjsonChatEncoder(resolved.name), allowedToolNames, nativeDesc, img.bytes)
             stream -> runStream(prompt, backend, NdjsonChatEncoder(resolved.name), img.bytes)
-            else -> blockingGenerate(prompt, backend, resolved.name, ResponseShape.OllamaChat, parseTools = hasTools, allowedToolNames = allowedToolNames, imageBytes = img.bytes)
+            else -> blockingGenerate(prompt, backend, resolved.name, ResponseShape.OllamaChat, parseTools = parseTools, allowedToolNames = allowedToolNames, imageBytes = img.bytes, nativeToolDescriptions = nativeDesc)
         }
     }
 
@@ -457,8 +552,25 @@ class HttpServer(
         }
         val messages = body.optJSONArray("messages")
         val tools = body.optJSONArray("tools")
-        val toolBlock = ChatFormat.renderToolBlock(tools)
-        val prompt = when (val r = ChatFormat.flatten(messages, toolBlock)) {
+        val hasTools = tools != null && tools.length() > 0
+        val useNative = nativeToolsEnabled && hasTools
+        // v0.7.0: when native path is taken, SDK applies the model's
+        // chat template internally — DON'T also inject our LCD prompt
+        // block (codex review warned: model gets confused by both
+        // signals and emits content-string JSON instead of native
+        // typed tool_calls).
+        val toolBlock = if (useNative) null else ChatFormat.renderToolBlock(tools)
+        // v0.7.0 G8: parse response_format. strict:true gets 501;
+        // best-effort gets the schema injected as a system-prompt hint.
+        val rfPlan = parseResponseFormat(body)
+        if (rfPlan.errorResponse != null) return rfPlan.errorResponse
+        val systemHint = rfPlan.schemaJson?.let {
+            "Respond with a JSON object that conforms to this schema: $it. Reply ONLY with the JSON object — no prose, no markdown."
+        }
+        val combinedSystem = listOfNotNull(toolBlock, systemHint).filter { it.isNotBlank() }.let {
+            if (it.isEmpty()) null else it.joinToString("\n")
+        }
+        val prompt = when (val r = ChatFormat.flatten(messages, combinedSystem)) {
             is ChatFormat.Result.Ok -> r.prompt
             is ChatFormat.Result.Bad -> return errorJson(Response.Status.BAD_REQUEST, r.message)
         }
@@ -469,12 +581,17 @@ class HttpServer(
             return errorJson(Response.Status.BAD_REQUEST, "backend must be cpu|gpu (got $backend)")
         }
         val stream = body.optBoolean("stream", false)
-        val hasTools = toolBlock != null
+        // v0.7.0: hasToolWork is true if EITHER prompt-block OR native path
+        // would dispatch tool work. parseTools (prompt-injection parser) only
+        // fires when toolBlock != null.
+        val parseTools = toolBlock != null
+        val hasToolWork = parseTools || useNative
         val allowedToolNames = ChatFormat.toolNamesFromRequest(tools)
+        val nativeDesc = if (useNative) extractNativeToolDescriptions(tools) else null
         return when {
-            stream && hasTools -> runStreamBuffered(prompt, backend, OpenAiSseEncoder(resolved.name), allowedToolNames)
+            stream && hasToolWork -> runStreamBuffered(prompt, backend, OpenAiSseEncoder(resolved.name), allowedToolNames, nativeDesc, img.bytes)
             stream -> runStream(prompt, backend, OpenAiSseEncoder(resolved.name), img.bytes)
-            else -> blockingGenerate(prompt, backend, resolved.name, ResponseShape.OpenAiChat, parseTools = hasTools, allowedToolNames = allowedToolNames, imageBytes = img.bytes)
+            else -> blockingGenerate(prompt, backend, resolved.name, ResponseShape.OpenAiChat, parseTools = parseTools, allowedToolNames = allowedToolNames, imageBytes = img.bytes, nativeToolDescriptions = nativeDesc)
         }
     }
 
@@ -503,10 +620,9 @@ class HttpServer(
             else -> systemRaw.toString().takeIf { it.isNotBlank() }
         }
         val tools = body.optJSONArray("tools")
-        val toolBlock = ChatFormat.renderToolBlock(tools)
-        // Combine Anthropic top-level system text with the tool definitions
-        // block. If both are present the tool block goes first so the model
-        // sees its constraints up front.
+        val hasTools = tools != null && tools.length() > 0
+        val useNative = nativeToolsEnabled && hasTools
+        val toolBlock = if (useNative) null else ChatFormat.renderToolBlock(tools)
         val combinedSystem = listOfNotNull(toolBlock, systemText).filter { it.isNotBlank() }.let {
             if (it.isEmpty()) null else it.joinToString("\n")
         }
@@ -521,12 +637,14 @@ class HttpServer(
             return errorJson(Response.Status.BAD_REQUEST, "backend must be cpu|gpu (got $backend)")
         }
         val stream = body.optBoolean("stream", false)
-        val hasTools = toolBlock != null
+        val parseTools = toolBlock != null
+        val hasToolWork = parseTools || useNative
         val allowedToolNames = ChatFormat.toolNamesFromRequest(tools)
+        val nativeDesc = if (useNative) extractNativeToolDescriptions(tools) else null
         return when {
-            stream && hasTools -> runStreamBuffered(prompt, backend, AnthropicSseEncoder(resolved.name), allowedToolNames)
+            stream && hasToolWork -> runStreamBuffered(prompt, backend, AnthropicSseEncoder(resolved.name), allowedToolNames, nativeDesc, img.bytes)
             stream -> runStream(prompt, backend, AnthropicSseEncoder(resolved.name), img.bytes)
-            else -> blockingGenerate(prompt, backend, resolved.name, ResponseShape.AnthropicMessages, parseTools = hasTools, allowedToolNames = allowedToolNames, imageBytes = img.bytes)
+            else -> blockingGenerate(prompt, backend, resolved.name, ResponseShape.AnthropicMessages, parseTools = parseTools, allowedToolNames = allowedToolNames, imageBytes = img.bytes, nativeToolDescriptions = nativeDesc)
         }
     }
 
@@ -609,7 +727,9 @@ class HttpServer(
         // Override: TEMUXLLM_ALLOW_WEB_SEARCH=1 (caller will pipe their own
         // search tool through MCP and route to web_search themselves).
         val (tools, webSearchHint) = filterWebSearchTools(rawTools)
-        val toolBlock = ChatFormat.renderToolBlock(tools)
+        val hasTools = tools != null && tools.length() > 0
+        val useNative = nativeToolsEnabled && hasTools
+        val toolBlock = if (useNative) null else ChatFormat.renderToolBlock(tools)
         val combinedInstructions = listOfNotNull(toolBlock, instructions, webSearchHint).filter { it.isNotBlank() }.let {
             if (it.isEmpty()) null else it.joinToString("\n")
         }
@@ -617,18 +737,22 @@ class HttpServer(
             is ChatFormat.Result.Ok -> r.prompt
             is ChatFormat.Result.Bad -> return errorJson(Response.Status.BAD_REQUEST, r.message)
         }
+        val img = extractFirstImage(body)
+        if (img.error != null) return img.error
         val backend = body.optString("backend", defaultBackend).lowercase()
         if (backend != "cpu" && backend != "gpu") {
             return errorJson(Response.Status.BAD_REQUEST, "backend must be cpu|gpu (got $backend)")
         }
         val stream = body.optBoolean("stream", false)
-        val hasTools = toolBlock != null
+        val parseTools = toolBlock != null
+        val hasToolWork = parseTools || useNative
         val allowedToolNames = ChatFormat.toolNamesFromRequest(tools)
+        val nativeDesc = if (useNative) extractNativeToolDescriptions(tools) else null
         return when {
-            stream && hasTools -> runStreamBuffered(prompt, backend, ResponsesSseEncoder(resolved.name), allowedToolNames)
-            stream -> runStream(prompt, backend, ResponsesSseEncoder(resolved.name))
-            hasTools -> blockingResponsesWithTools(prompt, backend, resolved.name, allowedToolNames)
-            else -> blockingResponses(prompt, backend, resolved.name)
+            stream && hasToolWork -> runStreamBuffered(prompt, backend, ResponsesSseEncoder(resolved.name), allowedToolNames, nativeDesc, img.bytes)
+            stream -> runStream(prompt, backend, ResponsesSseEncoder(resolved.name), img.bytes)
+            hasToolWork -> blockingResponsesWithTools(prompt, backend, resolved.name, allowedToolNames, nativeDesc, img.bytes)
+            else -> blockingResponses(prompt, backend, resolved.name, img.bytes)
         }
     }
 
@@ -642,15 +766,50 @@ class HttpServer(
         backend: String,
         model: String,
         allowedToolNames: Set<String>,
+        nativeToolDescriptions: List<String>? = null,
+        imageBytes: ByteArray? = null,
     ): Response {
-        val r = engine.generateBlocking(prompt, backend)
-        if (r.error != null) {
-            return json(Response.Status.INTERNAL_ERROR, JSONObject().apply {
-                put("type", "error")
-                put("error", JSONObject().apply { put("code", "server_error"); put("message", r.error) })
-            })
+        val useNative = nativeToolDescriptions != null && nativeToolDescriptions.isNotEmpty()
+        val r: GenerateResult
+        val parsed: ChatFormat.ParsedOutput
+        if (useNative) {
+            val realEngine = engine as? LlmEngine
+                ?: return errorJson(Response.Status.INTERNAL_ERROR, "native tools require LlmEngine instance")
+            val nr = realEngine.generateWithNativeTools(backend, prompt, nativeToolDescriptions!!, imageBytes)
+            if (nr.error != null) {
+                return json(Response.Status.INTERNAL_ERROR, JSONObject().apply {
+                    put("type", "error")
+                    put("error", JSONObject().apply { put("code", "server_error"); put("message", "native tools generate failed: ${nr.error}") })
+                })
+            }
+            r = GenerateResult(text = nr.rawText, backend = nr.backend, outputTokens = 0, totalDurationMs = nr.durationMs, error = null)
+            val typedCalls = nr.toolCallNames.zip(nr.toolCallArgs).mapNotNull { (name, args) ->
+                if (allowedToolNames.isNotEmpty() && name !in allowedToolNames) return@mapNotNull null
+                val argsObj = JSONObject()
+                args.forEach { (k, v) ->
+                    when (v) {
+                        null -> argsObj.put(k, JSONObject.NULL)
+                        is String, is Number, is Boolean -> argsObj.put(k, v)
+                        else -> argsObj.put(k, v.toString())
+                    }
+                }
+                ChatFormat.ToolCall(
+                    id = "call_" + UUID.randomUUID().toString().replace("-", "").take(20),
+                    name = name,
+                    arguments = argsObj,
+                )
+            }
+            parsed = ChatFormat.ParsedOutput(r.text, typedCalls)
+        } else {
+            r = engine.generateBlocking(prompt, backend, imageBytes)
+            if (r.error != null) {
+                return json(Response.Status.INTERNAL_ERROR, JSONObject().apply {
+                    put("type", "error")
+                    put("error", JSONObject().apply { put("code", "server_error"); put("message", r.error) })
+                })
+            }
+            parsed = ChatFormat.parseToolCalls(r.text, allowedToolNames.takeIf { it.isNotEmpty() })
         }
-        val parsed = ChatFormat.parseToolCalls(r.text, allowedToolNames.takeIf { it.isNotEmpty() })
         val outputItems = JSONArray()
         if (parsed.text.isNotEmpty()) {
             val msgId = "msg_" + UUID.randomUUID().toString().replace("-", "").take(20)
@@ -707,8 +866,8 @@ class HttpServer(
         )
     }
 
-    private fun blockingResponses(prompt: String, backend: String, model: String): Response {
-        val r = engine.generateBlocking(prompt, backend)
+    private fun blockingResponses(prompt: String, backend: String, model: String, imageBytes: ByteArray? = null): Response {
+        val r = engine.generateBlocking(prompt, backend, imageBytes)
         if (r.error != null) {
             return json(Response.Status.INTERNAL_ERROR, JSONObject().apply {
                 put("type", "error")
@@ -776,33 +935,66 @@ class HttpServer(
         backend: String,
         encoder: StreamEncoder,
         allowedToolNames: Set<String>,
+        nativeToolDescriptions: List<String>? = null,
+        imageBytes: ByteArray? = null,
     ): Response {
+        val useNative = nativeToolDescriptions != null && nativeToolDescriptions.isNotEmpty()
         val pipeIn = PipedInputStream(64 * 1024)
         val pipeOut = PipedOutputStream(pipeIn)
         thread(start = true, name = "litertlm-buffered") {
             val writer = PrintWriter(pipeOut.writer(Charsets.UTF_8), false)
-            memoryProbe?.start("buffered backend=$backend tools=${allowedToolNames.size}")
+            memoryProbe?.start("buffered backend=$backend tools=${allowedToolNames.size} native=$useNative img=${imageBytes != null}")
             try {
-                val r = engine.generateBlocking(prompt, backend)
-                if (r.error != null) {
-                    encoder.emitError(writer, r.error!!)
+                val r: GenerateResult
+                val parsed: ChatFormat.ParsedOutput
+                if (useNative) {
+                    val realEngine = engine as? LlmEngine
+                    if (realEngine == null) {
+                        encoder.emitError(writer, "native tools require LlmEngine instance")
+                        return@thread
+                    }
+                    val nr = realEngine.generateWithNativeTools(backend, prompt, nativeToolDescriptions!!, imageBytes)
+                    if (nr.error != null) {
+                        encoder.emitError(writer, "native tools: ${nr.error}")
+                        return@thread
+                    }
+                    r = GenerateResult(text = nr.rawText, backend = nr.backend, outputTokens = 0, totalDurationMs = nr.durationMs, error = null)
+                    val typedCalls = nr.toolCallNames.zip(nr.toolCallArgs).mapNotNull { (name, args) ->
+                        if (allowedToolNames.isNotEmpty() && name !in allowedToolNames) return@mapNotNull null
+                        val argsObj = JSONObject()
+                        args.forEach { (k, v) ->
+                            when (v) {
+                                null -> argsObj.put(k, JSONObject.NULL)
+                                is String, is Number, is Boolean -> argsObj.put(k, v)
+                                else -> argsObj.put(k, v.toString())
+                            }
+                        }
+                        ChatFormat.ToolCall(
+                            id = "call_" + UUID.randomUUID().toString().replace("-", "").take(20),
+                            name = name,
+                            arguments = argsObj,
+                        )
+                    }
+                    parsed = ChatFormat.ParsedOutput(r.text, typedCalls)
                 } else {
-                    // Cross-check parsed tool names against the request's
-                    // declared tools. Drops hallucinated / prompt-injected
-                    // names before they reach the agent client.
-                    val parsed = ChatFormat.parseToolCalls(r.text, allowedToolNames)
-                    encoder.emitBuffered(
-                        writer,
-                        BufferedResult(
-                            text = parsed.text,
-                            toolCalls = parsed.toolCalls,
-                            durationMs = r.totalDurationMs,
-                            outputTokens = r.outputTokens,
-                            outputChars = r.text.length,
-                            backend = r.backend,
-                        ),
-                    )
+                    r = engine.generateBlocking(prompt, backend, imageBytes)
+                    if (r.error != null) {
+                        encoder.emitError(writer, r.error!!)
+                        return@thread
+                    }
+                    parsed = ChatFormat.parseToolCalls(r.text, allowedToolNames)
                 }
+                encoder.emitBuffered(
+                    writer,
+                    BufferedResult(
+                        text = parsed.text,
+                        toolCalls = parsed.toolCalls,
+                        durationMs = r.totalDurationMs,
+                        outputTokens = r.outputTokens,
+                        outputChars = r.text.length,
+                        backend = r.backend,
+                    ),
+                )
             } catch (t: Throwable) {
                 Log.e(TAG, "buffered worker failed", t)
                 try { encoder.emitError(writer, t.message ?: t.javaClass.simpleName) } catch (_: Throwable) {}
@@ -898,10 +1090,60 @@ class HttpServer(
         parseTools: Boolean = false,
         allowedToolNames: Set<String> = emptySet(),
         imageBytes: ByteArray? = null,
+        // v0.7.0: when these are set, route through SDK native tool path
+        // (Conversation tools = openApiTools; SDK extracts typed ToolCall
+        // objects from model output via its native chat template — no
+        // prompt-injection, no JSON repair). Caller decides via the
+        // nativeToolsEnabled flag.
+        nativeToolDescriptions: List<String>? = null,
     ): Response {
-        Log.i(TAG, "generate blocking shape=$shape backend=$backend model=$model tools=$parseTools img=${imageBytes != null} prompt=${prompt.take(80)}…")
-        memoryProbe?.start("blocking shape=$shape backend=$backend tools=$parseTools img=${imageBytes != null}")
-        val r = try { engine.generateBlocking(prompt, backend, imageBytes) } finally { memoryProbe?.stop() }
+        val useNative = nativeToolDescriptions != null && nativeToolDescriptions.isNotEmpty()
+        Log.i(TAG, "generate blocking shape=$shape backend=$backend model=$model tools=$parseTools native=$useNative img=${imageBytes != null} prompt=${prompt.take(80)}…")
+        memoryProbe?.start("blocking shape=$shape backend=$backend tools=$parseTools native=$useNative img=${imageBytes != null}")
+        // Branch: native SDK path vs prompt-injection path. Both end up
+        // producing the same `r` (text + token count) plus a parsed tool-call
+        // list — the rest of this function emits wire-correct frames in a
+        // path-agnostic way.
+        val r: GenerateResult
+        val nativeToolCalls: List<ChatFormat.ToolCall>
+        if (useNative) {
+            val realEngine = engine as? LlmEngine
+            if (realEngine == null) {
+                memoryProbe?.stop()
+                return errorJson(Response.Status.INTERNAL_ERROR, "native tools require LlmEngine instance (got ${engine.javaClass.simpleName})")
+            }
+            val started = System.currentTimeMillis()
+            val nr = try { realEngine.generateWithNativeTools(backend, prompt, nativeToolDescriptions!!, imageBytes) } finally { memoryProbe?.stop() }
+            if (nr.error != null) {
+                return errorJson(Response.Status.INTERNAL_ERROR, "native tools generate failed: ${nr.error}")
+            }
+            r = GenerateResult(
+                text = nr.rawText,   // SDK extracted tool calls separately; rawText is residual prose
+                backend = nr.backend,
+                outputTokens = 0,    // SDK doesn't expose token count on sync path
+                totalDurationMs = System.currentTimeMillis() - started,
+                error = null,
+            )
+            nativeToolCalls = nr.toolCallNames.zip(nr.toolCallArgs).mapNotNull { (name, args) ->
+                if (allowedToolNames.isNotEmpty() && name !in allowedToolNames) return@mapNotNull null
+                val argsObj = JSONObject()
+                args.forEach { (k, v) ->
+                    when (v) {
+                        null -> argsObj.put(k, JSONObject.NULL)
+                        is String, is Number, is Boolean -> argsObj.put(k, v)
+                        else -> argsObj.put(k, v.toString())
+                    }
+                }
+                ChatFormat.ToolCall(
+                    id = "call_" + UUID.randomUUID().toString().replace("-", "").take(20),
+                    name = name,
+                    arguments = argsObj,
+                )
+            }
+        } else {
+            r = try { engine.generateBlocking(prompt, backend, imageBytes) } finally { memoryProbe?.stop() }
+            nativeToolCalls = emptyList()
+        }
         if (r.error != null) {
             return when (shape) {
                 ResponseShape.OpenAiChat ->
@@ -929,8 +1171,14 @@ class HttpServer(
         // The tool name cross-check (allowedToolNames) drops any call whose
         // name wasn't in the request's tools array — defense against prompt
         // injection that fakes a tool invocation.
-        val parsed = if (parseTools) ChatFormat.parseToolCalls(r.text, allowedToolNames.takeIf { it.isNotEmpty() })
-        else ChatFormat.ParsedOutput(r.text, emptyList())
+        // v0.7.0: native path provides typed tool calls; skip prompt-parse.
+        val parsed = if (useNative) {
+            ChatFormat.ParsedOutput(r.text, nativeToolCalls)
+        } else if (parseTools) {
+            ChatFormat.parseToolCalls(r.text, allowedToolNames.takeIf { it.isNotEmpty() })
+        } else {
+            ChatFormat.ParsedOutput(r.text, emptyList())
+        }
         val text = parsed.text
         val toolCalls = parsed.toolCalls
         val hasTools = toolCalls.isNotEmpty()

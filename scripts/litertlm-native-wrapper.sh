@@ -282,121 +282,31 @@ fi
 TOKENS="${DECODE_TOKENS:-}"
 
 # When --tools was set, look for a `{"tool_calls":[...]}` JSON object in the
-# model output and surface it. CLI wrapper parity with the APK service: same
-# wire-level expectation of the model, same `name(args)` extraction logic.
+# v0.7.0: parsing delegated to scripts/temuxllm_repair.py — single source
+# of truth shared with install-termux-native.sh's installed copy. The
+# helper does the same brace-balance parse PLUS the Gemma 4 JSON repair
+# pass that brought the APK service from 23/30 to 30/30 tool-call success
+# on the May 2 baseline.
 TOOL_CALLS_PRETTY=""
 TEXT_AFTER_TOOLS="$RESPONSE"
-if [ -n "$TOOLS_JSON" ] && [ -n "$RESPONSE" ] && command -v python3 >/dev/null 2>&1; then
-    PY_OUT=$(printf '%s' "$RESPONSE" | python3 -c '
-import json, re, sys
-buf = sys.stdin.read()
-# Find a {... "tool_calls": [...] ...} object using brace balance.
-key = '"'"'"tool_calls"'"'"'
-i = buf.find(key)
-if i < 0:
-    sys.stdout.write(buf); sys.stderr.write("\x00"); sys.exit(0)
-start = i
-while start >= 0 and buf[start] != "{":
-    start -= 1
-if start < 0:
-    sys.stdout.write(buf); sys.stderr.write("\x00"); sys.exit(0)
-depth = 0; in_str = False; esc = False; end = -1
-for j in range(start, len(buf)):
-    c = buf[j]
-    if in_str:
-        if esc: esc = False
-        elif c == "\\": esc = True
-        elif c == "\"": in_str = False
-    else:
-        if c == "\"": in_str = True
-        elif c == "{": depth += 1
-        elif c == "}":
-            depth -= 1
-            if depth == 0:
-                end = j; break
-if end < 0:
-    sys.stdout.write(buf); sys.stderr.write("\x00"); sys.exit(0)
-try:
-    obj = json.loads(buf[start:end+1])
-    calls = obj.get("tool_calls", [])
-except Exception:
-    sys.stdout.write(buf); sys.stderr.write("\x00"); sys.exit(0)
-text_remnant = (buf[:start] + buf[end+1:]).strip()
-sys.stdout.write(text_remnant)
-sys.stderr.write("\x00")
-for c in calls:
-    name = c.get("name") or (c.get("function") or {}).get("name") or ""
-    args = c.get("arguments")
-    if args is None: args = (c.get("function") or {}).get("arguments")
-    if isinstance(args, str):
-        try: args = json.loads(args)
-        except Exception: pass
-    sys.stderr.write(name + "::" + json.dumps(args, ensure_ascii=False) + "\n")
-' 2>/dev/null) || true
-    # Python writes: stdout=text-remnant, stderr=NUL-prefixed-then-tool-calls
-    # We re-emit them; bash limitation: capture stderr separately requires
-    # a temp file. Use { ... } 2>tmp pattern.
-    TMP_TOOLCALLS=$(mktemp 2>/dev/null || printf '/tmp/temuxllm-tc-%s' "$$")
-    TEXT_AFTER_TOOLS=$(printf '%s' "$RESPONSE" | python3 -c '
+HELPER_PATH=""
+for cand in \
+    "$(dirname "$0")/temuxllm_repair.py" \
+    "/data/data/com.termux/files/home/.litertlm/temuxllm_repair.py" \
+    "$HOME/.litertlm/temuxllm_repair.py" \
+    "/data/local/tmp/litertlm/temuxllm_repair.py"; do
+    if [ -f "$cand" ]; then HELPER_PATH="$cand"; break; fi
+done
+if [ -n "$TOOLS_JSON" ] && [ -n "$RESPONSE" ] && \
+   command -v python3 >/dev/null 2>&1 && [ -n "$HELPER_PATH" ]; then
+    PARSED_JSON=$(printf '%s' "$RESPONSE" | python3 "$HELPER_PATH" parse_tool_calls 2>/dev/null || printf '{}')
+    TEXT_AFTER_TOOLS=$(printf '%s' "$PARSED_JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("text",""), end="")')
+    TOOL_CALLS_PRETTY=$(printf '%s' "$PARSED_JSON" | python3 -c '
 import json, sys
-buf = sys.stdin.read()
-key = "\"tool_calls\""
-i = buf.find(key)
-if i < 0: print(buf, end=""); sys.exit(0)
-start = i
-while start >= 0 and buf[start] != "{": start -= 1
-if start < 0: print(buf, end=""); sys.exit(0)
-depth=0; ins=False; esc=False; end=-1
-for j in range(start, len(buf)):
-    c=buf[j]
-    if ins:
-        if esc: esc=False
-        elif c=="\\": esc=True
-        elif c=="\"": ins=False
-    else:
-        if c=="\"": ins=True
-        elif c=="{": depth+=1
-        elif c=="}":
-            depth-=1
-            if depth==0: end=j; break
-if end<0: print(buf, end=""); sys.exit(0)
-print((buf[:start]+buf[end+1:]).strip(), end="")
+o = json.load(sys.stdin)
+for c in o.get("tool_calls", []):
+    print("Tool call: " + c["name"] + "(" + json.dumps(c.get("arguments", {}), ensure_ascii=False) + ")")
 ')
-    TOOL_CALLS_PRETTY=$(printf '%s' "$RESPONSE" | python3 -c '
-import json, sys
-buf = sys.stdin.read()
-key = "\"tool_calls\""
-i = buf.find(key)
-if i < 0: sys.exit(0)
-start = i
-while start >= 0 and buf[start] != "{": start -= 1
-if start < 0: sys.exit(0)
-depth=0; ins=False; esc=False; end=-1
-for j in range(start, len(buf)):
-    c=buf[j]
-    if ins:
-        if esc: esc=False
-        elif c=="\\": esc=True
-        elif c=="\"": ins=False
-    else:
-        if c=="\"": ins=True
-        elif c=="{": depth+=1
-        elif c=="}":
-            depth-=1
-            if depth==0: end=j; break
-if end<0: sys.exit(0)
-try: obj=json.loads(buf[start:end+1])
-except Exception: sys.exit(0)
-for c in obj.get("tool_calls", []):
-    name=c.get("name") or (c.get("function") or {}).get("name") or ""
-    args=c.get("arguments")
-    if args is None: args=(c.get("function") or {}).get("arguments")
-    if isinstance(args, str):
-        try: args=json.loads(args)
-        except Exception: pass
-    print("Tool call: " + name + "(" + json.dumps(args, ensure_ascii=False) + ")")
-')
-    rm -f "$TMP_TOOLCALLS" 2>/dev/null || true
 fi
 
 if [ -n "$TOOL_CALLS_PRETTY" ]; then

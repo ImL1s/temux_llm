@@ -398,8 +398,149 @@ printf '\n[%s  total=%sms  tokens=%s  decode=%s t/s]\n' \
     "${DECODE_TPS:-?}"
 IMPL_EOF
 
-chmod +x "$BIN_DIR/litertlm-native" "$INSTALL_DIR/litertlm-native-impl.sh"
+# v0.7.0: ship temuxllm_repair.py alongside so power users can wire tool
+# calling via the host wrapper (scripts/litertlm-native-wrapper.sh) on
+# Termux without re-implementing JSON repair / tool parsing inline.
+# The embedded litertlm-native-impl.sh above stays text-only (Termux CLI's
+# documented use case is long generation / no-USB / scripts; agent tool
+# loops belong on the APK path).
+cat > "$INSTALL_DIR/temuxllm_repair.py" << 'REPAIR_EOF'
+#!/usr/bin/env python3
+# temuxllm_repair.py — single source of truth for tool-call JSON repair
+# and tool-result prose. Mirrors ChatFormat.kt (APK) repairToolCallJson +
+# parseToolCalls. Embedded by install-termux-native.sh (v0.7.0) so Termux
+# users running litertlm-native-wrapper.sh have a parser they can call.
+
+from __future__ import annotations
+import json
+import sys
+from typing import List, Optional, Tuple
+
+MAX_REPAIR_LEN = 64 * 1024
+MAX_REPAIR_DEPTH = 128
+
+
+def repair_tool_call_json(tail):
+    if not tail or tail[0] != "{": return None
+    if len(tail) > MAX_REPAIR_LEN: return None
+    out, stack = [], []
+    in_string = escaped = False
+    for c in tail:
+        if in_string:
+            out.append(c)
+            if escaped: escaped = False
+            elif c == "\\": escaped = True
+            elif c == '"': in_string = False
+        else:
+            if c == '"': out.append(c); in_string = True
+            elif c == "{":
+                if len(stack) >= MAX_REPAIR_DEPTH: return None
+                out.append(c); stack.append("{")
+            elif c == "[":
+                if len(stack) >= MAX_REPAIR_DEPTH: return None
+                out.append(c); stack.append("[")
+            elif c == "}":
+                if stack and stack[-1] == "{":
+                    stack.pop(); out.append(c)
+            elif c == "]":
+                while stack and stack[-1] == "{":
+                    out.append("}"); stack.pop()
+                if stack and stack[-1] == "[":
+                    stack.pop(); out.append(c)
+            else:
+                out.append(c)
+    if in_string: return None
+    while stack:
+        ch = stack.pop()
+        out.append("}" if ch == "{" else "]")
+    return "".join(out)
+
+
+def parse_tool_calls(raw, allowed_names=None):
+    if not raw or not raw.strip(): return raw, []
+    key = '"tool_calls"'
+    i = raw.find(key)
+    if i < 0: return raw.strip(), []
+    start = i
+    while start >= 0 and raw[start] != "{": start -= 1
+    if start < 0: return raw.strip(), []
+    depth = 0; in_str = False; esc = False; end = -1
+    for j in range(start, len(raw)):
+        c = raw[j]
+        if in_str:
+            if esc: esc = False
+            elif c == "\\": esc = True
+            elif c == '"': in_str = False
+        else:
+            if c == '"': in_str = True
+            elif c == "{": depth += 1
+            elif c == "}":
+                depth -= 1
+                if depth == 0: end = j; break
+    parsed = None
+    consumed_end = end
+    if end >= 0:
+        try: parsed = json.loads(raw[start:end+1])
+        except Exception: parsed = None
+    if parsed is None:
+        rep = repair_tool_call_json(raw[start:])
+        if rep:
+            try: parsed = json.loads(rep); consumed_end = len(raw) - 1
+            except Exception: parsed = None
+    if not isinstance(parsed, dict): return raw.strip(), []
+    arr = parsed.get("tool_calls")
+    if not isinstance(arr, list): return raw.strip(), []
+    calls = []
+    for o in arr:
+        if not isinstance(o, dict): continue
+        name = o.get("name") or (o.get("function", {}).get("name") if isinstance(o.get("function"), dict) else "")
+        if not isinstance(name, str) or not name.strip(): continue
+        if allowed_names and name not in allowed_names: continue
+        args = o.get("arguments")
+        if isinstance(args, str):
+            try: args = json.loads(args)
+            except Exception: args = {}
+        if not isinstance(args, dict):
+            fn = o.get("function") if isinstance(o.get("function"), dict) else None
+            if fn:
+                fa = fn.get("arguments")
+                if isinstance(fa, str):
+                    try: args = json.loads(fa)
+                    except Exception: args = {}
+                elif isinstance(fa, dict): args = fa
+        if not isinstance(args, dict): args = {}
+        calls.append({"name": name, "arguments": args})
+    text_left = raw[:start]
+    text_right = raw[consumed_end + 1:] if consumed_end + 1 <= len(raw) else ""
+    return (text_left + text_right).strip(), calls
+
+
+def main(argv):
+    if len(argv) < 2:
+        sys.stderr.write("usage: temuxllm_repair.py {repair|parse_tool_calls|prose}\n")
+        return 2
+    cmd, rest = argv[1], argv[2:]
+    if cmd == "repair":
+        out = repair_tool_call_json(sys.stdin.read())
+        if out is None: return 2
+        sys.stdout.write(out); return 0
+    if cmd == "parse_tool_calls":
+        text, calls = parse_tool_calls(sys.stdin.read(), rest if rest else None)
+        json.dump({"text": text, "tool_calls": calls}, sys.stdout); return 0
+    if cmd == "prose":
+        if len(rest) < 2: return 2
+        nm = rest[0] if rest[0].strip() else "tool"
+        sys.stdout.write("Tool[" + nm + "]: " + rest[1]); return 0
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))
+REPAIR_EOF
+
+chmod +x "$BIN_DIR/litertlm-native" "$INSTALL_DIR/litertlm-native-impl.sh" "$INSTALL_DIR/temuxllm_repair.py"
 info "[ok] $BIN_DIR/litertlm-native installed"
+info "[ok] $INSTALL_DIR/temuxllm_repair.py installed (used by host wrapper for tool calling)"
 
 # ---------------------------------------------------------------------------
 # 7. PATH guidance

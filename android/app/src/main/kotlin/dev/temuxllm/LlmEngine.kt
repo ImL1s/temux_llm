@@ -283,19 +283,30 @@ class LlmEngine(private val context: Context) : LlmEngineApi {
         val error: String?,
     )
 
-    fun probeNativeToolCall(
+    // v0.7.0: real native-tools generate. Used by /v1 routes when
+    // nativeToolsEnabled flag is on AND request has tools[]. The probe
+    // endpoint also calls this with a one-element list.
+    //
+    // Accepts multiple tool definitions and an optional image. Sync only —
+    // SDK's sendMessageAsync populates Message.toolCalls only at the
+    // terminal frame, so for tool-using flows the buffer-then-emit pattern
+    // is the cleanest.
+    fun generateWithNativeTools(
         backend: String,
         prompt: String,
-        toolDescJson: String,
+        toolDescJsons: List<String>,
+        imageBytes: ByteArray? = null,
     ): NativeToolsProbeResult {
         val started = System.currentTimeMillis()
-        val openApiTool = object : OpenApiTool {
-            override fun getToolDescriptionJsonString(): String = toolDescJson
-            override fun execute(arguments: String): String {
-                throw ToolException(
-                    "service is stateless; caller dispatches",
-                    null,
-                )
+        val openApiTools = toolDescJsons.map { td ->
+            object : OpenApiTool {
+                override fun getToolDescriptionJsonString(): String = td
+                override fun execute(arguments: String): String {
+                    throw ToolException(
+                        "service is stateless; caller dispatches",
+                        null,
+                    )
+                }
             }
         }
         return runBlocking {
@@ -305,7 +316,7 @@ class LlmEngine(private val context: Context) : LlmEngineApi {
                     val cfg = ConversationConfig(
                         systemInstruction = null,
                         initialMessages = emptyList(),
-                        tools = listOf(tool(openApiTool)),
+                        tools = openApiTools.map { tool(it) },
                         samplerConfig = null,
                         automaticToolCalling = false,
                         channels = null,
@@ -313,7 +324,14 @@ class LlmEngine(private val context: Context) : LlmEngineApi {
                     )
                     e.createConversation(cfg).use { conv ->
                         // Sync sendMessage; we want the full Message back, not a stream.
-                        val msg = conv.sendMessage(prompt)
+                        val msg = if (imageBytes != null) {
+                            conv.sendMessage(Contents.of(
+                                Content.ImageBytes(imageBytes),
+                                Content.Text(prompt),
+                            ))
+                        } else {
+                            conv.sendMessage(prompt)
+                        }
                         val names = msg.toolCalls.map { it.name }
                         val args = msg.toolCalls.map { it.arguments }
                         NativeToolsProbeResult(
@@ -327,7 +345,7 @@ class LlmEngine(private val context: Context) : LlmEngineApi {
                         )
                     }
                 } catch (t: Throwable) {
-                    Log.e(TAG, "probeNativeToolCall failed", t)
+                    Log.e(TAG, "generateWithNativeTools failed", t)
                     NativeToolsProbeResult(
                         backend = backend,
                         durationMs = System.currentTimeMillis() - started,
@@ -341,6 +359,13 @@ class LlmEngine(private val context: Context) : LlmEngineApi {
             }
         }
     }
+
+    /** Probe-endpoint wrapper kept for /api/probe/native_tools back-compat. */
+    fun probeNativeToolCall(
+        backend: String,
+        prompt: String,
+        toolDescJson: String,
+    ): NativeToolsProbeResult = generateWithNativeTools(backend, prompt, listOf(toolDescJson), null)
 
     fun close() {
         synchronized(lock) {

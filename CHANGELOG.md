@@ -9,6 +9,140 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 (no unreleased changes)
 
+## [0.7.0] — 2026-05-02
+
+Closes the 4 gaps that v0.6.0 punted to "v0.7.0 future work" and the
+user (correctly) called out as scope-cutting:
+
+1. **Native SDK tool API wired into `/v1/*` routing** (was probe-only).
+2. **Vision + tools + streaming** three-way combo (was: tool+stream
+   path silently dropped image bytes).
+3. **CLI Python helper** at `scripts/temuxllm_repair.py` shared by host
+   wrapper + Termux installer (was: code-reviewer flagged drift risk).
+4. **`response_format: {type:"json_schema"}`** with `strict:true` →
+   501 reject + non-strict best-effort hint (was: deferred / not
+   parsed at all).
+
+### Gap 1 — Native SDK tool API on `/v1/*`
+
+When `nativeToolsEnabled` flag is on (`native_tools=on` in
+`temuxllm.conf` or `TEMUXLLM_NATIVE_TOOLS=1` env) AND the request has
+`tools[]`, all four wire envelopes route through the SDK native path:
+
+- `LlmEngine.generateWithNativeTools(backend, prompt, toolDescJsons, imageBytes?)`
+  builds `ConversationConfig.tools` with `OpenApiTool` wrappers and
+  `automaticToolCalling=false`. SDK applies the model's native chat
+  template and extracts `Message.toolCalls` as typed `ToolCall(name, args)`.
+- `HttpServer.extractNativeToolDescriptions(tools)` flattens
+  Anthropic / OpenAI / Ollama tool shapes into the JSON-string form
+  `OpenApiTool.getToolDescriptionJsonString()` expects.
+- `HttpServer.blockingGenerate` and `HttpServer.runStreamBuffered`
+  branch on `nativeToolDescriptions != null` and emit wire-correct
+  frames (OpenAI `tool_calls` + `finish_reason:"tool_calls"`,
+  Anthropic `tool_use` + `stop_reason:"tool_use"`, Ollama `tool_calls`
+  + `done_reason:"tool_calls"`, OpenAI Responses `function_call`
+  output items).
+
+**Crucial fix from codex outside-review:** when native path is taken,
+**do not also inject the prompt-injection LCD tool block** (v0.6.0
+G1's `renderToolBlock`). The model gets confused by both signals and
+emits content-string JSON instead of typed tool calls. v0.7.0 sets
+`toolBlock = null` whenever `useNative` is true.
+
+Real-device n=30 (S25 / Gemma 4 E4B / CPU): Option A (prompt-injection
++ repair) and Option B (native via /v1) both 30/30 = 100 %. Native is
+~30 % faster (5.7 s vs 7-8 s/call) and produces typed wire output
+without our brace-balance parser. The probe endpoint
+`/api/probe/native_tools` remains, gated by the same flag.
+
+### Gap 2 — Vision + tools + streaming
+
+`runStreamBuffered` now accepts `imageBytes: ByteArray? = null` and
+threads it through to `engine.generateBlocking(prompt, backend, imageBytes)`
+(prompt-injection path) or `LlmEngine.generateWithNativeTools(..., imageBytes)`
+(native path). All three call sites in
+`handleOpenAiChat` / `handleAnthropicMessages` / `handleOllamaChat`
+now pass `img.bytes`. `/v1/responses` also gets vision support
+(was missing in v0.6.0).
+
+### Gap 3 — CLI Python helper (single source of truth)
+
+New file `scripts/temuxllm_repair.py` mirrors `ChatFormat.repairToolCallJson`
++ `parseToolCalls` from APK. Subcommands:
+
+- `repair`     — stack-based balanced rewriter; mirrors Kotlin parity
+  test cases (single-quote → double, missing `}` before `]`, trailing
+  commas, prose stripping). 64 KiB length cap + 128 depth cap.
+- `parse_tool_calls` — extract `{tool_calls:[...]}` from raw model
+  output, returning `{text, tool_calls}`.
+- `prose name content` — render `Tool[name]: content` (G2 unified
+  prose).
+
+`scripts/litertlm-native-wrapper.sh` (host CLI) now calls the helper
+via subprocess instead of inlining ~150 LOC of duplicated parsing.
+`scripts/install-termux-native.sh` writes a copy of the helper to
+`$INSTALL_DIR/temuxllm_repair.py` so Termux users running the host
+wrapper from inside Termux have the file available. The
+installer-embedded `litertlm-native-impl.sh` itself stays text-only —
+documented use case for that path is long generation / no-USB /
+scripts; agent tool loops belong on the APK service.
+
+### Gap 4 — `response_format` (G8)
+
+`HttpServer.parseResponseFormat(body)` accepts the OpenAI Structured
+Outputs shape on `/v1/chat/completions`:
+
+- `type: "text"` (default) → no-op.
+- `type: "json_object"` → injects "Respond with a JSON object".
+- `type: "json_schema"` + `strict: true` → **HTTP 501**
+  `not_implemented` / `strict_json_schema_unsupported`. Per codex
+  outside-review: silent downgrade to best-effort lies to the caller
+  about schema enforcement. We have no grammar-constrained decoder
+  (LiteRT-LM doesn't expose one).
+- `type: "json_schema"` + `strict: false` (or unset) → injects the
+  schema as a system-prompt hint. Best-effort; client validates.
+
+Real-device verified: strict:true returns the 501 envelope, strict:false
++ a `{city: string}` schema returns `{"city": "Tokyo"}` from Gemma 4.
+
+`response_format` retry-on-parse-fail and JSON Schema validator are
+deferred to v0.8.0 (would require ~150 LOC schema validator + ~2x
+latency cost per call; non-blocking gap for codex / Claude Code use
+cases that mostly do tool calling not Structured Outputs).
+
+### Files
+
+- `android/app/src/main/kotlin/dev/temuxllm/HttpServer.kt` — native
+  routing across 4 envelopes; `extractNativeToolDescriptions`;
+  `parseResponseFormat`; vision threaded through
+  `runStreamBuffered` + `blockingResponses` + `blockingResponsesWithTools`;
+  `useNative ? null : renderToolBlock(tools)` logic.
+- `android/app/src/main/kotlin/dev/temuxllm/LlmEngine.kt` —
+  `generateWithNativeTools` (real handler);
+  `probeNativeToolCall` reduced to thin wrapper.
+- `android/app/build.gradle.kts` — versionCode 14 → 15, versionName
+  0.6.0 → 0.7.0.
+- `scripts/temuxllm_repair.py` (NEW) — 200 LOC Python helper.
+- `scripts/litertlm-native-wrapper.sh` — replaced ~150 LOC inline
+  parser with helper subprocess call.
+- `scripts/install-termux-native.sh` — embed helper as
+  `$INSTALL_DIR/temuxllm_repair.py` heredoc.
+
+### Acceptance
+
+- 60 unit tests pass (no test changes; behavior preserved on default
+  flag-off path).
+- `:app:lintDebug` clean.
+- APK installs on Galaxy S25 / Android 16.
+- Real-device smoke:
+  - Plain text on `/v1/chat/completions` ✓
+  - Native tools on `/v1/chat/completions` (typed `tool_calls`,
+    `content:null`, `finish_reason:"tool_calls"`) ✓
+  - `response_format` `strict:true` → 501 envelope ✓
+  - `response_format` `strict:false` + schema hint → returns valid
+    JSON `{"city":"Tokyo"}` ✓
+  - n=30 native via `/v1` matches probe rate (100 %)
+
 ## [0.6.0] — 2026-05-02
 
 Vision input + tool-call repair + codex web_search filter + native SDK
