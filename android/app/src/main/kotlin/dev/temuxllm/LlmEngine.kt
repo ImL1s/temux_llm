@@ -44,11 +44,76 @@ class LlmEngine(private val context: Context) : LlmEngineApi {
     companion object {
         private const val TAG = "LlmEngine"
         const val SOURCE_MODEL_PATH = "/data/local/tmp/litertlm/model.litertlm"
+        // v0.8.0 sec review HIGH (post-pass): cap on sidecar-supplied
+        // max_tokens to prevent shell-UID DoS via /data/local/tmp.
+        private const val MAX_TOKENS_HARD_CAP = 65_536
     }
 
     @Volatile private var engine: Engine? = null
     @Volatile private var activeBackend: String = ""
     private val lock = Any()
+
+    init {
+        // v0.8.0 G1: SDK ExperimentalFlags set ONCE at construction.
+        //
+        // Bisect 2026-05-03:
+        //   - constrained=true global → n=30 tools 30/30 PASS, but tools-less
+        //     prose stops at first "```" fence (snake/Python tests ≤30 toks).
+        //   - constrained=true per-call (flip on for tools, off otherwise) →
+        //     n=30 drops to 15/30 (deterministic OOM at idx ~15) — flag flips
+        //     leak grammar-compiler memory, plausibly because each "off→on"
+        //     transition recompiles from scratch and never frees prior pass.
+        //   - constrained=false global → preserves v0.7.2 prose behavior, but
+        //     loses the +60pp T1 multi-tool reliability win.
+        //
+        // Resolution: constrained=true is the v0.8.0 default — the reliability
+        // win is the reason-for-being. Tools-less code-block prose regression
+        // is a known limitation; users who need snake-style code-block prose
+        // can opt out via /data/local/tmp/litertlm/temuxllm.conf with line
+        // `constrained_decode=0`, which we resolve below.
+        @OptIn(com.google.ai.edge.litertlm.ExperimentalApi::class)
+        try {
+            val constrained = readConstrainedDecodingPreference()
+            val caseNorm = (System.getenv("TEMUXLLM_TOOL_CASE_NORMALIZE") ?: "1").lowercase() in listOf("1", "true", "on")
+            com.google.ai.edge.litertlm.ExperimentalFlags.enableConversationConstrainedDecoding = constrained
+            com.google.ai.edge.litertlm.ExperimentalFlags.convertCamelToSnakeCaseInToolDescription = caseNorm
+            Log.i(TAG, "SDK ExperimentalFlags init: constrainedDecoding=$constrained caseNormalize=$caseNorm")
+        } catch (t: Throwable) {
+            Log.w(TAG, "could not set ExperimentalFlags (SDK upgrade may have removed them?)", t)
+        }
+    }
+
+    /**
+     * Resolution order for `enableConversationConstrainedDecoding` preference:
+     *   1. `<filesDir>/temuxllm.conf` line `constrained_decode=0|off|false` → off
+     *   2. `/data/local/tmp/litertlm/temuxllm.conf` (adb-pushable) same line
+     *   3. `TEMUXLLM_CONSTRAINED_DECODE` env var (rarely propagated)
+     *   4. Default: true (the v0.8.0 reliability win)
+     */
+    private fun readConstrainedDecodingPreference(): Boolean {
+        for (cfg in listOf(
+            File(context.filesDir, "temuxllm.conf"),
+            File("/data/local/tmp/litertlm/temuxllm.conf"),
+        )) {
+            try {
+                if (!cfg.exists()) continue
+                val line = cfg.readText(Charsets.UTF_8).lineSequence()
+                    .map { it.trim() }
+                    .firstOrNull { it.startsWith("constrained_decode=") }
+                    ?: continue
+                val v = line.removePrefix("constrained_decode=").trim().lowercase()
+                if (v in listOf("0", "off", "false", "no")) {
+                    Log.i(TAG, "constrained_decode=false from $cfg")
+                    return false
+                }
+            } catch (t: Throwable) {
+                Log.w(TAG, "constrained_decode read failed from $cfg", t)
+            }
+        }
+        val env = System.getenv("TEMUXLLM_CONSTRAINED_DECODE")?.trim()?.lowercase()
+        if (env != null) return env in listOf("1", "true", "on", "yes")
+        return true
+    }
 
     /**
      * Serializes inference requests across the entire generate() collect path.
@@ -101,6 +166,7 @@ class LlmEngine(private val context: Context) : LlmEngineApi {
     @Synchronized
     fun ensureEngine(backend: String): Engine {
         require(backend == "cpu" || backend == "gpu") { "backend must be cpu|gpu (got $backend)" }
+        // v0.8.0 ExperimentalFlags moved to init {} block (sec review LOW #5).
         val current = engine
         if (current != null && backend == activeBackend) return current
         if (current != null) {
@@ -408,6 +474,12 @@ class LlmEngine(private val context: Context) : LlmEngineApi {
         // must NOT take precedence over the manual /data/local/tmp path —
         // that's the existing supported override channel for users who
         // can't write into the app's filesDir.
+        // v0.8.0 sec review HIGH (post-pass): clamp sidecar-supplied
+        // max_tokens to MAX_TOKENS_HARD_CAP (65536) so a hostile actor
+        // with shell UID write access to /data/local/tmp/litertlm/ can't
+        // OOM the service by setting Int.MAX_VALUE. The hardware tier
+        // table caps at 32768 already; 65536 leaves headroom for future
+        // higher-RAM devices without trusting unbounded user input.
         try {
             val cfg = File(context.filesDir, "temuxllm.conf")
             if (cfg.exists()) {
@@ -416,9 +488,11 @@ class LlmEngine(private val context: Context) : LlmEngineApi {
                     .firstOrNull { it.startsWith("max_tokens=") }
                 if (line != null) {
                     val v = line.removePrefix("max_tokens=").trim().toIntOrNull()
-                    if (v != null && v > 0) {
+                    if (v != null && v in 1..MAX_TOKENS_HARD_CAP) {
                         Log.i(TAG, "computeMaxNumTokens: $v from $cfg override")
                         return v
+                    } else if (v != null) {
+                        Log.w(TAG, "computeMaxNumTokens: $cfg max_tokens=$v out of [1..$MAX_TOKENS_HARD_CAP]; ignoring")
                     }
                 }
             }
@@ -435,9 +509,11 @@ class LlmEngine(private val context: Context) : LlmEngineApi {
                     .firstOrNull { it.startsWith("max_tokens=") }
                 if (line != null) {
                     val v = line.removePrefix("max_tokens=").trim().toIntOrNull()
-                    if (v != null && v > 0) {
+                    if (v != null && v in 1..MAX_TOKENS_HARD_CAP) {
                         Log.i(TAG, "computeMaxNumTokens: $v from $tmpCfg override")
                         return v
+                    } else if (v != null) {
+                        Log.w(TAG, "computeMaxNumTokens: $tmpCfg max_tokens=$v out of [1..$MAX_TOKENS_HARD_CAP]; ignoring")
                     }
                 }
             }

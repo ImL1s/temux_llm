@@ -270,6 +270,65 @@ class ChatFormatTest {
         assertEquals(0, parsed.toolCalls.size)
     }
 
+    // v0.8.0 G6 — tool-name dictionary harden (prefix + edit distance)
+
+    @Test fun `resolveToolName exact match`() {
+        val r = ChatFormat.resolveToolName("get_weather", setOf("get_weather", "read_file"))
+        assertEquals("get_weather", r)
+    }
+
+    @Test fun `resolveToolName prefix - emitted is prefix of registered`() {
+        // Real Gemma failure: model emits "direct_name" (just first key)
+        // when intended "direct_web_fetch".
+        val r = ChatFormat.resolveToolName("direct_name", setOf("direct_web_fetch", "read_file"))
+        assertEquals(null, r)   // "direct_name" is NOT a prefix of "direct_web_fetch", so not matched
+    }
+
+    @Test fun `resolveToolName prefix - registered is prefix of emitted`() {
+        // Mangled-suffix case: model emits "web_fetch_v2" but registry has "web_fetch".
+        val r = ChatFormat.resolveToolName("web_fetch_v2", setOf("web_fetch", "read_file"))
+        assertEquals("web_fetch", r)
+    }
+
+    @Test fun `resolveToolName edit-distance fixes typo`() {
+        val r = ChatFormat.resolveToolName("get_weatehr", setOf("get_weather", "read_file"))
+        assertEquals("get_weather", r)
+    }
+
+    @Test fun `resolveToolName edit-distance off-by-one`() {
+        val r = ChatFormat.resolveToolName("direcct_web_fetch", setOf("direct_web_fetch"))
+        assertEquals("direct_web_fetch", r)
+    }
+
+    @Test fun `resolveToolName drops totally unknown name`() {
+        val r = ChatFormat.resolveToolName("delete_repo", setOf("get_weather", "read_file"))
+        assertEquals(null, r)
+    }
+
+    @Test fun `resolveToolName ambiguous prefix picks shortest length-diff`() {
+        // v0.8.0 sec/code review MEDIUM #2: when multiple registered names
+        // qualify as prefix matches (both pass the length-ratio guard),
+        // the original code returned whichever came first in Set
+        // iteration order — non-deterministic with respect to client
+        // tool-array order. Post-pass fix picks the candidate whose
+        // length is closest to the emitted name (most-specific match).
+        // Emitted "web_fetch" (9), registered {"web_fetcher" (11), "web_fetcher_v2" (14)}.
+        // Both pass guard: lenRatio = 9/11 = 0.82, 9/14 = 0.64 (≥ 0.5).
+        // Length diffs: 11-9=2 vs 14-9=5 → "web_fetcher" wins.
+        val r = ChatFormat.resolveToolName("web_fetch", setOf("web_fetcher_v2", "web_fetcher"))
+        assertEquals("web_fetcher", r)
+        // Same set in opposite insertion order — answer must be the same.
+        val r2 = ChatFormat.resolveToolName("web_fetch", setOf("web_fetcher", "web_fetcher_v2"))
+        assertEquals("web_fetcher", r2)
+    }
+
+    @Test fun `parseToolCalls resolves mangled name with edit distance`() {
+        val raw = """{"tool_calls":[{"name":"get_weatehr","arguments":{"city":"Tokyo"}}]}"""
+        val parsed = ChatFormat.parseToolCalls(raw, allowedNames = setOf("get_weather"))
+        assertEquals(1, parsed.toolCalls.size)
+        assertEquals("get_weather", parsed.toolCalls[0].name)
+    }
+
     @Test fun `repairToolCallJson is idempotent on valid input`() {
         val valid = """{"tool_calls":[{"name":"f","arguments":{"k":"v"}}]}"""
         val repaired = ChatFormat.repairToolCallJson(valid)
@@ -279,5 +338,87 @@ class ChatFormatTest {
         val a = org.json.JSONObject(valid).toString()
         val b = org.json.JSONObject(repaired!!).toString()
         assertEquals(a, b)
+    }
+
+    // v0.8.0 G5: multi-pass schema-gated repair
+
+    @Test fun `repairs single-quoted argument values`() {
+        // Model emits 'Tokyo' with single quotes instead of double quotes.
+        val raw = """{"tool_calls":[{"name":"get_weather","arguments":{"city":'Tokyo'}}]}"""
+        val parsed = ChatFormat.parseToolCalls(raw)
+        assertEquals("single-quoted repair should recover the call", 1, parsed.toolCalls.size)
+        assertEquals("get_weather", parsed.toolCalls[0].name)
+        assertEquals("Tokyo", parsed.toolCalls[0].arguments.optString("city"))
+    }
+
+    @Test fun `repairs missing closing quote`() {
+        // Model emits "Tokyo without the closing quote — structural `}` closes it.
+        val raw = """{"tool_calls":[{"name":"get_weather","arguments":{"city":"Tokyo}}]}"""
+        val parsed = ChatFormat.parseToolCalls(raw)
+        assertEquals("missing-close-quote repair should recover the call", 1, parsed.toolCalls.size)
+        assertEquals("Tokyo", parsed.toolCalls[0].arguments.optString("city"))
+    }
+
+    @Test fun `pass 4 does not corrupt legitimate string with structural chars`() {
+        // v0.8.0 sec/code review: pass 4 used to insert " before the first
+        // `,`/`}`/`]` while inside a string, which corrupted long
+        // arguments containing those chars (shell commands, regex, JSON
+        // literals). The post-pass guard requires content < 32 chars
+        // AND alphanumeric prev — a long sentence trips both gates and
+        // leaves the string intact for downstream parsing.
+        val raw = """{"tool_calls":[{"name":"bash","arguments":{"command":"ls -la /a/b/c/d/e | grep something, something else"}}]}"""
+        val parsed = ChatFormat.parseToolCalls(raw)
+        // The original input is already valid JSON; should parse one call.
+        assertEquals("legitimate JSON should parse cleanly", 1, parsed.toolCalls.size)
+        assertEquals(
+            "ls -la /a/b/c/d/e | grep something, something else",
+            parsed.toolCalls[0].arguments.optString("command"),
+        )
+    }
+
+    @Test fun `repairs raw terminal string when schema says string`() {
+        // Model emits Tokyo as a bare token; schema declares city as string type.
+        val raw = """{"tool_calls":[{"name":"get_weather","arguments":{"city":Tokyo}}]}"""
+        val schema = JSONObject().apply {
+            put("type", "object")
+            put("properties", JSONObject().apply {
+                put("city", JSONObject().apply { put("type", "string") })
+            })
+        }
+        val schemas = mapOf("get_weather" to schema)
+        val parsed = ChatFormat.parseToolCalls(raw, toolSchemas = schemas)
+        assertEquals("raw-token repair should recover the call", 1, parsed.toolCalls.size)
+        assertEquals("Tokyo", parsed.toolCalls[0].arguments.optString("city"))
+    }
+
+    @Test fun `does NOT wrap raw terminal when schema says integer`() {
+        // Schema says count is an integer — bare 42 should not get quoted.
+        val raw = """{"tool_calls":[{"name":"count_tool","arguments":{"count":42}}]}"""
+        val schema = JSONObject().apply {
+            put("type", "object")
+            put("properties", JSONObject().apply {
+                put("count", JSONObject().apply { put("type", "integer") })
+            })
+        }
+        val schemas = mapOf("count_tool" to schema)
+        val parsed = ChatFormat.parseToolCalls(raw, toolSchemas = schemas)
+        assertEquals(1, parsed.toolCalls.size)
+        assertEquals(42, parsed.toolCalls[0].arguments.optInt("count"))
+    }
+
+    @Test fun `strips trailing prose after final brace`() {
+        // Model appends a sentence after the JSON object.
+        val raw = """{"tool_calls":[{"name":"f","arguments":{"k":"v"}}]} Hope that helps!"""
+        val parsed = ChatFormat.parseToolCalls(raw)
+        assertEquals(1, parsed.toolCalls.size)
+        assertEquals("v", parsed.toolCalls[0].arguments.optString("k"))
+    }
+
+    @Test fun `chains all repair passes when needed`() {
+        // Combines missing inner brace (pass 2) + trailing prose (pass 6).
+        val raw = """{"tool_calls":[{"name":"get_weather","arguments":{"city":"Cairo"}]} Great!"""
+        val parsed = ChatFormat.parseToolCalls(raw)
+        assertEquals("chained repair should recover the call", 1, parsed.toolCalls.size)
+        assertEquals("Cairo", parsed.toolCalls[0].arguments.optString("city"))
     }
 }

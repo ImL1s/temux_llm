@@ -229,7 +229,7 @@ object ChatFormat {
     data class ToolCall(val id: String, val name: String, val arguments: JSONObject)
     data class ParsedOutput(val text: String, val toolCalls: List<ToolCall>)
 
-    fun parseToolCalls(raw: String, allowedNames: Set<String>? = null): ParsedOutput {
+    fun parseToolCalls(raw: String, allowedNames: Set<String>? = null, toolSchemas: Map<String, JSONObject>? = null): ParsedOutput {
         if (raw.isBlank()) return ParsedOutput(raw, emptyList())
         val idx = findToolCallsObjectStart(raw)
         if (idx < 0) return ParsedOutput(raw.trim(), emptyList())
@@ -244,7 +244,7 @@ object ChatFormat {
             parsed = try { JSONObject(raw.substring(idx, end + 1)) } catch (_: Throwable) { null }
         }
         if (parsed == null) {
-            // Repair attempt: take from idx to end of raw, balance braces/brackets.
+            // Pass 2: balance braces/brackets (v0.6.0 stack repair).
             val tail = raw.substring(idx)
             val repaired = repairToolCallJson(tail)
             if (repaired != null) {
@@ -259,20 +259,73 @@ object ChatFormat {
                 }
             }
         }
+        if (parsed == null) {
+            // Pass 3: single-quoted string values → double-quoted.
+            val tail = raw.substring(idx)
+            if (tail.length <= 64 * 1024) {
+                val p3 = repairSingleQuoted(tail)
+                parsed = try { JSONObject(p3) } catch (_: Throwable) { null }
+                if (parsed != null) {
+                    consumedEnd = raw.length - 1
+                    try { android.util.Log.i("ChatFormat", "tool_call repairSingleQuoted applied") } catch (_: Throwable) {}
+                }
+            }
+        }
+        if (parsed == null) {
+            // Pass 4: missing closing quote before structural char or EOF.
+            val tail = raw.substring(idx)
+            if (tail.length <= 64 * 1024) {
+                val p4 = repairMissingStringDelimiter(tail)
+                parsed = try { JSONObject(p4) } catch (_: Throwable) { null }
+                if (parsed != null) {
+                    consumedEnd = raw.length - 1
+                    try { android.util.Log.i("ChatFormat", "tool_call repairMissingStringDelimiter applied") } catch (_: Throwable) {}
+                }
+            }
+        }
+        if (parsed == null && toolSchemas != null) {
+            // Pass 5: bare token where schema declares string — schema-gated.
+            val tail = raw.substring(idx)
+            if (tail.length <= 64 * 1024) {
+                // We need the tool name to look up the schema; try to extract it
+                // from the raw tail with a simple heuristic.
+                val nameInTail = extractToolNameHeuristic(tail)
+                val schema = if (nameInTail != null) toolSchemas[nameInTail] else null
+                val p5 = repairRawTerminalString(tail, schema)
+                parsed = try { JSONObject(p5) } catch (_: Throwable) { null }
+                if (parsed != null) {
+                    consumedEnd = raw.length - 1
+                    try { android.util.Log.i("ChatFormat", "tool_call repairRawTerminalString applied") } catch (_: Throwable) {}
+                }
+            }
+        }
+        if (parsed == null) {
+            // Pass 6: strip trailing prose after last depth-0 closer.
+            val tail = raw.substring(idx)
+            if (tail.length <= 64 * 1024) {
+                val p6 = stripTrailingProse(tail)
+                parsed = try { JSONObject(p6) } catch (_: Throwable) { null }
+                if (parsed != null) {
+                    consumedEnd = idx + p6.length - 1
+                    try { android.util.Log.i("ChatFormat", "tool_call stripTrailingProse applied") } catch (_: Throwable) {}
+                }
+            }
+        }
         if (parsed == null) return ParsedOutput(raw.trim(), emptyList())
         val arr = parsed.optJSONArray("tool_calls") ?: return ParsedOutput(raw.trim(), emptyList())
         val calls = mutableListOf<ToolCall>()
         for (i in 0 until arr.length()) {
             val o = arr.optJSONObject(i) ?: continue
-            val n = o.optString("name").ifBlank { o.optJSONObject("function")?.optString("name") ?: "" }
-            if (n.isBlank()) continue
-            // Defense-in-depth: cross-check the model's emitted name against
-            // what the request actually advertised. Without this filter,
-            // a prompt-injected user message could trick the model into
-            // emitting a fake tool name (`exec`, `delete_repo`, ...) that
-            // we would relay verbatim to the agent client. Same hardening
-            // pattern Ollama's tools/tools.go uses (findTool()).
-            if (allowedNames != null && n !in allowedNames) continue
+            val rawName = o.optString("name").ifBlank { o.optJSONObject("function")?.optString("name") ?: "" }
+            if (rawName.isBlank()) continue
+            // v0.8.0 G6: tool-name dictionary with prefix + edit-distance fallback.
+            // Real-device test exposed model emitting names like `direct_name`
+            // (truncation/duplication of the registered `direct_web_fetch`).
+            // Strict in-set check would drop the call; instead try to map
+            // back to a registered name. Same defense rationale as before
+            // (only registered names ever propagate to the wire), with
+            // recovery for the common Gemma 4 mangling failure modes.
+            val n = if (allowedNames != null) resolveToolName(rawName, allowedNames) ?: continue else rawName
             val a = when {
                 o.opt("arguments") is JSONObject -> o.optJSONObject("arguments")!!
                 o.opt("arguments") is String -> try { JSONObject(o.optString("arguments")) } catch (_: Throwable) { JSONObject() }
@@ -376,6 +429,281 @@ object ChatFormat {
             }
         }
         return out.toString()
+    }
+
+    /**
+     * v0.8.0 G5 repair passes — each is idempotent on already-valid JSON.
+     * All respect the 64 KiB length cap enforced by the caller.
+     */
+
+    /**
+     * Convert single-quoted string values to double-quoted.
+     * String-aware: tracks `inDoubleQuoted` state so it does NOT touch
+     * characters inside already-double-quoted strings or object keys.
+     * Only converts single-quote-delimited value tokens.
+     *
+     * Input:  {"name":"f","arguments":{"city":'Tokyo'}}
+     * Output: {"name":"f","arguments":{"city":"Tokyo"}}
+     */
+    internal fun repairSingleQuoted(s: String): String {
+        val out = StringBuilder(s.length)
+        var i = 0
+        var inDouble = false
+        var inSingle = false
+        var escaped = false
+        while (i < s.length) {
+            val c = s[i]
+            when {
+                escaped -> { out.append(c); escaped = false }
+                c == '\\' && (inDouble || inSingle) -> { out.append(c); escaped = true }
+                c == '"' && !inSingle -> { out.append(c); inDouble = !inDouble }
+                c == '\'' && !inDouble -> {
+                    // Replace single quote with double quote.
+                    out.append('"')
+                    inSingle = !inSingle
+                }
+                else -> out.append(c)
+            }
+            i++
+        }
+        return out.toString()
+    }
+
+    /**
+     * Append a closing `"` when an open quote has no matching close before
+     * EOF, `,`, `}`, or `]` (all signal end-of-value in JSON).
+     *
+     * Input:  {"arguments":{"city":"Tokyo}
+     * Output: {"arguments":{"city":"Tokyo"}}   (caller still needs balance pass)
+     *
+     * This pass is deliberately narrow: it only closes the LAST unclosed
+     * string at EOF. If there are multiple unclosed strings the stack repair
+     * (pass 2) is more appropriate.
+     */
+    internal fun repairMissingStringDelimiter(s: String): String {
+        var inString = false
+        var escaped = false
+        var unclosedStart = -1
+        var i = 0
+        while (i < s.length) {
+            val c = s[i]
+            if (inString) {
+                when {
+                    escaped -> escaped = false
+                    c == '\\' -> escaped = true
+                    c == '"' -> { inString = false; unclosedStart = -1 }
+                    // Structural char while inside a string — likely the closing
+                    // quote is missing; close it here.
+                    //
+                    // v0.8.0 code review HIGH (post-pass): only treat the
+                    // structural char as "missing closer" if the string
+                    // content so far is short (< 32 chars, i.e. plausibly
+                    // a truncated word) AND the char immediately before
+                    // is alphanumeric (real truncation lands mid-token).
+                    // Without this guard, a legitimate value like
+                    // `"command":"ls -la | grep }"` is corrupted: the `,`
+                    // / `}` / `]` inside the value gets misread as the
+                    // missing closing quote, and everything after is
+                    // dropped or misattributed.
+                    (c == ',' || c == '}' || c == ']') -> {
+                        val contentLen = i - unclosedStart - 1
+                        val prev = if (i > 0) s[i - 1] else ' '
+                        val prevIsAlnum = prev.isLetterOrDigit() || prev == '_'
+                        if (contentLen in 1..32 && prevIsAlnum) {
+                            val sb = StringBuilder(s.length + 1)
+                            sb.append(s.substring(0, i))
+                            sb.append('"')
+                            sb.append(s.substring(i))
+                            return sb.toString()
+                        }
+                        // Otherwise treat as legitimate string content.
+                    }
+                }
+            } else {
+                if (c == '"') { inString = true; unclosedStart = i }
+            }
+            i++
+        }
+        // EOF while still in string — append the missing closer.
+        return if (inString) s + '"' else s
+    }
+
+    /**
+     * When schema declares a property as `"type":"string"` and the parsed
+     * value position holds a bare token (no quotes), wrap it in `"`.
+     *
+     * Only engages when `schema != null`. Conservative: only wraps bare
+     * alphanumeric tokens. Does not touch values already quoted or numbers
+     * declared as integer/number in the schema.
+     *
+     * Input:  {"arguments":{"city":Tokyo}}  schema says city is string
+     * Output: {"arguments":{"city":"Tokyo"}}
+     */
+    internal fun repairRawTerminalString(s: String, schema: JSONObject?): String {
+        if (schema == null) return s
+        val props = schema.optJSONObject("properties") ?: return s
+        var result = s
+        // For each string-typed property, replace `:bare_token` with `:"bare_token"`.
+        // Bare token = sequence of word chars (no whitespace, quotes, braces, brackets,
+        // commas) following `:` optionally preceded by whitespace.
+        val propNames = props.keys().asSequence().toList()
+        for (key in propNames) {
+            val propDef = props.optJSONObject(key) ?: continue
+            if (propDef.optString("type") != "string") continue
+            // Match :"key":bareValue and replace with :"key":"bareValue".
+            // v0.8.0 code review MEDIUM #1: extend to handle multi-word
+            // bare values like `"city":New York` (was: only `"city":New`).
+            // Capture is greedy until the next structural char `,`, `}`, `]`,
+            // and we strip trailing whitespace and escape any inner `"`.
+            val pattern = Regex(""""${Regex.escape(key)}"\s*:\s*([^,}\]"\n][^,}\]"\n]*?)\s*(?=[,}\]])""")
+            result = pattern.replace(result) { mr ->
+                val token = mr.groupValues[1].trim().replace("\"", "\\\"")
+                """"$key":"$token""""
+            }
+        }
+        return result
+    }
+
+    /**
+     * Strip everything after the last `}` or `]` that closes the depth-0
+     * object/array started at the beginning of [s].
+     *
+     * Input:  {"tool_calls":[...]} Hope that helps!
+     * Output: {"tool_calls":[...]}
+     *
+     * Handles strings with braces/brackets inside quoted values correctly.
+     */
+    internal fun stripTrailingProse(s: String): String {
+        if (s.isEmpty() || s[0] != '{') return s
+        var depth = 0
+        var inString = false
+        var escaped = false
+        var lastDepthZeroClose = -1
+        var i = 0
+        while (i < s.length) {
+            val c = s[i]
+            if (inString) {
+                when {
+                    escaped -> escaped = false
+                    c == '\\' -> escaped = true
+                    c == '"' -> inString = false
+                }
+            } else {
+                when (c) {
+                    '"' -> inString = true
+                    '{', '[' -> depth++
+                    '}', ']' -> {
+                        depth--
+                        if (depth == 0) lastDepthZeroClose = i
+                    }
+                }
+            }
+            i++
+        }
+        return if (lastDepthZeroClose >= 0 && lastDepthZeroClose < s.length - 1) {
+            s.substring(0, lastDepthZeroClose + 1)
+        } else {
+            s
+        }
+    }
+
+    /**
+     * Build a tool-name → parameters-schema map from the request's tools array.
+     * Accepts Anthropic (name + input_schema/parameters) and OpenAI/Ollama
+     * (type:"function", function:{name, parameters}) shapes.
+     *
+     * Used to pass schemas into parseToolCalls (pass 5: raw terminal string repair).
+     */
+    fun extractToolSchemas(tools: JSONArray?): Map<String, JSONObject> {
+        if (tools == null || tools.length() == 0) return emptyMap()
+        val map = mutableMapOf<String, JSONObject>()
+        for (i in 0 until tools.length()) {
+            val t = tools.optJSONObject(i) ?: continue
+            val fn = t.optJSONObject("function")
+            val name: String
+            val schema: JSONObject?
+            if (fn != null) {
+                name = fn.optString("name", "")
+                schema = fn.optJSONObject("parameters")
+            } else {
+                name = t.optString("name", "")
+                schema = t.optJSONObject("input_schema") ?: t.optJSONObject("parameters")
+            }
+            if (name.isNotBlank() && schema != null) map[name] = schema
+        }
+        return map
+    }
+
+    /** Heuristic: find the first "name":"<value>" in a raw JSON tail. */
+    private fun extractToolNameHeuristic(s: String): String? {
+        val m = Regex(""""name"\s*:\s*"([^"]+)"""").find(s) ?: return null
+        return m.groupValues[1].takeIf { it.isNotBlank() }
+    }
+
+    /**
+     * v0.8.0 G6: resolve a model-emitted name to a registered tool name.
+     *
+     * Order: exact match → ≥3-char prefix match (canonical name starts
+     * with emitted) → Levenshtein distance ≤ 2. Returns null if no
+     * registered name matches.
+     *
+     * Real-device pattern this is meant to fix: Gemma 4 emits
+     *   "name":"direct_name":"direct_web_fetch" → after JSON repair
+     *   we get name="direct_name" (just the first key value). We
+     *   want to recover the registered "direct_web_fetch".
+     *
+     * Also handles common typos:
+     *   "direcct_web_fetch" (extra c) → "direct_web_fetch"
+     *   "get_weatehr"        (transposed) → "get_weather"
+     */
+    internal fun resolveToolName(emitted: String, registered: Set<String>): String? {
+        if (emitted in registered) return emitted
+        // v0.8.0 + sec review HIGH #1 + LOW #4 hardening:
+        //   - prefix match requires length ratio ≥ 0.5 (and ≤ 2.0) so a
+        //     3-char registered name like "run" doesn't catch arbitrary
+        //     hallucinations starting with "run"
+        //   - Levenshtein input truncated to (max registered name + 3) so
+        //     a malicious 10k-char emitted name doesn't DoS the comparator
+        // v0.8.0 sec/code review MEDIUM #2 (post-pass): when multiple
+        //   registered names match the prefix predicate, pick the one
+        //   with smallest absolute length difference to the emitted
+        //   name (most-specific match) instead of relying on Set
+        //   iteration order, which depends on JSON-array ordering by
+        //   the client.
+        val em = emitted.lowercase()
+        val maxReg = registered.maxOfOrNull { it.length } ?: 0
+        val emCapped = if (em.length > maxReg + 3) em.substring(0, maxReg + 3) else em
+        val prefixCandidates = registered.filter { reg ->
+            val rl = reg.lowercase()
+            val lenRatio = if (rl.isEmpty()) 0.0 else em.length.toDouble() / rl.length
+            (rl.startsWith(em) && em.length >= 3 && lenRatio >= 0.5) ||
+                (em.startsWith(rl) && rl.length >= 3 && lenRatio <= 2.0)
+        }
+        val prefixMatch = prefixCandidates.minByOrNull { kotlin.math.abs(it.length - emitted.length) }
+        if (prefixMatch != null) return prefixMatch
+        val byEdit = registered.map { it to levenshtein(emCapped, it.lowercase()) }
+            .filter { it.second <= 2 }
+            .minByOrNull { it.second }
+        return byEdit?.first
+    }
+
+    /** Iterative Levenshtein with O(min(a,b)) memory. Pure function. */
+    private fun levenshtein(a: String, b: String): Int {
+        if (a == b) return 0
+        if (a.isEmpty()) return b.length
+        if (b.isEmpty()) return a.length
+        val (s, t) = if (a.length > b.length) Pair(b, a) else Pair(a, b)
+        var prev = IntArray(s.length + 1) { it }
+        var curr = IntArray(s.length + 1)
+        for (j in 1..t.length) {
+            curr[0] = j
+            for (i in 1..s.length) {
+                val cost = if (s[i - 1] == t[j - 1]) 0 else 1
+                curr[i] = minOf(curr[i - 1] + 1, prev[i] + 1, prev[i - 1] + cost)
+            }
+            val tmp = prev; prev = curr; curr = tmp
+        }
+        return prev[s.length]
     }
 
     /**

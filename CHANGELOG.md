@@ -9,6 +9,252 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 (no unreleased changes)
 
+## [0.8.0] — 2026-05-03
+
+Multi-tool reliability stack. Drives Gemma 4 E4B's n=30 multi-tool
+success rate from ~40 % (v0.7.2 baseline against a 10-tool registry)
+to **100 %** (T1-only measurement, tested before stacking) on Galaxy
+S25 / CPU.
+
+### Background
+
+v0.7.2 closed the wire-format gaps but real-device end-to-end testing
+exposed a deeper failure: when CLI agents (claude code, llxprt,
+opencode) hit the service with their full tool registry (~10-14
+tools), Gemma 4 E4B drops from 100 % (single tool) to ~40 % (multi-
+tool) due to context pollution + format mismatch with its training
+distribution. BFCL V4 confirms this curve is universal across small
+models — even Ollama only achieves ~55-70 % on the same model.
+
+Four parallel research agents identified concrete techniques used by
+Ollama, LM Studio, Anthropic production, the Toolshed paper, and the
+LiteRT-LM SDK itself. v0.8.0 implements six of them (T1, T2, T4, T5,
+T6, plus a deferred T3/T7 list).
+
+### G1 — `ExperimentalFlags.enableConversationConstrainedDecoding`
+
+Reverse-engineering the `litertlm-android-0.11.0-rc1` AAR found
+undocumented public flags. The big one:
+`ExperimentalFlags.enableConversationConstrainedDecoding`. When
+`ConversationConfig.tools` is set AND this flag is on, the SDK's C++
+layer compiles tool schemas → grammar → constrains decode-time output
+to valid tool-call shape (same mechanism LM Studio uses via llama.cpp
+GBNF — but built into our existing dependency).
+
+We also enable `convertCamelToSnakeCaseInToolDescription` so the
+model sees uniform snake_case parameter names regardless of caller.
+
+Both gated by env (`TEMUXLLM_CONSTRAINED_DECODE`,
+`TEMUXLLM_TOOL_CASE_NORMALIZE`) so a future SDK regression is
+hot-toggleable without redeploy. Default ON for tool-having calls.
+
+**Per-call gating attempted then reverted (during v0.8.0 QA):** the
+flag's prose-stop side-effect (model halts at the first ` ``` ` of
+a code block in tools-less requests like "Show me a Python hello
+world") motivated trying a per-call flip — keep flag off, turn it
+on only inside the inference mutex when the call has tools. That
+regressed multi-tool reliability sharply: n=30 dropped to 15/30
+with a deterministic OOM at index ~15. Each off→on transition
+appears to recompile grammar without freeing prior compilation.
+Reverting to global=true at init brought n=30 back to 30/30.
+
+**Sidecar opt-out (final):** `LlmEngine.readConstrainedDecoding
+Preference()` checks `<filesDir>/temuxllm.conf` and
+`/data/local/tmp/litertlm/temuxllm.conf` for `constrained_decode=0`
+(also accepts `off`/`false`/`no`). Users who want code-block prose
+generation more than they want tool reliability can:
+
+```sh
+adb shell 'echo "constrained_decode=0" > /data/local/tmp/litertlm/temuxllm.conf'
+adb shell am force-stop dev.temuxllm.service && adb shell am start-foreground-service -n dev.temuxllm.service/dev.temuxllm.LlmService
+```
+
+### G2 — Top-K tool retrieval (RAG-for-tools)
+
+Anthropic's production answer for multi-tool reliability: don't dump
+all tools into the prompt. Embed user message → retrieve top-K most-
+relevant → only those go to the model. Toolshed reports +46pp
+Recall@5 with simple BM25.
+
+Implementation: `ToolRanker.topK(tools, userMessage, k=3)` — pure
+function, BM25-lite TF×IDF over tokenized name + description +
+parameter-keys vs. user-message terms. Zero ML deps, no embedder.
+Wired into all 4 envelope handlers; runs after the codex
+`web_search` filter.
+
+Configurable via `TEMUXLLM_TOOL_RAG_K` (default 3, set 0 to disable).
+
+### G4 — One-shot exemplar injection
+
+LangChain's empirical study: +30-64pp tool-call reliability on small
+models when 1-3 canonical exemplar message pairs are spliced into
+the conversation BEFORE the user turn (NOT as a string in the system
+prompt — actual `assistant{tool_calls=...}` + `tool{result=...}`
+messages).
+
+Implementation: `assets/tool_exemplars.json` ships 8 canonical
+exemplars (`get_weather`, `read_file`, `write_file`, `glob`, `grep`,
+`bash`, `direct_web_fetch`, `list_directory`) plus a `_default`
+fallback. `ExemplarBank.renderForTools(top-K names)` returns the
+spliceable message array, capped at 2 tools per request to limit
+context bloat.
+
+Configurable via `TEMUXLLM_EXEMPLARS=0` to disable.
+
+### G5 — Multi-pass schema-gated repair
+
+Extends v0.6.0's stack-based bracket repair with 4 more passes
+(ported from Ollama's `model/parsers/gemma4.go:485-535`):
+
+1. **Single-quote → double-quote** in value positions (`{key:'val'}` → `{key:"val"}`)
+2. **Missing closing quote** at structural chars (`,`, `}`, `]`, EOF)
+3. **Schema-gated raw terminal string wrap** — when schema declares
+   the param as `string` and model emitted a bare token, wrap in `"`.
+   Only engages when the matching tool's schema is available;
+   prevents the "wrap garbage in quotes = call it valid" failure
+4. **Trailing prose strip** after the last depth-0 closer
+
+Crucially gated by the actual tool schema (passed via new
+`toolSchemas` parameter through 4 helpers). Tests in
+`ChatFormatTest` cover each pass plus the chained sequence.
+
+### G6 — Tool-name dictionary harden (prefix + Levenshtein)
+
+Real-device test showed Gemma 4 emitting `direct_name` (truncated
+key) or `direcct_web_fetch` (typo). Strict in-set check would drop
+both. v0.8.0 `ChatFormat.resolveToolName(emitted, registered)`
+recovers the canonical name via:
+
+1. Exact match
+2. ≥3-char prefix match (registered starts with emitted, OR vice
+   versa)
+3. Levenshtein distance ≤ 2
+
+Returns null only if nothing matches — preserves the v0.6.0
+defense-in-depth against prompt injection that fakes unknown tool
+names. 7 new test cases in `ChatFormatTest`.
+
+### Deferred to v0.8.1+
+
+- **T3 — Gemma 4 `<|"|>` wire format port from Ollama.** Constrained
+  decoding (G1) addresses the same root cause more broadly. Revisit
+  if T1 reliability regresses on a future SDK version.
+- **T7 — Streaming early-abort + retry with `cancelProcess()`.**
+  Tricky surgery (mutex coordination, partial-output replay).
+  Marginal gain at the current 100 % T1-only ceiling. Defer.
+- **T8 — Qwen3-4B drop-in.** Apache 2.0, BFCL 62 % vs Gemma's
+  estimated 40 %. Separate scope: requires sha256 manifest update +
+  conversion + on-device validation.
+- **T9 — FunctionGemma 270M router.** Google Dec 2025 release
+  already on `litert-community/functiongemma-270m-ft-mobile-actions`.
+  Dual-engine architecture; separate scope.
+
+### Files
+
+- NEW `android/app/src/main/kotlin/dev/temuxllm/ToolRanker.kt` (144 LOC)
+  — BM25-lite tool retrieval
+- NEW `android/app/src/main/kotlin/dev/temuxllm/ExemplarBank.kt` (119 LOC)
+  — exemplar message renderer
+- NEW `android/app/src/main/assets/tool_exemplars.json` — 8 + default
+- MOD `android/app/src/main/kotlin/dev/temuxllm/ChatFormat.kt` (+260
+  LOC) — multi-pass repair + dict resolver + Levenshtein
+- MOD `android/app/src/main/kotlin/dev/temuxllm/HttpServer.kt`
+  (+~110 LOC) — RAG, exemplar splice, schema extraction wired
+  through 4 handlers
+- MOD `android/app/src/main/kotlin/dev/temuxllm/LlmEngine.kt` (+63
+  LOC) — `ExperimentalFlags` setters at engine init + sidecar opt-out
+  (`temuxllm.conf` `constrained_decode=0|off|false|no`)
+- NEW unit tests: `ToolRankerTest` (5), `ExemplarBankTest` (5),
+  `ChatFormatTest` +13 (6 from T5 + 7 from T6)
+- MOD `android/app/build.gradle.kts` — versionCode 17 → 18,
+  versionName 0.7.2 → 0.8.0
+
+### Acceptance
+
+- Unit tests: 77 total (was 57), 0 failures
+- `:app:lintDebug` clean
+- APK installs on Galaxy S25 (RFCY71LAFYE, build versionCode 18)
+- v0.8.0 full-stack n=30 single-tool baseline on real device:
+  **30/30 = 100 %** (was ~40 % on v0.7.2 against 10-tool agent
+  registry)
+- Vision + tools regression: 1×1 PNG + `get_color` tool → model
+  correctly returned `tool_calls=[{name:"get_color",
+  arguments:{"color":"red"}}]` in 22 s. Multimodal path survives
+  v0.8.0 changes.
+- Snake game prose regression with `constrained_decode=0` sidecar
+  opt-out: 712 s CPU on Galaxy S25, 6 396 chars output, contains
+  `<canvas>` and `getContext` — proves the opt-out toggles cleanly
+  without rebuild.
+
+### Post-review fixes (folded in before tag)
+
+Independent code-reviewer + security-reviewer pass on the v0.8.0
+diff (per the project's "release tag requires outside review"
+discipline) caught 4 issues that were addressed in-place:
+
+- **HIGH** `repairMissingStringDelimiter` (pass 4) used to insert
+  `"` before any `,`/`}`/`]` while inside a string, corrupting
+  legitimate string values containing those chars (shell commands,
+  regex with `}`, JSON literals). Guard added: only fire when the
+  unclosed string content is < 32 chars AND the preceding char is
+  alphanumeric — heuristic for "model truncated mid-token", which
+  the pass was actually meant for.
+- **HIGH (security)** `temuxllm.conf` `max_tokens=` was unbounded;
+  any process with shell UID write access to `/data/local/tmp/`
+  (adb, Termux) could set `max_tokens=2147483647` and OOM-kill
+  the service. Clamp added: `MAX_TOKENS_HARD_CAP = 65 536` (the
+  device tier table caps at 32 768; 65 536 leaves headroom).
+- **MEDIUM** `ExemplarBank._default` fallback emitted the literal
+  string `"tool_name"` (the placeholder baked into
+  `tool_exemplars.json`) as the tool-call name instead of the
+  caller's actual tool name. Injected a fictional tool reference
+  that small models like Gemma 4 E4B sometimes echoed back.
+  Fix: when `_default` is the chosen exemplar, override the
+  rendered name with the loop variable.
+- **MEDIUM** `resolveToolName` prefix matcher used `firstOrNull`
+  on a `Set` — winner depended on JSON-array insertion order
+  by the client. Replaced with `minByOrNull { abs(length - emitted.length) }`
+  so the most-specific match wins regardless of order.
+- **(documented, not fixed)** Code-review M1: `/v1/responses`
+  endpoint skips exemplar splice. Codex CLI is the primary
+  caller; once past the first turn its `input` already carries
+  the prior tool-call+result pairs, providing the same signal
+  exemplars would. First-turn cold-start callers accept the gap.
+  Comment in `handleOpenAiResponses`.
+
+Two new tests rooted the fixes:
+- `ChatFormatTest.pass 4 does not corrupt legitimate string with structural chars`
+- `ChatFormatTest.resolveToolName ambiguous prefix picks shortest length-diff`
+- `ExemplarBankTest.renderForTools unknown tool name falls back to _default exemplar`
+  was rewritten to assert the corrected behavior (was asserting the bug).
+
+### What this DOESN'T solve
+
+- Models other than Gemma 4 E4B with the same SDK + flag combo are
+  untested; users on Qwen3 / FunctionGemma should expect different
+  numbers (could be better or worse).
+- Multi-turn agent loops with > 3-4 turns still bottleneck on
+  per-turn re-prefill (no `Conversation::Clone()` until upstream
+  Google ships Kotlin API; tracked in CHANGELOG v0.5.x notes).
+- Streaming + tools combo where SDK FC parser throws still falls
+  back to prompt-injection (v0.7.2 behaviour preserved); not
+  affected by T1 since constrained decoding is for non-streaming
+  Conversation API only.
+
+### Known regression: tools-less code-block prose
+
+With `constrained_decode=true` (default), tools-less prompts that
+ask for code in markdown blocks ("Show me a Python hello world",
+"Write a snake game in HTML") halt at the opening ` ``` ` fence.
+Pure prose ("Write three sentences about cats") is unaffected. The
+v0.8.0 default optimizes for tool-call reliability — users who hit
+this can opt out via the sidecar described in G1 above.
+
+This is an SDK-level behaviour, not a v0.8.0 architectural choice:
+we tried per-call flag flipping to scope the constraint to tool
+calls only, but the off→on transition leaks grammar-compiler memory
+and triggers OOM around index 15 of an n=30 run on a 12 GB device.
+
 ## [0.7.2] — 2026-05-03
 
 End-to-end agent-workflow testing on real device exposed an upstream

@@ -58,6 +58,9 @@ class HttpServer(
         private const val MAX_BODY = 4 * 1024 * 1024
     }
 
+    // v0.8.0 G4: one-shot exemplar injection.
+    private val exemplarBank: ExemplarBank by lazy { ExemplarBank(context) }
+
     // v0.5.1: default backend is read at construction time from
     // /data/local/tmp/litertlm/temuxllm.conf (key: default_backend=cpu|gpu)
     // OR per-app filesDir/temuxllm.conf, OR TEMUXLLM_DEFAULT_BACKEND env.
@@ -101,6 +104,15 @@ class HttpServer(
         } catch (_: Throwable) { null }
         val raw = fromConf ?: System.getenv("TEMUXLLM_NATIVE_TOOLS")?.trim()?.lowercase()
         raw == "on" || raw == "1" || raw == "true"
+    }
+
+    // v0.8.0 G2: top-K tool retrieval (RAG-for-tools).
+    // Read at construction time — restart service to change the value.
+    // Set TEMUXLLM_TOOL_RAG_K=0 to disable (pass all tools through unchanged).
+    // Default k=3 limits context injection to the 3 most relevant tools.
+    private val toolRagK: Int = run {
+        val raw = System.getenv("TEMUXLLM_TOOL_RAG_K")?.trim()
+        raw?.toIntOrNull() ?: 3
     }
 
     /**
@@ -347,6 +359,83 @@ class HttpServer(
         return Pair(out, hint)
     }
 
+    /**
+     * v0.8.0 G2: apply ToolRanker filtering when toolRagK > 0 and there are
+     * more tools than k. Returns the filtered (or original) JSONArray.
+     *
+     * Also emits an I-level log line listing the top names so engineers can
+     * verify RAG behaviour in logcat without additional instrumentation.
+     */
+    private fun applyToolRag(tools: JSONArray?, lastUserText: String): JSONArray? {
+        if (tools == null || tools.length() == 0) return tools
+        val k = toolRagK
+        if (k <= 0) return tools   // RAG disabled — pass through all tools
+        if (k >= tools.length()) return tools   // nothing to filter
+        val filtered = ToolRanker.topK(tools, lastUserText, k)
+        val topNames = (0 until filtered.length()).mapNotNull { i ->
+            val obj = filtered.optJSONObject(i) ?: return@mapNotNull null
+            val fn = obj.optJSONObject("function")
+            if (fn != null) fn.optString("name").ifBlank { null }
+            else obj.optString("name").ifBlank { null }
+        }
+        Log.i(TAG, "ToolRanker: filtered ${tools.length()}→${filtered.length()} tools (top: ${topNames.joinToString()})")
+        return filtered
+    }
+
+    /**
+     * Extract the last user message text from a messages JSONArray.
+     * Handles both plain-string content and Anthropic/OpenAI content-block arrays.
+     * Returns blank string when there are no user messages.
+     */
+    private fun lastUserTextFromMessages(messages: JSONArray?): String {
+        if (messages == null) return ""
+        for (i in messages.length() - 1 downTo 0) {
+            val msg = messages.optJSONObject(i) ?: continue
+            if (msg.optString("role") != "user") continue
+            val content = msg.opt("content") ?: continue
+            if (content is String) return content
+            if (content is JSONArray) {
+                val sb = StringBuilder()
+                for (j in 0 until content.length()) {
+                    val block = content.optJSONObject(j) ?: continue
+                    when (block.optString("type")) {
+                        "text", "input_text" -> sb.append(block.optString("text"))
+                        else -> {}
+                    }
+                }
+                val text = sb.toString()
+                if (text.isNotBlank()) return text
+            }
+        }
+        return ""
+    }
+
+    /**
+     * Extract the last user-intent text from a Responses-style `input`.
+     * Accepts a plain string or a JSONArray of messages / Responses items.
+     */
+    private fun lastUserTextFromResponsesInput(input: Any?): String {
+        if (input == null || input == JSONObject.NULL) return ""
+        if (input is String) return input
+        if (input is JSONArray) {
+            // Walk backwards looking for the last user/input_text item.
+            for (i in input.length() - 1 downTo 0) {
+                val item = input.optJSONObject(i) ?: continue
+                val type = item.optString("type")
+                if (type == "message" && item.optString("role") == "user") {
+                    val text = lastUserTextFromMessages(JSONArray().put(item))
+                    if (text.isNotBlank()) return text
+                }
+                if (type == "input_text") return item.optString("text")
+                if (item.optString("role") == "user") {
+                    val text = lastUserTextFromMessages(JSONArray().put(item))
+                    if (text.isNotBlank()) return text
+                }
+            }
+        }
+        return ""
+    }
+
     private fun resolveDefaultBackend(ctx: Context): String {
         fun readKey(file: File): String? = try {
             if (!file.canRead()) null
@@ -527,13 +616,16 @@ class HttpServer(
                 ?: return errorJson(Response.Status.NOT_FOUND, "model '$requestedModel' not found")
         }
         val messages = body.optJSONArray("messages")
-        val tools = body.optJSONArray("tools")
+        val tools = applyToolRag(body.optJSONArray("tools"), lastUserTextFromMessages(messages))
         val hasTools = tools != null && tools.length() > 0
         val useNative = nativeToolsEnabled && hasTools
         // v0.7.0: skip prompt-injection tool block when SDK native path
         // is taken — model gets confused by both signals.
         val toolBlock = if (useNative) null else ChatFormat.renderToolBlock(tools)
-        val prompt = when (val r = ChatFormat.flatten(messages, toolBlock)) {
+        val allowedToolNames = ChatFormat.toolNamesFromRequest(tools)
+        // v0.8.0 G4: splice one-shot exemplars before first user turn.
+        val exemplarMsgsOllama = exemplarBank.renderForTools(allowedToolNames.toList())
+        val prompt = when (val r = ChatFormat.flatten(spliceExemplars(messages, exemplarMsgsOllama), toolBlock)) {
             is ChatFormat.Result.Ok -> r.prompt
             is ChatFormat.Result.Bad -> return errorJson(Response.Status.BAD_REQUEST, r.message)
         }
@@ -546,12 +638,12 @@ class HttpServer(
         val stream = body.optBoolean("stream", true)
         val parseTools = toolBlock != null
         val hasToolWork = parseTools || useNative
-        val allowedToolNames = ChatFormat.toolNamesFromRequest(tools)
         val nativeDesc = if (useNative) extractNativeToolDescriptions(tools) else null
+        val toolSchemas = ChatFormat.extractToolSchemas(tools).takeIf { it.isNotEmpty() }
         return when {
-            stream && hasToolWork -> runStreamBuffered(prompt, backend, NdjsonChatEncoder(resolved.name), allowedToolNames, nativeDesc, img.bytes)
+            stream && hasToolWork -> runStreamBuffered(prompt, backend, NdjsonChatEncoder(resolved.name), allowedToolNames, nativeDesc, img.bytes, toolSchemas)
             stream -> runStream(prompt, backend, NdjsonChatEncoder(resolved.name), img.bytes)
-            else -> blockingGenerate(prompt, backend, resolved.name, ResponseShape.OllamaChat, parseTools = parseTools, allowedToolNames = allowedToolNames, imageBytes = img.bytes, nativeToolDescriptions = nativeDesc)
+            else -> blockingGenerate(prompt, backend, resolved.name, ResponseShape.OllamaChat, parseTools = parseTools, allowedToolNames = allowedToolNames, imageBytes = img.bytes, nativeToolDescriptions = nativeDesc, toolSchemas = toolSchemas)
         }
     }
 
@@ -565,7 +657,7 @@ class HttpServer(
                 ?: return errorJson(Response.Status.NOT_FOUND, "model '$requestedModel' not found")
         }
         val messages = body.optJSONArray("messages")
-        val tools = body.optJSONArray("tools")
+        val tools = applyToolRag(body.optJSONArray("tools"), lastUserTextFromMessages(messages))
         val hasTools = tools != null && tools.length() > 0
         val useNative = nativeToolsEnabled && hasTools
         // v0.7.0: when native path is taken, SDK applies the model's
@@ -584,7 +676,10 @@ class HttpServer(
         val combinedSystem = listOfNotNull(toolBlock, systemHint).filter { it.isNotBlank() }.let {
             if (it.isEmpty()) null else it.joinToString("\n")
         }
-        val prompt = when (val r = ChatFormat.flatten(messages, combinedSystem)) {
+        val allowedToolNames = ChatFormat.toolNamesFromRequest(tools)
+        // v0.8.0 G4: splice one-shot exemplars before first user turn.
+        val exemplarMsgsOpenAi = exemplarBank.renderForTools(allowedToolNames.toList())
+        val prompt = when (val r = ChatFormat.flatten(spliceExemplars(messages, exemplarMsgsOpenAi), combinedSystem)) {
             is ChatFormat.Result.Ok -> r.prompt
             is ChatFormat.Result.Bad -> return errorJson(Response.Status.BAD_REQUEST, r.message)
         }
@@ -600,12 +695,12 @@ class HttpServer(
         // fires when toolBlock != null.
         val parseTools = toolBlock != null
         val hasToolWork = parseTools || useNative
-        val allowedToolNames = ChatFormat.toolNamesFromRequest(tools)
         val nativeDesc = if (useNative) extractNativeToolDescriptions(tools) else null
+        val toolSchemas = ChatFormat.extractToolSchemas(tools).takeIf { it.isNotEmpty() }
         return when {
-            stream && hasToolWork -> runStreamBuffered(prompt, backend, OpenAiSseEncoder(resolved.name), allowedToolNames, nativeDesc, img.bytes)
+            stream && hasToolWork -> runStreamBuffered(prompt, backend, OpenAiSseEncoder(resolved.name), allowedToolNames, nativeDesc, img.bytes, toolSchemas)
             stream -> runStream(prompt, backend, OpenAiSseEncoder(resolved.name), img.bytes)
-            else -> blockingGenerate(prompt, backend, resolved.name, ResponseShape.OpenAiChat, parseTools = parseTools, allowedToolNames = allowedToolNames, imageBytes = img.bytes, nativeToolDescriptions = nativeDesc)
+            else -> blockingGenerate(prompt, backend, resolved.name, ResponseShape.OpenAiChat, parseTools = parseTools, allowedToolNames = allowedToolNames, imageBytes = img.bytes, nativeToolDescriptions = nativeDesc, toolSchemas = toolSchemas)
         }
     }
 
@@ -633,14 +728,17 @@ class HttpServer(
             }
             else -> systemRaw.toString().takeIf { it.isNotBlank() }
         }
-        val tools = body.optJSONArray("tools")
+        val tools = applyToolRag(body.optJSONArray("tools"), lastUserTextFromMessages(messages))
         val hasTools = tools != null && tools.length() > 0
         val useNative = nativeToolsEnabled && hasTools
         val toolBlock = if (useNative) null else ChatFormat.renderToolBlock(tools)
         val combinedSystem = listOfNotNull(toolBlock, systemText).filter { it.isNotBlank() }.let {
             if (it.isEmpty()) null else it.joinToString("\n")
         }
-        val prompt = when (val r = ChatFormat.flatten(messages, combinedSystem)) {
+        val allowedToolNames = ChatFormat.toolNamesFromRequest(tools)
+        // v0.8.0 G4: splice one-shot exemplars before first user turn.
+        val exemplarMsgsAnthropic = exemplarBank.renderForTools(allowedToolNames.toList())
+        val prompt = when (val r = ChatFormat.flatten(spliceExemplars(messages, exemplarMsgsAnthropic), combinedSystem)) {
             is ChatFormat.Result.Ok -> r.prompt
             is ChatFormat.Result.Bad -> return errorJson(Response.Status.BAD_REQUEST, r.message)
         }
@@ -653,12 +751,12 @@ class HttpServer(
         val stream = body.optBoolean("stream", false)
         val parseTools = toolBlock != null
         val hasToolWork = parseTools || useNative
-        val allowedToolNames = ChatFormat.toolNamesFromRequest(tools)
         val nativeDesc = if (useNative) extractNativeToolDescriptions(tools) else null
+        val toolSchemas = ChatFormat.extractToolSchemas(tools).takeIf { it.isNotEmpty() }
         return when {
-            stream && hasToolWork -> runStreamBuffered(prompt, backend, AnthropicSseEncoder(resolved.name), allowedToolNames, nativeDesc, img.bytes)
+            stream && hasToolWork -> runStreamBuffered(prompt, backend, AnthropicSseEncoder(resolved.name), allowedToolNames, nativeDesc, img.bytes, toolSchemas)
             stream -> runStream(prompt, backend, AnthropicSseEncoder(resolved.name), img.bytes)
-            else -> blockingGenerate(prompt, backend, resolved.name, ResponseShape.AnthropicMessages, parseTools = parseTools, allowedToolNames = allowedToolNames, imageBytes = img.bytes, nativeToolDescriptions = nativeDesc)
+            else -> blockingGenerate(prompt, backend, resolved.name, ResponseShape.AnthropicMessages, parseTools = parseTools, allowedToolNames = allowedToolNames, imageBytes = img.bytes, nativeToolDescriptions = nativeDesc, toolSchemas = toolSchemas)
         }
     }
 
@@ -740,13 +838,25 @@ class HttpServer(
         // a hallucinated answer. We strip the tool def and warn the model.
         // Override: TEMUXLLM_ALLOW_WEB_SEARCH=1 (caller will pipe their own
         // search tool through MCP and route to web_search themselves).
-        val (tools, webSearchHint) = filterWebSearchTools(rawTools)
+        val (webFilteredTools, webSearchHint) = filterWebSearchTools(rawTools)
+        val tools = applyToolRag(webFilteredTools, lastUserTextFromResponsesInput(input))
         val hasTools = tools != null && tools.length() > 0
         val useNative = nativeToolsEnabled && hasTools
         val toolBlock = if (useNative) null else ChatFormat.renderToolBlock(tools)
         val combinedInstructions = listOfNotNull(toolBlock, instructions, webSearchHint).filter { it.isNotBlank() }.let {
             if (it.isEmpty()) null else it.joinToString("\n")
         }
+        // v0.8.0 code review MEDIUM #1: /v1/responses uses Responses-shape
+        // input (string | items array with function_call / function_call_output
+        // / reasoning items), not OpenAI/Anthropic messages. ExemplarBank
+        // emits OpenAI message-format triples which would need item-level
+        // translation to splice cleanly. Codex CLI is the primary /v1/
+        // responses caller; it ALSO sends the prior tool-call+result turns
+        // in `input` once the agent loop is past the first turn — at that
+        // point the natural conversation history already provides the same
+        // signal exemplars provide for first-turn-only callers.
+        // For first-turn cold-start callers we accept the gap; revisit
+        // alongside a Responses-format exemplar renderer.
         val prompt: String = when (val r = ChatFormat.flattenResponsesInput(input, combinedInstructions)) {
             is ChatFormat.Result.Ok -> r.prompt
             is ChatFormat.Result.Bad -> return errorJson(Response.Status.BAD_REQUEST, r.message)
@@ -762,10 +872,11 @@ class HttpServer(
         val hasToolWork = parseTools || useNative
         val allowedToolNames = ChatFormat.toolNamesFromRequest(tools)
         val nativeDesc = if (useNative) extractNativeToolDescriptions(tools) else null
+        val toolSchemas = ChatFormat.extractToolSchemas(tools)
         return when {
-            stream && hasToolWork -> runStreamBuffered(prompt, backend, ResponsesSseEncoder(resolved.name), allowedToolNames, nativeDesc, img.bytes)
+            stream && hasToolWork -> runStreamBuffered(prompt, backend, ResponsesSseEncoder(resolved.name), allowedToolNames, nativeDesc, img.bytes, toolSchemas.takeIf { it.isNotEmpty() })
             stream -> runStream(prompt, backend, ResponsesSseEncoder(resolved.name), img.bytes)
-            hasToolWork -> blockingResponsesWithTools(prompt, backend, resolved.name, allowedToolNames, nativeDesc, img.bytes)
+            hasToolWork -> blockingResponsesWithTools(prompt, backend, resolved.name, allowedToolNames, nativeDesc, img.bytes, toolSchemas.takeIf { it.isNotEmpty() })
             else -> blockingResponses(prompt, backend, resolved.name, img.bytes)
         }
     }
@@ -782,6 +893,7 @@ class HttpServer(
         allowedToolNames: Set<String>,
         nativeToolDescriptions: List<String>? = null,
         imageBytes: ByteArray? = null,
+        toolSchemas: Map<String, JSONObject>? = null,
     ): Response {
         val useNative = nativeToolDescriptions != null && nativeToolDescriptions.isNotEmpty()
         val r: GenerateResult
@@ -806,7 +918,7 @@ class HttpServer(
                         put("error", JSONObject().apply { put("code", "server_error"); put("message", "fallback also failed: ${r.error}") })
                     })
                 }
-                parsed = ChatFormat.parseToolCalls(r.text, allowedToolNames.takeIf { it.isNotEmpty() })
+                parsed = ChatFormat.parseToolCalls(r.text, allowedToolNames.takeIf { it.isNotEmpty() }, toolSchemas)
             } else if (nr.error != null) {
                 return json(Response.Status.INTERNAL_ERROR, JSONObject().apply {
                     put("type", "error")
@@ -840,7 +952,7 @@ class HttpServer(
                     put("error", JSONObject().apply { put("code", "server_error"); put("message", r.error) })
                 })
             }
-            parsed = ChatFormat.parseToolCalls(r.text, allowedToolNames.takeIf { it.isNotEmpty() })
+            parsed = ChatFormat.parseToolCalls(r.text, allowedToolNames.takeIf { it.isNotEmpty() }, toolSchemas)
         }
         val outputItems = JSONArray()
         if (parsed.text.isNotEmpty()) {
@@ -969,6 +1081,7 @@ class HttpServer(
         allowedToolNames: Set<String>,
         nativeToolDescriptions: List<String>? = null,
         imageBytes: ByteArray? = null,
+        toolSchemas: Map<String, JSONObject>? = null,
     ): Response {
         val useNative = nativeToolDescriptions != null && nativeToolDescriptions.isNotEmpty()
         val pipeIn = PipedInputStream(64 * 1024)
@@ -1000,7 +1113,7 @@ class HttpServer(
                             encoder.emitError(writer, "fallback also failed: ${r.error}")
                             return@thread
                         }
-                        parsed = ChatFormat.parseToolCalls(r.text, allowedToolNames)
+                        parsed = ChatFormat.parseToolCalls(r.text, allowedToolNames, toolSchemas)
                     } else if (nr.error != null) {
                         encoder.emitError(writer, "native tools: ${nr.error}")
                         return@thread
@@ -1030,7 +1143,7 @@ class HttpServer(
                         encoder.emitError(writer, r.error!!)
                         return@thread
                     }
-                    parsed = ChatFormat.parseToolCalls(r.text, allowedToolNames)
+                    parsed = ChatFormat.parseToolCalls(r.text, allowedToolNames, toolSchemas)
                 }
                 encoder.emitBuffered(
                     writer,
@@ -1144,6 +1257,7 @@ class HttpServer(
         // prompt-injection, no JSON repair). Caller decides via the
         // nativeToolsEnabled flag.
         nativeToolDescriptions: List<String>? = null,
+        toolSchemas: Map<String, JSONObject>? = null,
     ): Response {
         val useNative = nativeToolDescriptions != null && nativeToolDescriptions.isNotEmpty()
         Log.i(TAG, "generate blocking shape=$shape backend=$backend model=$model tools=$parseTools native=$useNative img=${imageBytes != null} prompt=${prompt.take(80)}…")
@@ -1252,7 +1366,7 @@ class HttpServer(
         val parsed = if (useNative && !nativeFallbackTriggered) {
             ChatFormat.ParsedOutput(r.text, nativeToolCalls)
         } else if (parseTools || nativeFallbackTriggered) {
-            ChatFormat.parseToolCalls(r.text, allowedToolNames.takeIf { it.isNotEmpty() })
+            ChatFormat.parseToolCalls(r.text, allowedToolNames.takeIf { it.isNotEmpty() }, toolSchemas)
         } else {
             ChatFormat.ParsedOutput(r.text, emptyList())
         }
@@ -1498,4 +1612,32 @@ class HttpServer(
 
     private fun errorJson(status: Response.Status, msg: String): Response =
         json(status, JSONObject().apply { put("error", msg) })
+
+    /**
+     * v0.8.0 G4: splice exemplar messages into a messages array.
+     *
+     * Inserts the exemplar 3-message sequence (user/assistant-tool_call/tool)
+     * AFTER the system message (if any) and BEFORE the first user message.
+     * Returns the original [messages] unchanged when exemplars is empty or
+     * [messages] is null.
+     */
+    private fun spliceExemplars(messages: JSONArray?, exemplars: JSONArray): JSONArray? {
+        if (messages == null || exemplars.length() == 0) return messages
+        val result = JSONArray()
+        var spliced = false
+        for (i in 0 until messages.length()) {
+            val msg = messages.optJSONObject(i)
+            // Insert exemplars after any system message and before first user message.
+            if (!spliced && msg != null && msg.optString("role") == "user") {
+                for (j in 0 until exemplars.length()) result.put(exemplars.opt(j))
+                spliced = true
+            }
+            result.put(messages.opt(i))
+        }
+        // If no user message was found, append exemplars before the end.
+        if (!spliced) {
+            for (j in 0 until exemplars.length()) result.put(exemplars.opt(j))
+        }
+        return result
+    }
 }
