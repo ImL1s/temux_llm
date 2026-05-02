@@ -9,6 +9,83 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 (no unreleased changes)
 
+## [0.5.1] — 2026-05-02
+
+Honest CLI matrix re-verification + tunable default backend.
+
+### What was wrong with v0.5.0
+
+Two rows in the v0.5.0 4-CLI matrix were either unverified or
+empirically wrong; one CLI broke between v0.5.0 and now:
+
+- **Gemini CLI** (`gemini` 0.36) — v0.5.0 shipped a
+  `GEMINI_SYSTEM_MD=empty + GOOGLE_GEMINI_BASE_URL=...` recipe and
+  marked it "verified". On real-device retest: it does not work.
+  The stock CLI reads cached OAuth credentials before the env var is
+  consulted; traffic goes to Google's servers, not our bridge. The
+  relevant feature requests
+  (google-gemini/gemini-cli #1605, #5945, #24166) remain open.
+- **OpenCode** (`opencode` 1.14) — v0.5.0 marked it "Configured (not
+  installed)". Re-installed locally; in GPU mode + 16 k context the
+  bare-agent prompt (~2.3 k tokens) trips `lowmemorykiller` on
+  12 GB devices.
+- **Codex CLI 0.125** — newly broken since v0.5.0: `wire_api="chat"`
+  was dropped, `--oss --local-provider ollama` overrides the user's
+  `-c model=` to `gpt-oss:20b`, and `model_providers.ollama.*` is
+  reserved as a built-in. The launcher's old config silently
+  produced an unconfigured ollama provider.
+
+### v0.5.1 actually-verified matrix (Galaxy S25, 12 GB, 16 k context)
+
+| CLI | Status | How |
+|---|---|---|
+| **Claude Code** (`claude --bare`) | ✅ verified | unchanged from v0.5.0 |
+| **Codex CLI 0.125** | ✅ verified | custom `temuxllm` provider with `wire_api="responses"`, `reasoning_effort="minimal"`, tiny `model_instructions_file`, and `max_tokens=12288` in `temuxllm.conf` |
+| **llxprt-code** (Gemini CLI fork) | ✅ verified | `npm i -g @vybestack/llxprt-code`; native OpenAI provider |
+| **OpenCode** 1.14 | ✅ verified via bridge | LiteLLM proxy that injects `extra_body: {backend: "cpu"}` on every call |
+| **stock Gemini CLI** | ❌ confirmed unfixable | no env-var redirect path |
+| **OpenClaw** | not retested | wire still correct; deferred to v0.6.x |
+
+### `scripts/temuxllm` launcher updates
+
+- **`launch codex`**: switched to a custom `temuxllm` provider (not
+  the reserved `ollama`); ships a default tiny `model_instructions_file`
+  + `model_reasoning_effort="minimal"` to fit 12 GB / 16 k devices.
+  Override with `TEMUXLLM_CODEX_REASONING=...` and
+  `TEMUXLLM_CODEX_INSTRUCTIONS_FILE=...`.
+- **`launch gemini`**: dropped the `GEMINI_SYSTEM_MD` recipe; now
+  spawns `llxprt --provider openai --baseurl <host>/v1` directly.
+  `--config-only` prints the install-and-redirect instructions.
+- **`launch opencode`**: auto-spawns a LiteLLM proxy (with
+  `extra_body: {backend: "cpu"}` route) on `:4000` and points
+  OpenCode at it. Override with `TEMUXLLM_OPENCODE_BACKEND=gpu` on
+  ≥16 GB devices to skip the bridge.
+- **`pick_model`**: switched from greedy sed-on-`/api/tags` to
+  parsing `/v1/models` (which lists only the active staged model) —
+  v0.5.0's regex picked the *last* `"name"` in the JSON, so devices
+  with multiple `.litertlm` files in `/data/local/tmp/litertlm/`
+  silently got the wrong model.
+
+### Service: tunable default backend
+
+`HttpServer` now reads `default_backend=` from
+`/data/local/tmp/litertlm/temuxllm.conf` (or `filesDir/temuxllm.conf`,
+or the `TEMUXLLM_DEFAULT_BACKEND` env var) at construction time and
+uses that as the default for `/v1/*` requests that don't include a
+`backend` field. Codex / OpenCode never set a backend; on memory-
+constrained devices, setting `default_backend=cpu` lets their
+requests skip GPU init entirely. Falls back to `gpu` when no
+override is set so 16 GB+ devices keep the fast path.
+
+### README
+
+- Replaced the v0.3.0 "Use with CLI coding agents" section with a
+  v0.5.1 verified-matrix table, complete per-CLI manual configs,
+  and an honest "what works vs what doesn't" list.
+- Added a Tunables section under API documenting `max_tokens` and
+  `default_backend` knobs in `temuxllm.conf`.
+- Mirrored to `README.zh-TW.md`.
+
 ## [0.5.0] — 2026-05-02
 
 ### 4-CLI bare-mode matrix — what works under 16 k context

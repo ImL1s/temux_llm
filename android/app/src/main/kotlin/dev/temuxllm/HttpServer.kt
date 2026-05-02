@@ -58,6 +58,38 @@ class HttpServer(
         private const val MAX_BODY = 4 * 1024 * 1024
     }
 
+    // v0.5.1: default backend is read at construction time from
+    // /data/local/tmp/litertlm/temuxllm.conf (key: default_backend=cpu|gpu)
+    // OR per-app filesDir/temuxllm.conf, OR TEMUXLLM_DEFAULT_BACKEND env.
+    // Memory-constrained devices (12 GB / 16 k context) need CPU as the
+    // request default — clients like Codex / OpenCode don't send a
+    // `backend` field, so without this their /v1 calls re-init GPU and
+    // get LMK-killed under the prompt prefill. Falls back to "gpu" when
+    // no override is set so 16 GB+ devices keep the fast path.
+    private val defaultBackend: String = resolveDefaultBackend(context)
+
+    private fun resolveDefaultBackend(ctx: Context): String {
+        fun readKey(file: File): String? = try {
+            if (!file.canRead()) null
+            else file.readLines()
+                .map { it.trim() }
+                .firstOrNull { it.startsWith("default_backend=", ignoreCase = true) }
+                ?.substringAfter('=')
+                ?.trim()
+                ?.lowercase()
+        } catch (_: Throwable) { null }
+        val candidates = listOfNotNull(
+            File(ctx.filesDir, "temuxllm.conf"),
+            File("/data/local/tmp/litertlm/temuxllm.conf"),
+        )
+        val fromFile = candidates.firstNotNullOfOrNull(::readKey)
+        val raw = fromFile ?: System.getenv("TEMUXLLM_DEFAULT_BACKEND")?.trim()?.lowercase()
+        return when (raw) {
+            "cpu", "gpu" -> raw
+            else -> "gpu"
+        }
+    }
+
     override fun serve(session: IHTTPSession): Response = try {
         when {
             session.uri == "/" && session.method == Method.GET ->
@@ -138,7 +170,7 @@ class HttpServer(
         put("service", "temuxllm")
         put("phase", "3a")
         put("runtime", "litertlm-android 0.11.0-rc1 (in-process Engine)")
-        put("default_backend", "gpu")
+        put("default_backend", defaultBackend)
         put("engine_loaded", engine.isLoaded())
     }
 
@@ -164,7 +196,7 @@ class HttpServer(
         val prompt = body.optString("prompt").also {
             if (it.isBlank()) return errorJson(Response.Status.BAD_REQUEST, "prompt is required")
         }
-        val backend = body.optString("backend", "gpu").lowercase()
+        val backend = body.optString("backend", defaultBackend).lowercase()
         if (backend != "cpu" && backend != "gpu") {
             return errorJson(Response.Status.BAD_REQUEST, "backend must be cpu|gpu (got $backend)")
         }
@@ -200,7 +232,7 @@ class HttpServer(
             is ChatFormat.Result.Ok -> r.prompt
             is ChatFormat.Result.Bad -> return errorJson(Response.Status.BAD_REQUEST, r.message)
         }
-        val backend = body.optString("backend", "gpu").lowercase()
+        val backend = body.optString("backend", defaultBackend).lowercase()
         if (backend != "cpu" && backend != "gpu") {
             return errorJson(Response.Status.BAD_REQUEST, "backend must be cpu|gpu (got $backend)")
         }
@@ -230,7 +262,7 @@ class HttpServer(
             is ChatFormat.Result.Ok -> r.prompt
             is ChatFormat.Result.Bad -> return errorJson(Response.Status.BAD_REQUEST, r.message)
         }
-        val backend = body.optString("backend", "gpu").lowercase()
+        val backend = body.optString("backend", defaultBackend).lowercase()
         if (backend != "cpu" && backend != "gpu") {
             return errorJson(Response.Status.BAD_REQUEST, "backend must be cpu|gpu (got $backend)")
         }
@@ -280,7 +312,7 @@ class HttpServer(
             is ChatFormat.Result.Ok -> r.prompt
             is ChatFormat.Result.Bad -> return errorJson(Response.Status.BAD_REQUEST, r.message)
         }
-        val backend = body.optString("backend", "gpu").lowercase()
+        val backend = body.optString("backend", defaultBackend).lowercase()
         if (backend != "cpu" && backend != "gpu") {
             return errorJson(Response.Status.BAD_REQUEST, "backend must be cpu|gpu (got $backend)")
         }
@@ -318,7 +350,7 @@ class HttpServer(
             is ChatFormat.Result.Ok -> r.prompt
             is ChatFormat.Result.Bad -> return errorJson(Response.Status.BAD_REQUEST, r.message)
         }
-        val backend = body.optString("backend", "gpu").lowercase()
+        val backend = body.optString("backend", defaultBackend).lowercase()
         if (backend != "cpu" && backend != "gpu") {
             return errorJson(Response.Status.BAD_REQUEST, "backend must be cpu|gpu (got $backend)")
         }
