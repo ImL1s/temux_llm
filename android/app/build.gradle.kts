@@ -65,7 +65,7 @@ dependencies {
     // kotlinx-coroutines-test is needed for runTest{} on Flow<GenerateEvent>;
     // JSONassert keeps wire-format assertions readable across all 4 envelopes.
     testImplementation("junit:junit:4.13.2")
-    testImplementation("io.mockk:mockk:1.13.13")
+    testImplementation("io.mockk:mockk:1.14.9")
     testImplementation("org.jetbrains.kotlinx:kotlinx-coroutines-test:1.10.2")
     testImplementation("org.skyscreamer:jsonassert:1.5.3")
 }
