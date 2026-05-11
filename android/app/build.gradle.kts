@@ -58,7 +58,7 @@ dependencies {
     // the v0.11.0-rc.1 CLI binary). Bumps the heavy lifting off ProcessBuilder
     // and into a shared engine that loads the model once and serves multiple
     // /api/generate calls. Also unlocks streaming via Kotlin Flow.
-    implementation("com.google.ai.edge.litertlm:litertlm-android:0.11.0-rc1")
+    implementation("com.google.ai.edge.litertlm:litertlm-android:0.11.0")
 
     // Local-test deps. JUnit 4 is what AGP 8.x wires zero-config; MockK mocks
     // Kotlin final classes (the SDK's Engine/Conversation are final);
